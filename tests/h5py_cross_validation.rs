@@ -5771,3 +5771,59 @@ fn rewritten_legacy_headers_keep_the_addresses_h5py_references_hold() {
     assert_eq!(file.dataset("data").unwrap().attr_names().unwrap().len(), 7);
     std::fs::remove_file(&path).ok();
 }
+
+/// And when the session is a SWMR one: `start_swmr` publishes every header
+/// of the reopened file over the chunk 0 it already had, and the close-time
+/// finalize writes over it once more — a reader of the live file may be
+/// holding any of these addresses, so neither may move a header.
+#[test]
+fn swmr_sessions_keep_the_addresses_h5py_references_hold() {
+    let Some(py) = python() else { return };
+    let path = tmp("kept_swmr_headers");
+    create_referenced_objects(&path, Some(rust_hdf5::LibverBound::V110));
+    run_python(
+        py,
+        &ADDRESSES_AND_REFERENCES.replace("PATH", &format!("r'{}'", path.display())),
+    );
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::open_append(&path).unwrap();
+        // `data` and `g/inner` outgrow their chunk 0; `g` grows within its
+        // estimate; the root gains a link.
+        let data = w.dataset_index("data").unwrap();
+        for i in 0..4 {
+            w.set_dataset_attr_array::<f64>(data, &format!("wide{i}"), &[32], &[f64::from(i); 32])
+                .unwrap();
+        }
+        let inner = w.dataset_index("g/inner").unwrap();
+        for i in 0..3 {
+            w.set_dataset_attr_array::<f64>(inner, &format!("wide{i}"), &[32], &[1.5; 32])
+                .unwrap();
+        }
+        w.set_group_attr_numeric::<i64>("/g", "mark", &7).unwrap();
+        let frames = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(frames, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(frames, &[5u8, 6, 7, 8]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+names = ['/', 'data', 's0', 'g', 'g/inner']
+addresses = [h5py.h5o.get_info(f[n].id).addr for n in names]
+assert addresses == list(f.attrs['addresses']), (addresses, list(f.attrs['addresses']))
+assert [f[r].name for r in f['refs'][...]] == ['/data', '/s0', '/g', '/g/inner']
+assert f[f['data'].attrs['to_s0']].name == '/s0'
+assert f[f.attrs['to_inner']].name == '/g/inner'
+assert f[f['data'].attrs['by_rust'][0]].name == '/g/inner'
+assert (f['data'].attrs['wide3'] == 3.0).all()
+assert f['g'].attrs['mark'] == 7
+assert (f['g/inner'].attrs['wide2'] == 1.5).all()
+assert h5py.h5ds.is_attached(f['data'].id, f['s0'].id, 0)
+assert f['frames'].shape == (2, 2, 2), f['frames'].shape
+assert f['frames'][1].tolist() == [[5, 6], [7, 8]]
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

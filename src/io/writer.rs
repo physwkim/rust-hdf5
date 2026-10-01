@@ -3766,7 +3766,6 @@ pub struct Hdf5Writer {
     /// Address of the root group object header (set after first finalize).
     root_group_addr: Option<u64>,
     /// Size of the encoded root group object header (for in-place rewrites).
-    root_group_encoded_size: usize,
     /// The on-disk root header block a reopen found, `(addr, len)`, so
     /// finalize can free the block its rewrite supersedes.
     superseded_root_header: crate::io::object_header_io::HeaderBlocks,
@@ -4529,6 +4528,35 @@ impl HeaderPlacement {
             continuation: None,
         }
     }
+
+    /// The placement as the registry records a written header: chunk 0's
+    /// block, then the continuation block when there is one.
+    fn blocks(&self) -> crate::io::object_header_io::HeaderBlocks {
+        std::iter::once((self.addr, self.size as u64))
+            .chain(self.continuation.map(|(a, s)| (a, s as u64)))
+            .collect()
+    }
+
+    /// The placement a written header's recorded blocks describe, to write
+    /// it back over: chunk 0 held to its block, and the continuation chunk,
+    /// if it has one, to its own.
+    fn over(blocks: &[(u64, u64)]) -> Option<Self> {
+        match blocks {
+            [(addr, size)] => Some(Self {
+                addr: *addr,
+                size: *size as usize,
+                kept: true,
+                continuation: None,
+            }),
+            [(addr, size), (cont, cont_size)] => Some(Self {
+                addr: *addr,
+                size: *size as usize,
+                kept: true,
+                continuation: Some((*cont, *cont_size as usize)),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Where every object header this finalize writes goes.
@@ -4547,9 +4575,9 @@ struct HeaderLayout {
 /// The chunk-0 blocks existing object headers keep across a rewrite, by
 /// object: `(address, length)` of each, as the open-time walk read it.
 ///
-/// Filled by finalize's planning step from the registry's `obj_header_blocks`
-/// and consumed by [`Hdf5Writer::allocate_object_headers`]. Empty for the SWMR
-/// finalize, which never writes over a block a reader may be walking.
+/// Filled by [`Hdf5Writer::supersede_headers`] from the registry's
+/// `obj_header_blocks` and consumed by
+/// [`Hdf5Writer::allocate_object_headers`].
 #[derive(Default)]
 struct KeptChunks {
     datasets: std::collections::HashMap<usize, (u64, u64)>,
@@ -4793,7 +4821,6 @@ impl Hdf5Writer {
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
-            root_group_encoded_size: 0,
             superseded_root_header: Vec::new(),
             // A new file starts at the oldest superblock the generation it was
             // created in allows, and finalize raises it if the content needs a
@@ -6183,7 +6210,6 @@ impl Hdf5Writer {
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
-            root_group_encoded_size: 0,
             superseded_root_header: root_header_blocks,
             // The version the file already has. It is written back unchanged
             // and it floors every bound this session writes at, so the append
@@ -8003,8 +8029,9 @@ impl Hdf5Writer {
         }
     }
 
-    /// Encode an object header for the block at `addr`, at the version this
-    /// file's format calls for and with `rc` as the object's hard link count.
+    /// Encode `header` as `placement` lays it out, at the version this file's
+    /// format calls for and with `rc` as the object's hard link count: every
+    /// `(address, image)` pair to write, chunk 0 first.
     ///
     /// The count is passed rather than read off the header because the two
     /// versions carry it in different places — the version-1 prefix's `nlink`
@@ -8012,41 +8039,24 @@ impl Hdf5Writer {
     /// [`emit_refcount`](Self::emit_refcount) already added — and only the
     /// caller knows it.
     ///
-    /// INVARIANT: a fresh header lives in the one block its address and
-    /// encoded size describe. A header whose messages overflow chunk 0 gets a
-    /// continuation chunk immediately behind it in that same block, so the
-    /// address is enough to free, relocate or supersede the whole header.
-    /// libhdf5 would have grown chunk 0 into space that free rather than
-    /// chaining onto it, but it reads a continuation chunk by the address and
-    /// length its message states and cares nothing for where that lands. A
-    /// rewritten header is the other shape: see
-    /// [`encode_header_in`](Self::encode_header_in).
-    fn encode_header_at(
-        &self,
-        header: &ObjectHeader,
-        rc: u32,
-        format: ObjectFormat,
-        addr: u64,
-    ) -> IoResult<Vec<u8>> {
-        let mut images =
-            self.encode_header_in(header, rc, format, &HeaderPlacement::fresh(addr, 0))?;
-        debug_assert_eq!(images.len(), 1);
-        Ok(images.pop().map(|(_, image)| image).unwrap_or_default())
-    }
-
-    /// Encode `header` as `placement` lays it out: every `(address, image)`
-    /// pair to write, chunk 0 first.
-    ///
     /// INVARIANT: an object header's chunk 0 never moves once something in the
-    /// file has named its address. A reopened object's header is rewritten
-    /// over the chunk-0 block it already had, padded when the messages shrank
-    /// and spilling into a continuation block of its own when they grew — the
-    /// way `H5O__alloc_new_chunk` (H5Oalloc.c) grows a header libhdf5 cannot
+    /// file has named its address. A written header is rewritten over the
+    /// chunk-0 block it already has, padded when the messages shrank and
+    /// spilling into a continuation block of its own when they grew — the way
+    /// `H5O__alloc_new_chunk` (H5Oalloc.c) grows a header libhdf5 cannot
     /// extend in place. That is what keeps every object reference already in
     /// the file — in a reference dataset, an attribute, a `REFERENCE_LIST`,
     /// whoever wrote them — resolving after this session. The one exception is
     /// a block too small to hold even the message naming a continuation, which
     /// [`place_header`](Self::place_header) gives up and replaces.
+    ///
+    /// A fresh header lives in the one block its address and encoded size
+    /// describe: one whose messages overflow chunk 0 gets its continuation
+    /// chunk immediately behind it in that same block, so the address is
+    /// enough to free or supersede the whole header. libhdf5 would have grown
+    /// chunk 0 into space that free rather than chaining onto it, but it reads
+    /// a continuation chunk by the address and length its message states and
+    /// cares nothing for where that lands.
     fn encode_header_in(
         &self,
         header: &ObjectHeader,
@@ -8120,7 +8130,12 @@ impl Hdf5Writer {
                         continuation,
                     });
                 }
-                None => self.allocator.free(addr, len, FreeSpaceClass::Metadata),
+                // A block a SWMR reader may be walking stays allocated, as
+                // everywhere else under `swmr_active`.
+                None if !self.swmr_active => {
+                    self.allocator.free(addr, len, FreeSpaceClass::Metadata);
+                }
+                None => {}
             }
         }
         let plan = header.plan_chunks(format, self.chunk0_capacity(header, format), &self.ctx)?;
@@ -16873,45 +16888,41 @@ impl Hdf5Writer {
 
     /// Re-write a dataset's object header in place (SWMR update).
     ///
-    /// The header must have been previously written via `finalize_for_swmr`.
-    /// Only the dataspace dimensions change; the encoded size must not exceed
-    /// the originally allocated space.
+    /// The header must have been written by `finalize_for_swmr`, and goes
+    /// back over the same blocks: chunk 0 held to its block and the
+    /// continuation chunk, when it has one, to its own. Only the dataspace
+    /// dimensions are meant to change; a header that no longer fits is
+    /// refused rather than moved, since a reader holds its address.
     pub fn write_dataset_header_inplace(&mut self, index: usize) -> IoResult<()> {
         // Scope the slot guard: `build_dataset_header` re-locks the same slot.
-        let (addr, original_size) = {
+        let placement = {
             let ds = self.ds(index);
             let m = ds.lock();
-            // One block, because a finalize writes every header as one
-            // chunk: an in-place rewrite has that block's room and no more.
-            match m.obj_header_blocks.as_slice() {
-                [(addr, size)] => (*addr, *size as usize),
-                _ => {
-                    return Err(crate::io::IoError::InvalidState(
-                        "dataset header not yet written as a single chunk".into(),
-                    ))
-                }
-            }
+            HeaderPlacement::over(&m.obj_header_blocks).ok_or_else(|| {
+                crate::io::IoError::InvalidState("dataset header not yet written".into())
+            })?
         };
 
         let header = self.build_dataset_header(index)?;
         let nlink = self.object_link_count(HardLinkTarget::Dataset(index));
-        let encoded =
-            self.encode_header_at(&header, nlink, self.dataset_header_format(index), addr)?;
-
-        if encoded.len() > original_size {
+        let format = self.dataset_header_format(index);
+        let images = self.encode_header_in(&header, nlink, format, &placement)?;
+        let reserved = placement.blocks();
+        let fits = images.len() == reserved.len()
+            && images
+                .iter()
+                .zip(&reserved)
+                .all(|((_, image), &(_, size))| image.len() as u64 == size);
+        if !fits {
             return Err(crate::io::IoError::InvalidState(format!(
                 "dataset header grew from {} to {} bytes; cannot rewrite in place",
-                original_size,
-                encoded.len()
+                reserved.iter().map(|&(_, size)| size).sum::<u64>(),
+                images.iter().map(|(_, image)| image.len()).sum::<usize>()
             )));
         }
-
-        // Pad to original size with zeros (the trailing zeros after the
-        // checksum won't be parsed by readers since chunk0_data_size is fixed).
-        let mut padded = encoded;
-        padded.resize(original_size, 0);
-
-        self.handle.write_at(addr, &padded)?;
+        for (addr, image) in &images {
+            self.handle.write_at(*addr, image)?;
+        }
         // Only after the bytes are down: a failed write leaves the registry
         // describing the header the file still holds.
         self.ds(index).lock().header_written(nlink);
@@ -16944,10 +16955,11 @@ impl Hdf5Writer {
         let live: Vec<usize> = (0..self.dataset_count())
             .filter(|&i| !self.ds(i).lock().deleted)
             .collect();
+        let kept = self.supersede_headers(&live);
         // Before any dataset header: a sharing dataset's header names the
         // committed type's address.
         self.write_committed_datatype_headers()?;
-        let layout = self.allocate_object_headers(&live, &KeptChunks::default())?;
+        let layout = self.allocate_object_headers(&live, &kept)?;
 
         // 2. Build content against those addresses.
         self.prepare_dense_attributes(&live)?;
@@ -16956,16 +16968,23 @@ impl Hdf5Writer {
 
         // 3. Write every object header.
         self.write_object_headers(&layout)?;
-        // What SWMR alone needs to know afterwards: where each dataset's
-        // header is published and how much room it has, which is what
-        // `write_dataset_header_inplace` rewrites within.
+        // Where each header is published and how much room it has: what
+        // `write_dataset_header_inplace` rewrites within, and what the
+        // closing finalize writes over, since a reader may by then hold any
+        // of these addresses.
         for &(i, placement) in &layout.datasets {
             let ds = self.ds(i);
             let mut m = ds.lock();
             m.obj_header_written_addr = Some(placement.addr);
-            m.obj_header_blocks = vec![(placement.addr, placement.size as u64)];
+            m.obj_header_blocks = placement.blocks();
         }
-        self.root_group_encoded_size = layout.root.size;
+        for &(gi, placement) in &layout.groups {
+            let grp = self.grp(gi);
+            let mut g = grp.lock();
+            g.obj_header_written_addr = Some(placement.addr);
+            g.obj_header_blocks = placement.blocks();
+        }
+        self.superseded_root_header = layout.root.blocks();
 
         // 4. Write superblock with SWMR flags.
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
@@ -17012,7 +17031,7 @@ impl Hdf5Writer {
 
         // A SWMR session (`finalize_for_swmr` already ran, so
         // `root_group_addr` is `Some`) is closed by the same full finalize as
-        // a fresh write: every object header is rebuilt at a fresh address and
+        // a fresh write: every object header is rebuilt over its chunk 0 and
         // the superblock is written with clean-close flags. A full rebuild —
         // rather than the in-place header rewrite used by the live
         // `SwmrWriter::flush` path — is required so any structural change made
@@ -17043,27 +17062,12 @@ impl Hdf5Writer {
             self.flush_dataset_synced(i, sync)?;
         }
 
-        // Every header block this finalize supersedes — a reopened root or
-        // group header, a modified dataset's reopened header — is freed
-        // before its replacement is allocated, so the rewrite reuses the
-        // block instead of growing the file on every open/close cycle.
-        // Never under SWMR: a live reader may be walking the old headers,
-        // the same rule `release_vlen_references` and `place_chunk` follow.
-        // Hard links can alias one header under several names; the set keeps
-        // an aliased block from entering the free list twice.
-        let mut freed_headers = std::collections::HashSet::new();
-        // Chunk 0 of each superseded header stays where it is and is written
-        // over; only the continuation blocks behind it are returned. Nothing
-        // in the file names a continuation block but its own header, so
-        // those can move; chunk 0's address is what every reference holds.
-        let mut kept = KeptChunks::default();
-
         // 1. Plan. Which datasets get a header (deleted datasets get none —
         // their storage was already freed at delete time) is settled first,
         // because everything the next phases lay out is laid out only for the
-        // headers this finalize actually rewrites; and every header block
-        // those phases supersede is returned here, before the first
-        // allocation, so a rewrite can land in it.
+        // headers this finalize actually rewrites; and every header those
+        // phases supersede is taken here, before the first allocation, so
+        // the rewrite lands over it.
         let mut rewritten: Vec<usize> = Vec::new();
         // A finalize that lays the shared-message table out afresh reassigns
         // every heap ID in the file, so no existing header can keep its bytes:
@@ -17078,48 +17082,19 @@ impl Hdf5Writer {
             if m.deleted {
                 continue;
             }
-            if m.obj_header_written_addr.is_some() {
-                // An existing dataset from append mode keeps its header — and
-                // everything that header names — unless this session changed
-                // what the header says.
+            // An existing dataset from append mode keeps its header — and
+            // everything that header names — unless this session changed
+            // what the header says.
+            if let Some(written) = m.obj_header_written_addr {
                 if !table_replaced && !m.header_stale_with(nlink) {
                     // Keep the original object header address for the root group link.
-                    m.obj_header_addr = m.obj_header_written_addr.unwrap();
+                    m.obj_header_addr = written;
                     continue;
-                }
-                if !self.swmr_active && !m.obj_header_blocks.is_empty() {
-                    let old = m.obj_header_written_addr.take().unwrap();
-                    let blocks = std::mem::take(&mut m.obj_header_blocks);
-                    if freed_headers.insert(old) {
-                        kept.datasets.insert(i, self.keep_chunk0(blocks));
-                    }
                 }
             }
             rewritten.push(i);
         }
-        if !self.swmr_active {
-            for gi in 0..self.group_count() {
-                let grp = self.grp(gi);
-                let mut g = grp.lock();
-                if let Some(old) = g
-                    .obj_header_written_addr
-                    .take()
-                    .filter(|_| !g.obj_header_blocks.is_empty())
-                {
-                    let blocks = std::mem::take(&mut g.obj_header_blocks);
-                    if freed_headers.insert(old) {
-                        kept.groups.insert(gi, self.keep_chunk0(blocks));
-                    }
-                }
-            }
-            let root_blocks = std::mem::take(&mut self.superseded_root_header);
-            if root_blocks
-                .first()
-                .is_some_and(|&(addr, _)| freed_headers.insert(addr))
-            {
-                kept.root = Some(self.keep_chunk0(root_blocks));
-            }
-        }
+        let kept = self.supersede_headers(&rewritten);
 
         // 2. Allocate. Committed datatype headers go down whole: a header of
         // theirs holds a datatype and a reference count, so it waits on
@@ -17166,13 +17141,63 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Take the on-disk header of every object this finalize rewrites — the
+    /// datasets in `datasets`, every group, and the root — and hand each
+    /// chunk-0 block to [`allocate_object_headers`](Self::allocate_object_headers)
+    /// to be written over.
+    ///
+    /// Chunk 0 stays where it is: its address is what every reference in the
+    /// file holds. The continuation blocks behind it go back to the free
+    /// list, so the rewrite reuses them instead of growing the file on every
+    /// open/close cycle — nothing names one but its own header. Hard links
+    /// can alias one header under several names; the set keeps an aliased
+    /// chain from being taken twice. The registry forgets each header here,
+    /// so a finalize that fails later describes none the file no longer holds.
+    fn supersede_headers(&mut self, datasets: &[usize]) -> KeptChunks {
+        let mut kept = KeptChunks::default();
+        let mut taken = std::collections::HashSet::new();
+        for &i in datasets {
+            let ds = self.ds(i);
+            let mut m = ds.lock();
+            let Some(old) = m.obj_header_written_addr.take() else {
+                continue;
+            };
+            let blocks = std::mem::take(&mut m.obj_header_blocks);
+            if !blocks.is_empty() && taken.insert(old) {
+                kept.datasets.insert(i, self.keep_chunk0(blocks));
+            }
+        }
+        for gi in 0..self.group_count() {
+            let grp = self.grp(gi);
+            let mut g = grp.lock();
+            let Some(old) = g.obj_header_written_addr.take() else {
+                continue;
+            };
+            let blocks = std::mem::take(&mut g.obj_header_blocks);
+            if !blocks.is_empty() && taken.insert(old) {
+                kept.groups.insert(gi, self.keep_chunk0(blocks));
+            }
+        }
+        let root_blocks = std::mem::take(&mut self.superseded_root_header);
+        if root_blocks
+            .first()
+            .is_some_and(|&(addr, _)| taken.insert(addr))
+        {
+            kept.root = Some(self.keep_chunk0(root_blocks));
+        }
+        kept
+    }
+
     /// Keep `blocks`' chunk 0 for a rewrite and free the continuation blocks
-    /// behind it.
-    fn keep_chunk0(&mut self, blocks: crate::io::object_header_io::HeaderBlocks) -> (u64, u64) {
+    /// behind it — never under SWMR, where a live reader may be walking them,
+    /// the same rule `release_vlen_references` and `place_chunk` follow.
+    fn keep_chunk0(&self, blocks: crate::io::object_header_io::HeaderBlocks) -> (u64, u64) {
         let mut blocks = blocks.into_iter();
         let chunk0 = blocks.next().expect("a written header has a chunk 0");
-        for (addr, len) in blocks {
-            self.allocator.free(addr, len, FreeSpaceClass::Metadata);
+        if !self.swmr_active {
+            for (addr, len) in blocks {
+                self.allocator.free(addr, len, FreeSpaceClass::Metadata);
+            }
         }
         chunk0
     }
@@ -20261,6 +20286,59 @@ mod tests {
             assert_eq!(version, bound.superblock_version(), "{bound:?}");
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// A dataset header the SWMR publish could not fit into the chunk 0 it
+    /// already had chains into a continuation block, and the in-place rewrite
+    /// goes back over both: chunk 0 stays at the address the file's readers
+    /// hold, and the continuation chunk at the one chunk 0 names.
+    #[test]
+    fn inplace_rewrite_goes_over_a_chained_header() {
+        let path = temp_path("inplace_rewrite_chained");
+        let writer = Hdf5Writer::create_with_options(
+            &path,
+            FileCreateOptions {
+                libver: Some(LibverBound::V110),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer
+            .create_chunked_dataset("d", DatatypeMessage::i32_type(), &[0], &[u64::MAX], &[4])
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut writer = Hdf5Writer::open_append(&path).unwrap();
+        let idx = 0;
+        let published = writer.ds(idx).lock().obj_header_written_addr.unwrap();
+        for i in 0..4 {
+            writer
+                .add_dataset_attribute(
+                    idx,
+                    AttributeMessage::array_numeric(
+                        &format!("wide{i}"),
+                        DatatypeMessage::f64_type(),
+                        &[32],
+                        vec![0u8; 256],
+                    ),
+                )
+                .unwrap();
+        }
+        writer.finalize_for_swmr().unwrap();
+        let blocks = writer.ds(idx).lock().obj_header_blocks.clone();
+        assert_eq!(blocks.len(), 2, "chunk 0 and a continuation: {blocks:?}");
+        assert_eq!(blocks[0].0, published, "chunk 0 stayed where it was");
+
+        writer.write_dataset_header_inplace(idx).unwrap();
+        assert_eq!(writer.ds(idx).lock().obj_header_blocks, blocks);
+        writer.close().unwrap();
+
+        // The closing finalize wrote over the same chunk 0, and the chained
+        // header reads back whole.
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        assert_eq!(writer.ds(0).lock().obj_header_written_addr, Some(published));
+        assert_eq!(writer.ds(0).lock().attributes.len(), 4);
+        std::fs::remove_file(&path).ok();
     }
 
     /// After every writer of a dataset object header, `nlink_written` is the

@@ -25,6 +25,13 @@
   session. Previously every rewritten header was laid out afresh at an
   exact-size block and references to it went stale.
 
+- A SWMR session keeps its object headers in place too: `start_swmr` on
+  a reopened file publishes every header over the chunk 0 it already
+  had, the in-place rewrite after each append goes back over the same
+  blocks, continuation chunk included, and the close-time finalize
+  writes over them once more. Previously every SWMR finalize moved
+  every header to a fresh block.
+
 - A new version-2 object header takes the narrowest chunk-0 size field
   that can express its size, as `H5O_apply_ohdr` picks it, instead of
   always a four-byte one. Rewriting a header libhdf5 sized exactly for
