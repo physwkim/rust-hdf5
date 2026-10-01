@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Dimension scales: `H5Dataset::set_scale` (`H5DSset_scale`) and
+  `H5Dataset::attach_scale` (`H5DSattach_scale`) write the `CLASS` /
+  `NAME`, `DIMENSION_LIST` and `REFERENCE_LIST` attributes libhdf5's
+  high-level API writes, so h5py's `ds.dims[i]`, `h5ds.is_scale` and
+  `h5ds.is_attached` see them. Attaching appends to an axis and is a
+  no-op for a scale already on it; an attach in an append session
+  extends the lists the file already holds, including ones written by
+  libhdf5.
+
+### Fixed
+
+- A global heap object released by a replaced attribute or a rewritten
+  element no longer keeps its finalize-time address stamp registered,
+  which could have stamped a later object inserted at the same index.
+
 ## 0.6.0
 
 ### Added

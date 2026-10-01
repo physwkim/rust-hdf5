@@ -37,7 +37,7 @@ use crate::format::messages::data_layout::{
     DataLayoutMessage, EarrayParams, FixedArrayParams, LAYOUT_VERSION_DEFAULT,
 };
 use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
-use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
+use crate::format::messages::datatype::{ByteOrder, DatatypeMessage, ReferenceKind};
 use crate::format::messages::external_file_list::{ExternalFileListMessage, UNLIMITED};
 use crate::format::messages::fill_value::{
     FillValueMessage, FILL_TIME_ALLOC, FILL_TIME_IFSET, FILL_TIME_NEVER,
@@ -4438,6 +4438,33 @@ pub(crate) struct AttributeReferenceValue {
     targets: Vec<String>,
     /// Bytes from one element's address to the next: the element size.
     stride: usize,
+}
+
+/// The attribute naming the scales attached to each axis of a dataset.
+pub(crate) const DIMENSION_LIST: &str = "DIMENSION_LIST";
+/// The attribute naming every (dataset, axis) a dimension scale is attached to.
+pub(crate) const REFERENCE_LIST: &str = "REFERENCE_LIST";
+/// The `CLASS` a dimension scale carries.
+const DIMENSION_SCALE_CLASS: &str = "DIMENSION_SCALE";
+
+/// A dataset's `CLASS` attribute as `H5DS` reads it.
+enum ClassAttr {
+    /// A fixed-length string, with what `H5DSis_scale` checks beside the text.
+    Fixed {
+        size: u32,
+        null_terminated: bool,
+        text: String,
+    },
+    /// A variable-length string.
+    VarLen(String),
+    /// Not a string at all.
+    NotString,
+}
+
+/// `bytes` read as a C string: everything before the first NUL.
+fn c_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Refuse an object header body that is not the length its block was reserved
@@ -11561,6 +11588,578 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 targets: paths.iter().map(|p| (*p).to_string()).collect(),
                 stride: self.ctx.sizeof_addr as usize,
+            });
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Dimension scales — the H5DS high-level API (hl/src/H5DS.c)
+    // -----------------------------------------------------------------------
+
+    /// Mark dataset `dsid` as a dimension scale — `H5DSset_scale`.
+    ///
+    /// Writes `CLASS` as the fixed-length null-terminated ASCII string
+    /// `DIMENSION_SCALE` and, when `name` is given, `NAME` the same way: the
+    /// `H5LT_set_attribute_string` form, one byte longer than the text so the
+    /// terminator is stored, which is what `H5DSis_scale` requires of a scale
+    /// (a 16-byte null-terminated `CLASS`). Either attribute already there is
+    /// deleted and created anew, as `H5LT_set_attribute_string` does, so it
+    /// takes a fresh creation index. A dataset with scales of its own
+    /// (`DIMENSION_LIST`) is refused, as upstream refuses it.
+    pub fn set_dimension_scale(&self, dsid: usize, name: Option<&str>) -> IoResult<()> {
+        let scale_path = self.dataset_name(dsid)?;
+        if self.dataset_attribute(dsid, DIMENSION_LIST)?.is_some() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset '{scale_path}' has dimension scales attached and cannot become one"
+            )));
+        }
+        self.set_fixed_string_attribute(dsid, "CLASS", DIMENSION_SCALE_CLASS)?;
+        if let Some(name) = name {
+            self.set_fixed_string_attribute(dsid, "NAME", name)?;
+        }
+        Ok(())
+    }
+
+    /// Attach dataset `dsid` as a dimension scale of axis `idx` of dataset
+    /// `did` — `H5DSattach_scale`.
+    ///
+    /// Two attributes record the attachment: `DIMENSION_LIST` on `did`, one
+    /// variable-length sequence of object references per axis (a scalar
+    /// dataset counts as rank 1), and `REFERENCE_LIST` on `dsid`, an array
+    /// of `{dataset: H5T_STD_REF_OBJ, dimension: uint}` compounds naming
+    /// every (dataset, axis) the scale is attached to. `dsid` is then made a
+    /// scale if it is not one already ([`set_dimension_scale`] with no name).
+    /// Both lists are rewritten whole; what an existing list holds is read
+    /// back as paths (registered this session, or resolved from the file's
+    /// addresses), so an attach in an append session keeps earlier
+    /// attachments and every reference is stamped with the address its
+    /// target ends up at.
+    ///
+    /// Refused, as upstream refuses them: `did == dsid`; a `did` that is a
+    /// scale or carries a reserved `CLASS` (`IMAGE`, `PALETTE`, `TABLE`); a
+    /// `dsid` that has scales of its own; an axis beyond `did`'s rank.
+    ///
+    /// Attaching a scale already attached to that axis changes nothing. This
+    /// is stricter than upstream, which leaves `DIMENSION_LIST` as it is but
+    /// still appends a duplicate `REFERENCE_LIST` entry; a second entry for
+    /// the same (dataset, axis) tells `H5DSis_attached` nothing the first
+    /// does not.
+    ///
+    /// [`set_dimension_scale`]: Self::set_dimension_scale
+    pub fn attach_dimension_scale(&self, did: usize, dsid: usize, idx: usize) -> IoResult<()> {
+        let data_path = self.dataset_name(did)?;
+        let scale_path = self.dataset_name(dsid)?;
+        if did == dsid {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset '{data_path}' cannot be its own dimension scale"
+            )));
+        }
+        if self.is_dimension_scale(did)? {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset '{data_path}' is a dimension scale and cannot have scales attached"
+            )));
+        }
+        if self.dataset_attribute(dsid, DIMENSION_LIST)?.is_some() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset '{scale_path}' has dimension scales attached and cannot be one"
+            )));
+        }
+        if self.has_reserved_class(did)? {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset '{data_path}' holds an image, palette or table and cannot have \
+                 dimension scales"
+            )));
+        }
+        let rank = self.ds(did).lock().dataspace.dims.len().max(1);
+        if idx >= rank {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "axis {idx} is out of range for the rank-{rank} dataset '{data_path}'"
+            )));
+        }
+
+        let mut lists = match self.dimension_list(did)? {
+            Some(lists) => lists,
+            None => vec![Vec::new(); rank],
+        };
+        if lists.len() != rank {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "DIMENSION_LIST of '{data_path}' has {} entries for a rank-{rank} dataset",
+                lists.len()
+            )));
+        }
+        if lists[idx].contains(&scale_path) {
+            return Ok(());
+        }
+        lists[idx].push(scale_path);
+        self.write_dimension_list(did, &lists)?;
+
+        let mut entries = self.reference_list(dsid)?;
+        entries.push((data_path, idx as u32));
+        self.write_reference_list(dsid, &entries)?;
+
+        if !self.is_dimension_scale(dsid)? {
+            self.set_dimension_scale(dsid, None)?;
+        }
+        Ok(())
+    }
+
+    /// The registry name of live dataset `index`, or why there is none.
+    fn dataset_name(&self, index: usize) -> IoResult<String> {
+        let count = self.dataset_count();
+        if index >= count {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset index {index} out of range (have {count})"
+            )));
+        }
+        let ds = self.ds(index);
+        let m = ds.lock();
+        if m.deleted {
+            return Err(crate::io::IoError::NotFound(format!(
+                "dataset '{}' has been deleted",
+                m.name
+            )));
+        }
+        Ok(m.name.clone())
+    }
+
+    /// The stored attribute `name` of dataset `index`, without marking the
+    /// header dirty the way [`with_attr_list`](Self::with_attr_list) must.
+    fn dataset_attribute(&self, index: usize, name: &str) -> IoResult<Option<AttributeEntry>> {
+        self.dataset_name(index)?;
+        Ok(self
+            .ds(index)
+            .lock()
+            .attributes
+            .iter()
+            .find(|a| a.name() == name)
+            .cloned())
+    }
+
+    /// Write the scalar fixed-length string attribute `name` = `value` on
+    /// dataset `index` — `H5LT_set_attribute_string`: the string is stored
+    /// null-terminated in `strlen + 1` bytes, and an attribute of that name
+    /// is deleted first rather than written over.
+    fn set_fixed_string_attribute(&self, index: usize, name: &str, value: &str) -> IoResult<()> {
+        if value.as_bytes().contains(&0) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "attribute '{name}' value holds an interior NUL"
+            )));
+        }
+        let size = u32::try_from(value.len() + 1).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "attribute '{name}' value of {} bytes exceeds the fixed-string width field",
+                value.len()
+            ))
+        })?;
+        let mut data = value.as_bytes().to_vec();
+        data.push(0);
+        let attr =
+            AttributeMessage::scalar_numeric(name, DatatypeMessage::fixed_string(size), data);
+        let target = AttrTarget::Dataset(index);
+        self.evict_attr(target, name)?;
+        self.insert_attribute(target, attr, Created)
+    }
+
+    /// The `CLASS` attribute of dataset `index`, read the way `H5DS` reads
+    /// it: as a C string, up to the first NUL.
+    fn class_attribute(&self, index: usize) -> IoResult<Option<ClassAttr>> {
+        use crate::format::global_heap::decode_vlen_reference;
+
+        let Some(entry) = self.dataset_attribute(index, "CLASS")? else {
+            return Ok(None);
+        };
+        let msg = entry.decoded().map_err(|reason| {
+            crate::io::IoError::InvalidState(format!(
+                "CLASS attribute of '{}' cannot be decoded: {reason}",
+                self.ds(index).lock().name
+            ))
+        })?;
+        Ok(Some(match &msg.datatype {
+            DatatypeMessage::FixedString { size, padding, .. } => {
+                let avail = (*size as usize).min(msg.data.len());
+                ClassAttr::Fixed {
+                    size: *size,
+                    null_terminated: *padding == 0,
+                    text: c_string(&msg.data[..avail]),
+                }
+            }
+            DatatypeMessage::VarLenString { .. } => {
+                let (_, addr, obj_idx) = decode_vlen_reference(&msg.data, &self.ctx)?;
+                let bytes = if addr == 0 || addr == UNDEF_ADDR {
+                    Vec::new()
+                } else {
+                    let obj_idx = u16::try_from(obj_idx).map_err(|_| {
+                        crate::io::IoError::InvalidState(format!(
+                            "global heap object index {obj_idx} does not fit the 16-bit on-disk \
+                             field"
+                        ))
+                    })?;
+                    self.read_heap_object(addr, obj_idx)?
+                };
+                ClassAttr::VarLen(c_string(&bytes))
+            }
+            _ => ClassAttr::NotString,
+        }))
+    }
+
+    /// `H5DSis_scale`: a `CLASS` that is a string saying `DIMENSION_SCALE` —
+    /// and, for a fixed-length string, null-terminated and exactly 16 bytes
+    /// wide, the width the spec gives the attribute.
+    fn is_dimension_scale(&self, index: usize) -> IoResult<bool> {
+        Ok(match self.class_attribute(index)? {
+            None | Some(ClassAttr::NotString) => false,
+            Some(ClassAttr::Fixed {
+                size,
+                null_terminated,
+                text,
+            }) => null_terminated && size == 16 && text == DIMENSION_SCALE_CLASS,
+            Some(ClassAttr::VarLen(text)) => text == DIMENSION_SCALE_CLASS,
+        })
+    }
+
+    /// `H5DS_is_reserved`: a `CLASS` naming an image, palette or table — the
+    /// datasets the other high-level APIs own. A `CLASS` that is not a string
+    /// is an error here, where [`is_dimension_scale`](Self::is_dimension_scale)
+    /// reads it as "not a scale", because that is how upstream splits them.
+    fn has_reserved_class(&self, index: usize) -> IoResult<bool> {
+        Ok(match self.class_attribute(index)? {
+            None => false,
+            Some(ClassAttr::NotString) => {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "CLASS attribute of '{}' is not a string",
+                    self.ds(index).lock().name
+                )))
+            }
+            Some(ClassAttr::Fixed { text, .. }) | Some(ClassAttr::VarLen(text)) => {
+                matches!(text.as_str(), "IMAGE" | "PALETTE" | "TABLE")
+            }
+        })
+    }
+
+    /// The bytes of object `index` in the global heap collection at
+    /// `collection` — `H5HG_read`.
+    fn read_heap_object(&self, collection: u64, index: u16) -> IoResult<Vec<u8>> {
+        use crate::format::global_heap::GlobalHeapCollection;
+
+        let mut image = self.handle.read_at_most(collection, 4096)?;
+        let declared = GlobalHeapCollection::decode_size(&image, &self.ctx)?;
+        if declared > image.len() {
+            image = self.handle.read_at(collection, declared)?;
+        }
+        let (gcol, _) = GlobalHeapCollection::decode(&image[..declared], &self.ctx)?;
+        gcol.get_object(index).map(<[u8]>::to_vec).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap collection {collection:#x} has no object {index}"
+            ))
+        })
+    }
+
+    /// The path of the object whose header is at `addr` in the file as it
+    /// was opened — what an object reference read back from an append
+    /// session's existing attributes names.
+    fn path_of_header_address(&self, addr: u64) -> IoResult<String> {
+        for ds in self.dataset_refs() {
+            let m = ds.lock();
+            if !m.deleted && m.obj_header_written_addr == Some(addr) {
+                return Ok(m.name.clone());
+            }
+        }
+        for grp in self.group_refs() {
+            let g = grp.lock();
+            if !g.deleted && g.obj_header_written_addr == Some(addr) {
+                return Ok(g.name.clone());
+            }
+        }
+        Err(crate::io::IoError::InvalidState(format!(
+            "object reference to header {addr:#x} names no dataset or group of this file"
+        )))
+    }
+
+    /// The path a reference slot inside a global heap object names: the one
+    /// registered for stamping when this session wrote the slot, else the
+    /// one the address on disk resolves to.
+    fn heap_reference_path(
+        &self,
+        collection: u64,
+        index: u16,
+        token_offset: usize,
+        on_disk: &[u8],
+    ) -> IoResult<String> {
+        let registered = self
+            .pending_heap_references
+            .lock()
+            .iter()
+            .find(|p| {
+                p.collection == collection && p.index == index && p.token_offset == token_offset
+            })
+            .map(|p| match &p.target {
+                PendingHeapTarget::Dataset(path) | PendingHeapTarget::Object(path) => path.clone(),
+            });
+        if let Some(path) = registered {
+            return Ok(path);
+        }
+        let mut raw = [0u8; 8];
+        raw[..on_disk.len()].copy_from_slice(on_disk);
+        self.path_of_header_address(u64::from_le_bytes(raw))
+    }
+
+    /// Dataset `did`'s `DIMENSION_LIST` as the paths of the scales on each
+    /// axis, or `None` when it has no such attribute.
+    fn dimension_list(&self, did: usize) -> IoResult<Option<Vec<Vec<String>>>> {
+        use crate::format::global_heap::{decode_vlen_reference, vlen_reference_size};
+
+        let Some(entry) = self.dataset_attribute(did, DIMENSION_LIST)? else {
+            return Ok(None);
+        };
+        let name = || self.ds(did).lock().name.clone();
+        let msg = entry.decoded().map_err(|reason| {
+            crate::io::IoError::InvalidState(format!(
+                "DIMENSION_LIST of '{}' cannot be decoded: {reason}",
+                name()
+            ))
+        })?;
+        match &msg.datatype {
+            DatatypeMessage::VarLenSequence { base }
+                if matches!(
+                    **base,
+                    DatatypeMessage::Reference {
+                        kind: ReferenceKind::Object1,
+                        ..
+                    }
+                ) => {}
+            other => {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "DIMENSION_LIST of '{}' is {other}; only a sequence of H5T_STD_REF_OBJ \
+                     references is supported",
+                    name()
+                )))
+            }
+        }
+        let sa = self.ctx.sizeof_addr as usize;
+        let ref_size = vlen_reference_size(&self.ctx);
+        let mut lists = Vec::new();
+        for elem in msg.data.chunks_exact(ref_size) {
+            let (seq_len, addr, obj_idx) = decode_vlen_reference(elem, &self.ctx)?;
+            let seq_len = seq_len as usize;
+            let mut paths = Vec::with_capacity(seq_len);
+            if seq_len > 0 {
+                let index = u16::try_from(obj_idx).map_err(|_| {
+                    crate::io::IoError::InvalidState(format!(
+                        "global heap object index {obj_idx} does not fit the 16-bit on-disk field"
+                    ))
+                })?;
+                let bytes = self.read_heap_object(addr, index)?;
+                if bytes.len() < seq_len * sa {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "DIMENSION_LIST of '{}' names {seq_len} scales in a {}-byte heap object",
+                        name(),
+                        bytes.len()
+                    )));
+                }
+                for k in 0..seq_len {
+                    paths.push(self.heap_reference_path(
+                        addr,
+                        index,
+                        k * sa,
+                        &bytes[k * sa..(k + 1) * sa],
+                    )?);
+                }
+            }
+            lists.push(paths);
+        }
+        Ok(Some(lists))
+    }
+
+    /// Store `lists` — the scales attached to each axis — as dataset `did`'s
+    /// `DIMENSION_LIST`, replacing the one it has.
+    ///
+    /// Each axis is one global heap object of `sizeof_addr` bytes per scale,
+    /// zero until finalize stamps the scale's header address in through
+    /// [`write_heap_reference_values`](Self::write_heap_reference_values);
+    /// an axis with no scale is an empty heap object, as libhdf5's
+    /// `H5VL__native_blob_put` stores an empty sequence. The attribute's
+    /// value is the vlen reference to each object, final at write time.
+    fn write_dimension_list(&self, did: usize, lists: &[Vec<String>]) -> IoResult<()> {
+        use crate::format::global_heap::{
+            encode_vlen_reference, vlen_reference_size, vlen_seq_len,
+        };
+
+        let target = AttrTarget::Dataset(did);
+        let origin = self.evict_attr(target, DIMENSION_LIST)?;
+        let sa = self.ctx.sizeof_addr as usize;
+        let blobs: Vec<Vec<u8>> = lists.iter().map(|l| vec![0u8; l.len() * sa]).collect();
+        let items: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        let placements = self.insert_vlen_objects(&items)?;
+
+        let mut data = Vec::with_capacity(lists.len() * vlen_reference_size(&self.ctx));
+        let mut pending = self.pending_heap_references.lock();
+        for (axis, &(collection, index)) in placements.iter().enumerate() {
+            for (k, path) in lists[axis].iter().enumerate() {
+                pending.push(PendingHeapReference {
+                    collection,
+                    index,
+                    token_offset: k * sa,
+                    target: PendingHeapTarget::Object(path.clone()),
+                });
+            }
+            data.extend_from_slice(&encode_vlen_reference(
+                vlen_seq_len(lists[axis].len())?,
+                collection,
+                u32::from(index),
+                &self.ctx,
+            ));
+        }
+        drop(pending);
+
+        let attr = AttributeMessage {
+            name: DIMENSION_LIST.to_string(),
+            datatype: DatatypeMessage::VarLenSequence {
+                base: Box::new(DatatypeMessage::object_reference(&self.ctx)),
+            },
+            dataspace: DataspaceMessage::simple(&[lists.len() as u64]),
+            data,
+        };
+        self.insert_attribute(target, attr, origin)
+    }
+
+    /// Scale `dsid`'s `REFERENCE_LIST` as (dataset path, axis) pairs; empty
+    /// when it has no such attribute.
+    fn reference_list(&self, dsid: usize) -> IoResult<Vec<(String, u32)>> {
+        let Some(entry) = self.dataset_attribute(dsid, REFERENCE_LIST)? else {
+            return Ok(Vec::new());
+        };
+        let name = || self.ds(dsid).lock().name.clone();
+        let msg = entry.decoded().map_err(|reason| {
+            crate::io::IoError::InvalidState(format!(
+                "REFERENCE_LIST of '{}' cannot be decoded: {reason}",
+                name()
+            ))
+        })?;
+        let unsupported = |why: String| {
+            crate::io::IoError::InvalidState(format!(
+                "REFERENCE_LIST of '{}' is {}; {why}",
+                name(),
+                msg.datatype
+            ))
+        };
+        let DatatypeMessage::Compound { size, members } = &msg.datatype else {
+            return Err(unsupported("a compound is required".into()));
+        };
+        let member = |m: &str| {
+            members
+                .iter()
+                .find(|c| c.name == m)
+                .ok_or_else(|| unsupported(format!("member '{m}' is missing")))
+        };
+        let dataset = member("dataset")?;
+        let dimension = member("dimension")?;
+        let sa = self.ctx.sizeof_addr as usize;
+        if !matches!(
+            dataset.datatype,
+            DatatypeMessage::Reference {
+                kind: ReferenceKind::Object1,
+                ..
+            }
+        ) {
+            return Err(unsupported(
+                "only an H5T_STD_REF_OBJ 'dataset' member is supported".into(),
+            ));
+        }
+        let DatatypeMessage::FixedPoint {
+            size: 4,
+            byte_order,
+            ..
+        } = dimension.datatype
+        else {
+            return Err(unsupported(
+                "a 4-byte integer 'dimension' member is required".into(),
+            ));
+        };
+        let stride = *size as usize;
+        let registered: Option<Vec<String>> = self
+            .attribute_references
+            .lock()
+            .iter()
+            .find(|r| r.scope == AttrScope::Dataset(dsid) && r.name == REFERENCE_LIST)
+            .map(|r| r.targets.clone());
+        let mut entries = Vec::with_capacity(msg.data.len() / stride);
+        for (i, elem) in msg.data.chunks_exact(stride).enumerate() {
+            let at = |offset: u32, len: usize| {
+                elem.get(offset as usize..offset as usize + len)
+                    .ok_or_else(|| unsupported(format!("element {i} is too short for its members")))
+            };
+            let path = match &registered {
+                Some(targets) => targets.get(i).cloned().ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "REFERENCE_LIST of '{}' entry {i} has no registered target",
+                        name()
+                    ))
+                })?,
+                None => {
+                    let mut raw = [0u8; 8];
+                    raw[..sa].copy_from_slice(at(dataset.offset, sa)?);
+                    self.path_of_header_address(u64::from_le_bytes(raw))?
+                }
+            };
+            let dim: [u8; 4] = at(dimension.offset, 4)?.try_into().expect("4 bytes");
+            let dim = match byte_order {
+                ByteOrder::LittleEndian => u32::from_le_bytes(dim),
+                ByteOrder::BigEndian => u32::from_be_bytes(dim),
+            };
+            entries.push((path, dim));
+        }
+        Ok(entries)
+    }
+
+    /// Store `entries` as scale `dsid`'s `REFERENCE_LIST`, replacing the one
+    /// it has — deleted and created anew, as upstream does, so it takes a
+    /// fresh creation index.
+    ///
+    /// The element is libhdf5's `ds_list_t` as it lands on disk: the
+    /// reference at offset 0, `dimension` right after it, and the struct's
+    /// trailing padding — 16 bytes over 8-byte addresses. The addresses are
+    /// stamped at finalize through [`object_attributes`](Self::object_attributes)
+    /// like any reference attribute's; the `dimension` fields are final here.
+    fn write_reference_list(&self, dsid: usize, entries: &[(String, u32)]) -> IoResult<()> {
+        use crate::format::messages::datatype::CompoundMember;
+
+        let target = AttrTarget::Dataset(dsid);
+        self.evict_attr(target, REFERENCE_LIST)?;
+        let sa = self.ctx.sizeof_addr as usize;
+        let stride = sa + 8;
+        let datatype = DatatypeMessage::compound(
+            stride as u32,
+            vec![
+                CompoundMember {
+                    name: "dataset".to_string(),
+                    offset: 0,
+                    datatype: DatatypeMessage::object_reference(&self.ctx),
+                },
+                CompoundMember {
+                    name: "dimension".to_string(),
+                    offset: sa as u32,
+                    datatype: DatatypeMessage::u32_type(),
+                },
+            ],
+        );
+        let mut data = vec![0u8; entries.len() * stride];
+        for (i, (_, dim)) in entries.iter().enumerate() {
+            data[i * stride + sa..i * stride + sa + 4].copy_from_slice(&dim.to_le_bytes());
+        }
+        let attr = AttributeMessage::array_numeric(
+            REFERENCE_LIST,
+            datatype,
+            &[entries.len() as u64],
+            data,
+        );
+        self.insert_attribute(target, attr, Created)?;
+        self.attribute_references
+            .lock()
+            .push(AttributeReferenceValue {
+                scope: AttrScope::Dataset(dsid),
+                name: REFERENCE_LIST.to_string(),
+                targets: entries.iter().map(|(p, _)| p.clone()).collect(),
+                stride,
             });
         Ok(())
     }
