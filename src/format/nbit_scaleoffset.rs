@@ -34,11 +34,17 @@ struct NbitAtomic {
 /// complete, `acc` holds the `nacc` bits (fewer than 8) that do not yet
 /// fill one. The buffer is zero-filled, so a completed byte is stored, not
 /// or-ed in.
+///
+/// A byte past the end of the buffer is dropped and remembered, and
+/// [`BitWriter::finish`] reports it: the nbit parameter tree a file stores
+/// can describe more packed bits than the elements hold, so the sink is
+/// bounded here and the owner learns of the overrun once, at the end.
 struct BitWriter<'a> {
     buf: &'a mut [u8],
     j: usize,
     acc: u64,
     nacc: u32,
+    overrun: bool,
 }
 
 impl<'a> BitWriter<'a> {
@@ -48,7 +54,17 @@ impl<'a> BitWriter<'a> {
             j: 0,
             acc: 0,
             nacc: 0,
+            overrun: false,
         }
+    }
+
+    #[inline]
+    fn store(&mut self, b: u8) {
+        match self.buf.get_mut(self.j) {
+            Some(slot) => *slot = b,
+            None => self.overrun = true,
+        }
+        self.j += 1;
     }
 
     /// Append the low `n` bits of `v`, most significant first, `n <= 64`.
@@ -69,18 +85,27 @@ impl<'a> BitWriter<'a> {
         self.nacc += n;
         while self.nacc >= 8 {
             self.nacc -= 8;
-            self.buf[self.j] = (self.acc >> self.nacc) as u8;
-            self.j += 1;
+            self.store((self.acc >> self.nacc) as u8);
         }
     }
 
     /// Store the hanging bits and return the C cursor's byte index: the
     /// partial byte, or one past the last byte when the final bit filled it.
-    fn finish(self) -> usize {
+    /// Fails if any byte fell past the end of the buffer.
+    fn finish(mut self) -> FormatResult<usize> {
         if self.nacc > 0 {
-            self.buf[self.j] = (self.acc << (8 - self.nacc)) as u8;
+            let b = (self.acc << (8 - self.nacc)) as u8;
+            match self.buf.get_mut(self.j) {
+                Some(slot) => *slot = b,
+                None => self.overrun = true,
+            }
         }
-        self.j
+        if self.overrun {
+            return Err(FormatError::InvalidData(
+                "packed stream longer than the buffer it was sized for".into(),
+            ));
+        }
+        Ok(self.j)
     }
 }
 
@@ -257,6 +282,75 @@ fn nbit_decompress_atomics<const N: usize>(
     Ok(())
 }
 
+/// The nbit parameter list, read through a bounded cursor.
+///
+/// The datatype tree that drives the walk through the parameters is held
+/// in those same parameters, so a list that stops short of the type it
+/// describes can only be caught at each step, never measured up front —
+/// the bound `H5Z_NBIT_PARMS_AVAIL` puts on every read in `H5Znbit.c`.
+/// Every read of the list goes through [`Parms::next`], so no walker can
+/// index past it.
+struct Parms<'a> {
+    list: &'a [u32],
+    pos: usize,
+}
+
+impl<'a> Parms<'a> {
+    fn at(list: &'a [u32], pos: usize) -> Self {
+        Self { list, pos }
+    }
+
+    /// The next parameter, or the truncation error.
+    fn next(&mut self) -> FormatResult<u32> {
+        let v = *self
+            .list
+            .get(self.pos)
+            .ok_or_else(|| FormatError::InvalidData("nbit: parameter list truncated".into()))?;
+        self.pos += 1;
+        Ok(v)
+    }
+
+    fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Rewind to a position taken from [`Parms::position`], so one element
+    /// description is walked once per repeat.
+    fn seek(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+}
+
+/// The `size` bytes of one element at `offset`, or the error a description
+/// that reaches past the buffer earns. The C indexes `data` unchecked here;
+/// this port refuses rather than panic.
+fn element(data: &[u8], offset: usize, size: u32) -> FormatResult<&[u8]> {
+    offset
+        .checked_add(size as usize)
+        .and_then(|end| data.get(offset..end))
+        .ok_or_else(|| FormatError::InvalidData("nbit: element extends past buffer".into()))
+}
+
+/// The mutable counterpart of [`element`].
+fn element_mut(data: &mut [u8], offset: usize, size: u32) -> FormatResult<&mut [u8]> {
+    offset
+        .checked_add(size as usize)
+        .and_then(|end| data.get_mut(offset..end))
+        .ok_or_else(|| FormatError::InvalidData("nbit: element extends past buffer".into()))
+}
+
+/// How many `base_size`-byte elements an array of `total_size` bytes holds:
+/// the C's `total_size / base_size`, refusing the zero divisor a crafted
+/// list can carry.
+fn repeat_count(total_size: u32, base_size: u32) -> FormatResult<usize> {
+    if base_size == 0 {
+        return Err(FormatError::InvalidData(
+            "nbit: zero-sized array base type".into(),
+        ));
+    }
+    Ok((total_size / base_size) as usize)
+}
+
 /// Decompress one nooptype element, mirroring `H5Z__nbit_decompress_one_nooptype`.
 fn nbit_decompress_one_nooptype(
     data: &mut [u8],
@@ -264,17 +358,23 @@ fn nbit_decompress_one_nooptype(
     r: &mut BitReader,
     size: u32,
 ) -> FormatResult<()> {
-    for b in &mut data[data_offset..data_offset + size as usize] {
+    for b in element_mut(data, data_offset, size)? {
         *b = r.get(8)? as u8;
     }
     Ok(())
 }
 
 /// Compress one nooptype element, mirroring `H5Z__nbit_compress_one_nooptype`.
-fn nbit_compress_one_nooptype(data: &[u8], data_offset: usize, w: &mut BitWriter, size: u32) {
-    for &b in &data[data_offset..data_offset + size as usize] {
+fn nbit_compress_one_nooptype(
+    data: &[u8],
+    data_offset: usize,
+    w: &mut BitWriter,
+    size: u32,
+) -> FormatResult<()> {
+    for &b in element(data, data_offset, size)? {
         w.put(u64::from(b), 8);
     }
+    Ok(())
 }
 
 /// Decompress one atomic element, mirroring `H5Z__nbit_decompress_one_atomic`.
@@ -287,7 +387,7 @@ fn nbit_decompress_one_atomic(
     r: &mut BitReader,
     p: &NbitAtomic,
 ) -> FormatResult<()> {
-    let elem = &mut data[data_offset..data_offset + p.size as usize];
+    let elem = element_mut(data, data_offset, p.size)?;
     if matches!(p.size, 1 | 2 | 4 | 8) {
         let field = r.get(p.precision)?;
         let le = p.order == NBIT_ORDER_LE;
@@ -301,36 +401,36 @@ fn nbit_decompress_one_atomic(
 }
 
 /// Compress one atomic element, mirroring `H5Z__nbit_compress_one_atomic`.
-fn nbit_compress_one_atomic(data: &[u8], data_offset: usize, w: &mut BitWriter, p: &NbitAtomic) {
-    let elem = &data[data_offset..data_offset + p.size as usize];
+fn nbit_compress_one_atomic(
+    data: &[u8],
+    data_offset: usize,
+    w: &mut BitWriter,
+    p: &NbitAtomic,
+) -> FormatResult<()> {
+    let elem = element(data, data_offset, p.size)?;
     if matches!(p.size, 1 | 2 | 4 | 8) {
         let le = p.order == NBIT_ORDER_LE;
         w.put(
             by_width!(p.size, nbit_field(elem, le, p.offset)),
             p.precision,
         );
-        return;
+        return Ok(());
     }
     for (k, bits, shift) in nbit_bytes(p) {
         w.put(u64::from(elem[k] >> shift), bits);
     }
+    Ok(())
 }
 
-/// Read an atomic parameter group starting at `parms[idx]` (after the class
-/// code has already been consumed): `size, order, precision, offset`.
-fn read_atomic(parms: &[u32], idx: &mut usize) -> FormatResult<NbitAtomic> {
-    if *idx + 4 > parms.len() {
-        return Err(FormatError::InvalidData(
-            "nbit: parameter list truncated".into(),
-        ));
-    }
+/// Read an atomic parameter group (after the class code has already been
+/// consumed): `size, order, precision, offset`.
+fn read_atomic(parms: &mut Parms) -> FormatResult<NbitAtomic> {
     let p = NbitAtomic {
-        size: parms[*idx],
-        order: parms[*idx + 1],
-        precision: parms[*idx + 2],
-        offset: parms[*idx + 3],
+        size: parms.next()?,
+        order: parms.next()?,
+        precision: parms.next()?,
+        offset: parms.next()?,
     };
-    *idx += 4;
     // Validate every atomic (top-level, array member, compound member) so
     // the bit math below cannot overflow or panic on a crafted file.
     let bits = p.size.checked_mul(8);
@@ -353,58 +453,39 @@ fn nbit_decompress_one_array(
     data: &mut [u8],
     data_offset: usize,
     r: &mut BitReader,
-    parms: &[u32],
-    parms_index: &mut usize,
+    parms: &mut Parms,
 ) -> FormatResult<()> {
-    if *parms_index + 2 > parms.len() {
-        return Err(FormatError::InvalidData(
-            "nbit: parameter list truncated".into(),
-        ));
-    }
-    let total_size = parms[*parms_index];
-    let base_class = parms[*parms_index + 1];
-    *parms_index += 2;
+    let total_size = parms.next()?;
+    let base_class = parms.next()?;
 
     match base_class {
         NBIT_ATOMIC => {
-            let p = read_atomic(parms, parms_index)?;
-            let n = total_size / p.size;
-            for i in 0..n as usize {
+            let p = read_atomic(parms)?;
+            let n = repeat_count(total_size, p.size)?;
+            for i in 0..n {
                 nbit_decompress_one_atomic(data, data_offset + i * p.size as usize, r, &p)?;
             }
         }
         NBIT_ARRAY => {
-            let base_size = parms[*parms_index];
-            let n = total_size / base_size;
-            let begin_index = *parms_index;
-            for i in 0..n as usize {
-                *parms_index = begin_index;
-                nbit_decompress_one_array(
-                    data,
-                    data_offset + i * base_size as usize,
-                    r,
-                    parms,
-                    parms_index,
-                )?;
+            let begin = parms.position();
+            let base_size = parms.next()?;
+            let n = repeat_count(total_size, base_size)?;
+            for i in 0..n {
+                parms.seek(begin);
+                nbit_decompress_one_array(data, data_offset + i * base_size as usize, r, parms)?;
             }
         }
         NBIT_COMPOUND => {
-            let base_size = parms[*parms_index];
-            let n = total_size / base_size;
-            let begin_index = *parms_index;
-            for i in 0..n as usize {
-                *parms_index = begin_index;
-                nbit_decompress_one_compound(
-                    data,
-                    data_offset + i * base_size as usize,
-                    r,
-                    parms,
-                    parms_index,
-                )?;
+            let begin = parms.position();
+            let base_size = parms.next()?;
+            let n = repeat_count(total_size, base_size)?;
+            for i in 0..n {
+                parms.seek(begin);
+                nbit_decompress_one_compound(data, data_offset + i * base_size as usize, r, parms)?;
             }
         }
         NBIT_NOOPTYPE => {
-            *parms_index += 1; // skip size of no-op type
+            parms.next()?; // skip size of no-op type
             nbit_decompress_one_nooptype(data, data_offset, r, total_size)?;
         }
         _ => {
@@ -422,54 +503,28 @@ fn nbit_decompress_one_compound(
     data: &mut [u8],
     data_offset: usize,
     r: &mut BitReader,
-    parms: &[u32],
-    parms_index: &mut usize,
+    parms: &mut Parms,
 ) -> FormatResult<()> {
-    if *parms_index + 2 > parms.len() {
-        return Err(FormatError::InvalidData(
-            "nbit: parameter list truncated".into(),
-        ));
-    }
-    *parms_index += 1; // skip compound size
-    let nmembers = parms[*parms_index];
-    *parms_index += 1;
+    parms.next()?; // skip compound size
+    let nmembers = parms.next()?;
 
     for _ in 0..nmembers {
-        if *parms_index + 2 > parms.len() {
-            return Err(FormatError::InvalidData(
-                "nbit: parameter list truncated".into(),
-            ));
-        }
-        let member_offset = parms[*parms_index] as usize;
-        let member_class = parms[*parms_index + 1];
-        *parms_index += 2;
+        let member_offset = parms.next()? as usize;
+        let member_class = parms.next()?;
 
         match member_class {
             NBIT_ATOMIC => {
-                let p = read_atomic(parms, parms_index)?;
+                let p = read_atomic(parms)?;
                 nbit_decompress_one_atomic(data, data_offset + member_offset, r, &p)?;
             }
             NBIT_ARRAY => {
-                nbit_decompress_one_array(
-                    data,
-                    data_offset + member_offset,
-                    r,
-                    parms,
-                    parms_index,
-                )?;
+                nbit_decompress_one_array(data, data_offset + member_offset, r, parms)?;
             }
             NBIT_COMPOUND => {
-                nbit_decompress_one_compound(
-                    data,
-                    data_offset + member_offset,
-                    r,
-                    parms,
-                    parms_index,
-                )?;
+                nbit_decompress_one_compound(data, data_offset + member_offset, r, parms)?;
             }
             NBIT_NOOPTYPE => {
-                let size = parms[*parms_index];
-                *parms_index += 1;
+                let size = parms.next()?;
                 nbit_decompress_one_nooptype(data, data_offset + member_offset, r, size)?;
             }
             _ => {
@@ -488,59 +543,40 @@ fn nbit_compress_one_array(
     data: &[u8],
     data_offset: usize,
     w: &mut BitWriter,
-    parms: &[u32],
-    parms_index: &mut usize,
+    parms: &mut Parms,
 ) -> FormatResult<()> {
-    if *parms_index + 2 > parms.len() {
-        return Err(FormatError::InvalidData(
-            "nbit: parameter list truncated".into(),
-        ));
-    }
-    let total_size = parms[*parms_index];
-    let base_class = parms[*parms_index + 1];
-    *parms_index += 2;
+    let total_size = parms.next()?;
+    let base_class = parms.next()?;
 
     match base_class {
         NBIT_ATOMIC => {
-            let p = read_atomic(parms, parms_index)?;
-            let n = total_size / p.size;
-            for i in 0..n as usize {
-                nbit_compress_one_atomic(data, data_offset + i * p.size as usize, w, &p);
+            let p = read_atomic(parms)?;
+            let n = repeat_count(total_size, p.size)?;
+            for i in 0..n {
+                nbit_compress_one_atomic(data, data_offset + i * p.size as usize, w, &p)?;
             }
         }
         NBIT_ARRAY => {
-            let base_size = parms[*parms_index];
-            let n = total_size / base_size;
-            let begin_index = *parms_index;
-            for i in 0..n as usize {
-                *parms_index = begin_index;
-                nbit_compress_one_array(
-                    data,
-                    data_offset + i * base_size as usize,
-                    w,
-                    parms,
-                    parms_index,
-                )?;
+            let begin = parms.position();
+            let base_size = parms.next()?;
+            let n = repeat_count(total_size, base_size)?;
+            for i in 0..n {
+                parms.seek(begin);
+                nbit_compress_one_array(data, data_offset + i * base_size as usize, w, parms)?;
             }
         }
         NBIT_COMPOUND => {
-            let base_size = parms[*parms_index];
-            let n = total_size / base_size;
-            let begin_index = *parms_index;
-            for i in 0..n as usize {
-                *parms_index = begin_index;
-                nbit_compress_one_compound(
-                    data,
-                    data_offset + i * base_size as usize,
-                    w,
-                    parms,
-                    parms_index,
-                )?;
+            let begin = parms.position();
+            let base_size = parms.next()?;
+            let n = repeat_count(total_size, base_size)?;
+            for i in 0..n {
+                parms.seek(begin);
+                nbit_compress_one_compound(data, data_offset + i * base_size as usize, w, parms)?;
             }
         }
         NBIT_NOOPTYPE => {
-            *parms_index += 1;
-            nbit_compress_one_nooptype(data, data_offset, w, total_size);
+            parms.next()?;
+            nbit_compress_one_nooptype(data, data_offset, w, total_size)?;
         }
         _ => {
             return Err(FormatError::InvalidData(format!(
@@ -557,49 +593,29 @@ fn nbit_compress_one_compound(
     data: &[u8],
     data_offset: usize,
     w: &mut BitWriter,
-    parms: &[u32],
-    parms_index: &mut usize,
+    parms: &mut Parms,
 ) -> FormatResult<()> {
-    if *parms_index + 2 > parms.len() {
-        return Err(FormatError::InvalidData(
-            "nbit: parameter list truncated".into(),
-        ));
-    }
-    *parms_index += 1;
-    let nmembers = parms[*parms_index];
-    *parms_index += 1;
+    parms.next()?;
+    let nmembers = parms.next()?;
 
     for _ in 0..nmembers {
-        if *parms_index + 2 > parms.len() {
-            return Err(FormatError::InvalidData(
-                "nbit: parameter list truncated".into(),
-            ));
-        }
-        let member_offset = parms[*parms_index] as usize;
-        let member_class = parms[*parms_index + 1];
-        *parms_index += 2;
+        let member_offset = parms.next()? as usize;
+        let member_class = parms.next()?;
 
         match member_class {
             NBIT_ATOMIC => {
-                let p = read_atomic(parms, parms_index)?;
-                nbit_compress_one_atomic(data, data_offset + member_offset, w, &p);
+                let p = read_atomic(parms)?;
+                nbit_compress_one_atomic(data, data_offset + member_offset, w, &p)?;
             }
             NBIT_ARRAY => {
-                nbit_compress_one_array(data, data_offset + member_offset, w, parms, parms_index)?;
+                nbit_compress_one_array(data, data_offset + member_offset, w, parms)?;
             }
             NBIT_COMPOUND => {
-                nbit_compress_one_compound(
-                    data,
-                    data_offset + member_offset,
-                    w,
-                    parms,
-                    parms_index,
-                )?;
+                nbit_compress_one_compound(data, data_offset + member_offset, w, parms)?;
             }
             NBIT_NOOPTYPE => {
-                let size = parms[*parms_index];
-                *parms_index += 1;
-                nbit_compress_one_nooptype(data, data_offset + member_offset, w, size);
+                let size = parms.next()?;
+                nbit_compress_one_nooptype(data, data_offset + member_offset, w, size)?;
             }
             _ => {
                 return Err(FormatError::InvalidData(format!(
@@ -612,6 +628,10 @@ fn nbit_compress_one_compound(
     Ok(())
 }
 
+/// The parameters the filter header always occupies: count, no-compression
+/// flag, element count, datatype class and datatype size.
+const NBIT_HEADER_NPARMS: usize = 5;
+
 /// Apply the HDF5 N-bit filter.
 ///
 /// `cd_values` follows `H5Znbit.c`'s schema:
@@ -620,9 +640,21 @@ fn nbit_compress_one_compound(
 ///
 /// On compress, `data` is the raw element buffer; on decompress, `data`
 /// is the packed buffer and the result is the unpacked element buffer.
+///
+/// Both directions read the parameter tree a file stores, so both are
+/// bounded against it the way `H5Z__filter_nbit` bounds its read path:
+/// the header must be present and the count must match (#6497), and the
+/// walkers above refuse a tree that outruns the list or the buffer.
 pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResult<Vec<u8>> {
-    if cd_values.len() < 4 {
+    if cd_values.len() < NBIT_HEADER_NPARMS {
         return Err(FormatError::InvalidData("nbit: cd_values too short".into()));
+    }
+    if cd_values[0] as usize != cd_values.len() {
+        return Err(FormatError::InvalidData(format!(
+            "nbit: cd_values[0] names {} parameters but {} are stored",
+            cd_values[0],
+            cd_values.len()
+        )));
     }
     // cd_values[1] != 0 -> data is full-precision, filter is a pass-through.
     if cd_values[1] != 0 {
@@ -634,7 +666,9 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
     if dtype_size == 0 {
         return Err(FormatError::InvalidData("nbit: zero datatype size".into()));
     }
-    let unpacked_size = d_nelmts * dtype_size;
+    let unpacked_size = d_nelmts.checked_mul(dtype_size).ok_or_else(|| {
+        FormatError::InvalidData("nbit: (de)compression buffer size overflow".into())
+    })?;
 
     if compress {
         if data.len() != unpacked_size {
@@ -649,28 +683,25 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
         let mut w = BitWriter::new(&mut buffer);
         match cd_values[3] {
             NBIT_ATOMIC => {
-                let mut idx = 4;
-                let p = read_atomic(cd_values, &mut idx)?;
+                let p = read_atomic(&mut Parms::at(cd_values, 4))?;
                 if matches!(p.size, 1 | 2 | 4 | 8) {
                     by_width!(p.size, nbit_compress_atomics(data, &mut w, &p));
                 } else {
                     for i in 0..d_nelmts {
-                        nbit_compress_one_atomic(data, i * p.size as usize, &mut w, &p);
+                        nbit_compress_one_atomic(data, i * p.size as usize, &mut w, &p)?;
                     }
                 }
             }
             NBIT_ARRAY => {
-                let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
-                    let mut idx = 4;
-                    nbit_compress_one_array(data, i * size, &mut w, cd_values, &mut idx)?;
+                    let mut parms = Parms::at(cd_values, 4);
+                    nbit_compress_one_array(data, i * dtype_size, &mut w, &mut parms)?;
                 }
             }
             NBIT_COMPOUND => {
-                let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
-                    let mut idx = 4;
-                    nbit_compress_one_compound(data, i * size, &mut w, cd_values, &mut idx)?;
+                    let mut parms = Parms::at(cd_values, 4);
+                    nbit_compress_one_compound(data, i * dtype_size, &mut w, &mut parms)?;
                 }
             }
             other => {
@@ -681,21 +712,23 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
             }
         }
         // libhdf5 reports new_size + 1 (any hanging bits round up).
-        let j = w.finish();
+        let j = w.finish()?;
         buffer.truncate(j + 1);
         Ok(buffer)
     } else {
-        let mut out = vec![0u8; unpacked_size];
+        // A crafted count can name more than any machine holds; fail the
+        // way `H5MM_malloc` fails in `H5Z__filter_nbit`, not by aborting.
+        let mut out = Vec::new();
+        out.try_reserve_exact(unpacked_size).map_err(|_| {
+            FormatError::InvalidData(format!(
+                "nbit: cannot allocate {unpacked_size} bytes for decompression"
+            ))
+        })?;
+        out.resize(unpacked_size, 0);
         let mut r = BitReader::new(data, NBIT_SHORT);
         match cd_values[3] {
             NBIT_ATOMIC => {
-                let mut idx = 4;
-                let p = read_atomic(cd_values, &mut idx)?;
-                if p.precision > p.size * 8 || p.precision + p.offset > p.size * 8 {
-                    return Err(FormatError::InvalidData(
-                        "nbit: invalid precision/offset".into(),
-                    ));
-                }
+                let p = read_atomic(&mut Parms::at(cd_values, 4))?;
                 if matches!(p.size, 1 | 2 | 4 | 8) {
                     by_width!(p.size, nbit_decompress_atomics(&mut out, &mut r, &p))?;
                 } else {
@@ -705,17 +738,15 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
                 }
             }
             NBIT_ARRAY => {
-                let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
-                    let mut idx = 4;
-                    nbit_decompress_one_array(&mut out, i * size, &mut r, cd_values, &mut idx)?;
+                    let mut parms = Parms::at(cd_values, 4);
+                    nbit_decompress_one_array(&mut out, i * dtype_size, &mut r, &mut parms)?;
                 }
             }
             NBIT_COMPOUND => {
-                let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
-                    let mut idx = 4;
-                    nbit_decompress_one_compound(&mut out, i * size, &mut r, cd_values, &mut idx)?;
+                    let mut parms = Parms::at(cd_values, 4);
+                    nbit_decompress_one_compound(&mut out, i * dtype_size, &mut r, &mut parms)?;
                 }
             }
             other => {
@@ -1052,7 +1083,7 @@ pub fn forward_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
         let mut w = BitWriter::new(&mut out[SO_BUF_OFFSET..]);
         let le = p.order == SO_ORDER_LE;
         by_width!(p.size, so_pack(&buf, le, minbits, &mut w));
-        w.finish();
+        w.finish()?;
     }
     // minbits == 0: every element is the chunk minimum, so the payload is
     // the single zero byte the size formula leaves.
@@ -1642,6 +1673,102 @@ mod tests {
         let packed = apply_nbit(&raw, &cd, true).unwrap();
         let unpacked = apply_nbit(&packed, &cd, false).unwrap();
         assert_eq!(unpacked, raw);
+    }
+
+    // ---------------------------------------------------------------
+    //  Crafted parameter trees (HDFGroup/hdf5#6497)
+    // ---------------------------------------------------------------
+    //
+    // Each case is one boundary a file-stored list can cross: the header
+    // itself, the list the walk reads, the divisor it computes, the buffer
+    // it writes, the buffer it packs into, and the allocation it asks for.
+    // Every one is an error, never a panic or an abort.
+
+    fn refusal(data: &[u8], cd: &[u32], compress: bool) -> String {
+        match apply_nbit(data, cd, compress) {
+            Ok(out) => panic!("accepted {cd:?}: {} bytes out", out.len()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_list_without_the_datatype_size_is_refused() {
+        // Four values: the header is read through index 4.
+        let err = refusal(&[0; 8], &[4, 0, 1, NBIT_ATOMIC], false);
+        assert!(err.contains("cd_values too short"), "{err}");
+    }
+
+    #[test]
+    fn a_count_that_disagrees_with_the_list_is_refused() {
+        let mut cd = nbit_atomic_cd(1, 2, 12, 0);
+        cd[0] = 9;
+        let err = refusal(&[0; 2], &cd, false);
+        assert!(err.contains("names 9 parameters but 8"), "{err}");
+    }
+
+    #[test]
+    fn an_array_whose_base_lies_past_the_list_is_refused() {
+        // Array of arrays, with the list ending at the inner class code.
+        let cd = [6, 0, 1, NBIT_ARRAY, 8, NBIT_ARRAY];
+        for compress in [false, true] {
+            let err = refusal(&[0; 8], &cd, compress);
+            assert!(err.contains("parameter list truncated"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_array_over_a_zero_sized_base_is_refused() {
+        // Array of a compound whose stored size is 0: the C divides by it.
+        let cd = [8, 0, 1, NBIT_ARRAY, 8, NBIT_COMPOUND, 0, 0];
+        for compress in [false, true] {
+            let err = refusal(&[0; 8], &cd, compress);
+            assert!(err.contains("zero-sized array base type"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_member_past_the_element_is_refused() {
+        // One 4-byte compound element whose only member sits at offset 8.
+        let cd = [12, 0, 1, NBIT_COMPOUND, 4, 1, 8, NBIT_ATOMIC, 4, 0, 32, 0];
+        for compress in [false, true] {
+            let err = refusal(&[0; 4], &cd, compress);
+            assert!(err.contains("element extends past buffer"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_tree_that_packs_more_bits_than_the_element_holds_is_refused() {
+        // Two full-width members at offset 0 of a 4-byte element: 8 bytes of
+        // stream into a sink sized for 5.
+        let cd = [
+            18,
+            0,
+            1,
+            NBIT_COMPOUND,
+            4,
+            2,
+            0,
+            NBIT_ATOMIC,
+            4,
+            0,
+            32,
+            0,
+            0,
+            NBIT_ATOMIC,
+            4,
+            0,
+            32,
+            0,
+        ];
+        let err = refusal(&[0xAB; 4], &cd, true);
+        assert!(err.contains("packed stream longer"), "{err}");
+    }
+
+    #[test]
+    fn an_element_count_no_machine_can_hold_is_refused() {
+        let cd = [8, 0, u32::MAX, NBIT_ATOMIC, u32::MAX, NBIT_ORDER_LE, 1, 0];
+        let err = refusal(&[0; 8], &cd, false);
+        assert!(err.contains("cannot allocate"), "{err}");
     }
 
     // ---------------------------------------------------------------

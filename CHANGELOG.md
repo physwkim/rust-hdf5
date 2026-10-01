@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- The nbit filter no longer panics on a parameter list a file stores
+  that describes more than it holds (HDFGroup/hdf5#6497): a list shorter
+  than the five-value header, a count that disagrees with the list, a
+  datatype tree that runs past the list, a zero-sized array base, a
+  member past the element, a tree that packs more bits than the element
+  holds, or an element count no allocation can satisfy. Each is now an
+  error from `apply_nbit`, in both directions, as `H5Z__filter_nbit`
+  refuses them on read. The fletcher32 short-chunk and object-header
+  message-size checks of the same upstream round were already in place.
+
 ### Changed
 
 - A reopened file is appended to at the bound the caller named, or the
