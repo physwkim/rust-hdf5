@@ -4420,8 +4420,14 @@ pub(crate) enum PendingHeapTarget {
 /// attribute set is built: the measuring pass reads the zeros of objects that
 /// have no address yet, the content pass reads the addresses the file will
 /// have, and the two agree in length because an address is a fixed-width
-/// field. The entry in the object's attribute list carries a zero image of
-/// exactly that length and is never itself written.
+/// field. The entry in the object's attribute list carries an image with
+/// zeros where the addresses go and is never itself written.
+///
+/// The address of `targets[i]` lands at byte `i * stride` of that image: the
+/// whole element when the attribute is an array of references, the leading
+/// member when each element is a compound that carries other fields beside
+/// the reference (`REFERENCE_LIST`'s `dimension`), which the stored image
+/// already holds.
 pub(crate) struct AttributeReferenceValue {
     /// The object the attribute hangs on.
     scope: AttrScope,
@@ -4430,6 +4436,8 @@ pub(crate) struct AttributeReferenceValue {
     /// Paths of the objects the elements name, in element order; `/` is the
     /// root group.
     targets: Vec<String>,
+    /// Bytes from one element's address to the next: the element size.
+    stride: usize,
 }
 
 /// Refuse an object header body that is not the length its block was reserved
@@ -8063,15 +8071,15 @@ impl Hdf5Writer {
             AttrScope::Dataset(i) => self.ds(i).lock().attributes.clone(),
         };
         // Snapshot first: resolving a path locks group and dataset slots.
-        let values: Vec<(String, Vec<String>)> = self
+        let values: Vec<(String, Vec<String>, usize)> = self
             .attribute_references
             .lock()
             .iter()
             .filter(|r| r.scope == scope)
-            .map(|r| (r.name.clone(), r.targets.clone()))
+            .map(|r| (r.name.clone(), r.targets.clone(), r.stride))
             .collect();
         let width = self.ctx.sizeof_addr as usize;
-        for (name, targets) in values {
+        for (name, targets, stride) in values {
             let Some(pos) = attrs.iter().position(|a| a.name() == name) else {
                 continue;
             };
@@ -8079,13 +8087,18 @@ impl Hdf5Writer {
                 continue;
             };
             let mut msg = msg.clone();
-            let mut data = Vec::with_capacity(targets.len() * width);
-            for target in &targets {
-                data.extend_from_slice(
+            for (i, target) in targets.iter().enumerate() {
+                let at = i * stride;
+                let held = msg.data.len();
+                let slot = msg.data.get_mut(at..at + width).ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "attribute '{name}' holds {held} bytes, too few for reference {i} at {at}"
+                    ))
+                })?;
+                slot.copy_from_slice(
                     &self.object_reference_address(target)?.to_le_bytes()[..width],
                 );
             }
-            msg.data = data;
             attrs[pos] = AttributeEntry::from(msg).with_creation_index(attrs[pos].creation_index());
         }
         Ok(attrs)
@@ -11547,6 +11560,7 @@ impl Hdf5Writer {
                 scope,
                 name: name.to_string(),
                 targets: paths.iter().map(|p| (*p).to_string()).collect(),
+                stride: self.ctx.sizeof_addr as usize,
             });
         Ok(())
     }
