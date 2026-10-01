@@ -20,7 +20,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 - **Parallel compression** — per-chunk compression/decompression via rayon
 - **SIMD filter kernels** — default `simd` feature: shuffle, bitshuffle and Fletcher-32 dispatch on the CPU level detected at run time (AVX2/AVX-512, NEON) via `fearless_simd`
 - **Groups** — hierarchical group structure with nested object headers
-- **Attributes** — string and numeric attributes on datasets and root
+- **Attributes** — string, numeric and object-reference attributes on datasets, groups and root; dimension scales (`set_scale` / `attach_scale`) readable by h5py's `dims`
 - **SWMR** — Single Writer / Multiple Reader streaming protocol
 - **File locking** — OS-level advisory locks (`flock` / `LockFileEx`) honoring `HDF5_USE_FILE_LOCKING`
 - **Hyperslab I/O** — `read_slice` / `write_slice` for partial N-dimensional access, on contiguous and chunked (including compressed) datasets

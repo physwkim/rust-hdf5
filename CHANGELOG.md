@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Dimension scales: `H5Dataset::set_scale` (`H5DSset_scale`) and
+  `H5Dataset::attach_scale` (`H5DSattach_scale`) write the `CLASS` /
+  `NAME`, `DIMENSION_LIST` and `REFERENCE_LIST` attributes libhdf5's
+  high-level API writes, so h5py's `ds.dims[i]`, `h5ds.is_scale` and
+  `h5ds.is_attached` see them. Attaching appends to an axis and is a
+  no-op for a scale already on it; an attach in an append session
+  extends the lists the file already holds, including ones written by
+  libhdf5.
+
+### Fixed
+
+- An append session no longer moves the object headers it rewrites. A
+  reopened dataset, group or root header is written back over the
+  chunk 0 it already occupies — padded when its messages shrank,
+  spilling into a continuation chunk when they grew, as libhdf5 grows
+  a header it cannot extend in place — so every object reference the
+  file already holds, in a reference dataset, a reference attribute or
+  a `REFERENCE_LIST`, whoever wrote it, still resolves after the
+  session. Previously every rewritten header was laid out afresh at an
+  exact-size block and references to it went stale.
+
+- A SWMR session keeps its object headers in place too: `start_swmr` on
+  a reopened file publishes every header over the chunk 0 it already
+  had, the in-place rewrite after each append goes back over the same
+  blocks, continuation chunk included, and the close-time finalize
+  writes over them once more. Previously every SWMR finalize moved
+  every header to a fresh block.
+
+- A new version-2 object header takes the narrowest chunk-0 size field
+  that can express its size, as `H5O_apply_ohdr` picks it, instead of
+  always a four-byte one. Rewriting a header libhdf5 sized exactly for
+  its messages now fits the block again.
+
+- A global heap object released by a replaced attribute or a rewritten
+  element no longer keeps its finalize-time address stamp registered,
+  which could have stamped a later object inserted at the same index.
+
 ## 0.6.0
 
 ### Added

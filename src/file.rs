@@ -81,6 +81,13 @@ pub(crate) fn new_shared(inner: H5FileInner) -> SharedInner {
     std::rc::Rc::new(std::cell::RefCell::new(inner))
 }
 
+/// Whether two handles share one file — the same inner state, not merely
+/// equal state.
+#[cfg(not(feature = "threadsafe"))]
+pub(crate) fn same_inner(a: &SharedInner, b: &SharedInner) -> bool {
+    std::rc::Rc::ptr_eq(a, b)
+}
+
 /// Acquire a shared (read) lock on the inner state. The fine-grained writer
 /// (atomic allocator, positioned handle, per-dataset `Slot` mutexes) is safe to
 /// drive through `&H5FileInner`, so the non-extending chunk-write path takes
@@ -107,6 +114,13 @@ pub(crate) fn try_borrow_inner_mut(
     inner: &SharedInner,
 ) -> Option<std::sync::RwLockWriteGuard<'_, H5FileInner>> {
     inner.write().ok()
+}
+
+/// Whether two handles share one file — the same inner state, not merely
+/// equal state.
+#[cfg(feature = "threadsafe")]
+pub(crate) fn same_inner(a: &SharedInner, b: &SharedInner) -> bool {
+    std::sync::Arc::ptr_eq(a, b)
 }
 
 #[cfg(feature = "threadsafe")]

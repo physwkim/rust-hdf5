@@ -5424,3 +5424,406 @@ fn h5py_written_deflated_chunk_matches_h5py_read_direct_chunk() {
     assert_eq!(got_mask, want_mask);
     std::fs::remove_file(&path).ok();
 }
+
+/// Dimension scales attached by this crate are the ones h5py sees:
+/// `ds.dims[i]` lists them in attach order, `is_scale` holds for a scale
+/// made explicitly and for one made by the attach, and the scale's
+/// `REFERENCE_LIST` dereferences back to the dataset and axis. Attaching a
+/// scale already on the axis adds nothing.
+#[test]
+fn dimension_scales_attached_by_rust_resolve_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("dimension_scales_write");
+    let file = H5File::create(&path).unwrap();
+    let data = file
+        .new_dataset::<u16>()
+        .shape([2, 3])
+        .create("data")
+        .unwrap();
+    data.write_raw(&[1u16, 2, 3, 4, 5, 6]).unwrap();
+    let s0 = file.new_dataset::<f32>().shape([2]).create("s0").unwrap();
+    s0.write_raw(&[10.0f32, 20.0]).unwrap();
+    let s1 = file.new_dataset::<f32>().shape([2]).create("s1").unwrap();
+    s1.write_raw(&[0.5f32, 1.5]).unwrap();
+    let grp = file.create_group("axes").unwrap();
+    let s2 = grp.new_dataset::<f64>().shape([3]).create("s2").unwrap();
+    s2.write_raw(&[7.0f64, 8.0, 9.0]).unwrap();
+
+    s0.set_scale(Some("s0")).unwrap();
+    data.attach_scale(0, &s0).unwrap();
+    data.attach_scale(0, &s1).unwrap();
+    data.attach_scale(1, &s2).unwrap();
+    data.attach_scale(0, &s0).unwrap();
+    file.close().unwrap();
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert len(d.dims[0]) == 2, len(d.dims[0])\n\
+         assert len(d.dims[1]) == 1, len(d.dims[1])\n\
+         assert [d.dims[0][i].name for i in range(len(d.dims[0]))] == ['/s0', '/s1'], [d.dims[0][i].name for i in range(len(d.dims[0]))]\n\
+         assert d.dims[1][0].name == '/axes/s2', d.dims[1][0].name\n\
+         assert (d.dims[0][0][:] == [10.0, 20.0]).all()\n\
+         assert (d.dims[1][0][:] == [7.0, 8.0, 9.0]).all()\n\
+         for name in ['s0', 's1', 'axes/s2']: assert h5py.h5ds.is_scale(f[name].id), name\n\
+         for name in ['s0', 's1', 'axes/s2']: assert f[name].attrs.get_id('CLASS').dtype == np.dtype('S16'), name\n\
+         for name in ['s0', 's1', 'axes/s2']: assert f[name].attrs['CLASS'] == b'DIMENSION_SCALE', name\n\
+         assert f['s0'].attrs['NAME'] == b's0'\n\
+         assert f['s0'].attrs.get_id('NAME').dtype == np.dtype('S3')\n\
+         assert 'NAME' not in f['s1'].attrs\n\
+         assert h5py.h5ds.get_scale_name(f['s0'].id) == b's0'\n\
+         assert h5py.h5ds.is_attached(d.id, f['s0'].id, 0)\n\
+         assert h5py.h5ds.is_attached(d.id, f['s1'].id, 0)\n\
+         assert h5py.h5ds.is_attached(d.id, f['axes/s2'].id, 1)\n\
+         assert not h5py.h5ds.is_attached(d.id, f['s0'].id, 1)\n\
+         rl = f['s0'].attrs['REFERENCE_LIST']\n\
+         assert rl.shape == (1,), rl.shape\n\
+         assert rl.dtype.itemsize == 16 and rl.dtype.names == ('dataset', 'dimension'), rl.dtype\n\
+         assert f[rl[0][0]].name == '/data' and rl[0][1] == 0, rl\n\
+         rl = f['axes/s2'].attrs['REFERENCE_LIST']\n\
+         assert f[rl[0][0]].name == '/data' and rl[0][1] == 1, rl\n\
+         dl = d.attrs.get_id('DIMENSION_LIST')\n\
+         assert dl.shape == (2,), dl.shape\n\
+         assert h5py.check_vlen_dtype(dl.dtype) == h5py.ref_dtype, dl.dtype\n",
+    );
+    // h5py's own detach and re-attach work on the lists this crate wrote.
+    let script = format!(
+        "import h5py\n\
+         f = h5py.File(r'{p}', 'r+')\n\
+         d = f['data']\n\
+         d.dims[0].detach_scale(f['s0'])\n\
+         assert [d.dims[0][i].name for i in range(len(d.dims[0]))] == ['/s1']\n\
+         assert 'REFERENCE_LIST' not in f['s0'].attrs\n\
+         d.dims[1].attach_scale(f['s0'])\n\
+         assert [d.dims[1][i].name for i in range(len(d.dims[1]))] == ['/axes/s2', '/s0']\n\
+         f.close()\n",
+        p = path.display()
+    );
+    let status = std::process::Command::new(py)
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .expect("failed to spawn python");
+    assert!(status.success(), "h5py detach/attach on {}", path.display());
+    std::fs::remove_file(&path).ok();
+}
+
+/// An attach in an append session keeps what the lists already hold —
+/// read back from the file's own addresses — and every reference is
+/// stamped with the address its target's rewritten header ends up at.
+#[test]
+fn dimension_scales_attached_in_append_session_resolve_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("dimension_scales_append");
+    {
+        let file = H5File::create(&path).unwrap();
+        let data = file
+            .new_dataset::<u16>()
+            .shape([2, 3])
+            .create("data")
+            .unwrap();
+        data.write_raw(&[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let s0 = file.new_dataset::<f32>().shape([2]).create("s0").unwrap();
+        s0.write_raw(&[10.0f32, 20.0]).unwrap();
+        let s1 = file.new_dataset::<f32>().shape([3]).create("s1").unwrap();
+        s1.write_raw(&[1.0f32, 2.0, 3.0]).unwrap();
+        s0.set_scale(Some("s0")).unwrap();
+        data.attach_scale(0, &s0).unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let data = file.dataset_writer("data").unwrap();
+        let s0 = file.dataset_writer("s0").unwrap();
+        let s1 = file.dataset_writer("s1").unwrap();
+        let s2 = file.new_dataset::<f64>().shape([2]).create("s2").unwrap();
+        s2.write_raw(&[7.0f64, 8.0]).unwrap();
+        // Already there: nothing changes.
+        data.attach_scale(0, &s0).unwrap();
+        // New on axis 1, including a scale that already serves axis 0.
+        data.attach_scale(1, &s1).unwrap();
+        data.attach_scale(1, &s2).unwrap();
+        data.attach_scale(0, &s2).unwrap();
+        s1.set_scale(Some("renamed")).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert [d.dims[0][i].name for i in range(len(d.dims[0]))] == ['/s0', '/s2'], [d.dims[0][i].name for i in range(len(d.dims[0]))]\n\
+         assert [d.dims[1][i].name for i in range(len(d.dims[1]))] == ['/s1', '/s2'], [d.dims[1][i].name for i in range(len(d.dims[1]))]\n\
+         assert (d.dims[0][0][:] == [10.0, 20.0]).all()\n\
+         assert (d.dims[1][1][:] == [7.0, 8.0]).all()\n\
+         for name in ['s0', 's1', 's2']: assert h5py.h5ds.is_scale(f[name].id), name\n\
+         assert f['s0'].attrs['NAME'] == b's0'\n\
+         assert f['s1'].attrs['NAME'] == b'renamed'\n\
+         rl = f['s0'].attrs['REFERENCE_LIST']\n\
+         assert [(f[r].name, int(i)) for r, i in rl] == [('/data', 0)], rl\n\
+         rl = f['s2'].attrs['REFERENCE_LIST']\n\
+         assert [(f[r].name, int(i)) for r, i in rl] == [('/data', 1), ('/data', 0)], rl\n\
+         assert h5py.h5ds.is_attached(d.id, f['s1'].id, 1)\n\
+         assert h5py.h5ds.is_attached(d.id, f['s2'].id, 0)\n\
+         assert h5py.h5ds.is_attached(d.id, f['s2'].id, 1)\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The lists h5py writes are the ones this crate extends: a scale attached
+/// by h5py stays attached after this crate attaches another, and h5py reads
+/// both back.
+#[test]
+fn dimension_scales_attached_by_h5py_are_extended_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("dimension_scales_extend_h5py");
+    write_with_h5py(
+        py,
+        &path,
+        "d = f.create_dataset('data', data=np.arange(6, dtype='u2').reshape(2, 3))\n\
+         s0 = f.create_dataset('s0', data=np.array([10.0, 20.0], dtype='f4'))\n\
+         s1 = f.create_dataset('s1', data=np.array([1.0, 2.0, 3.0], dtype='f4'))\n\
+         s0.make_scale('s0')\n\
+         d.dims[0].attach_scale(s0)\n\
+         d.dims[0].label = 'rows'\n",
+    );
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let data = file.dataset_writer("data").unwrap();
+        let s0 = file.dataset_writer("s0").unwrap();
+        let s1 = file.dataset_writer("s1").unwrap();
+        data.attach_scale(1, &s1).unwrap();
+        data.attach_scale(1, &s0).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert [d.dims[0][i].name for i in range(len(d.dims[0]))] == ['/s0'], [d.dims[0][i].name for i in range(len(d.dims[0]))]\n\
+         assert [d.dims[1][i].name for i in range(len(d.dims[1]))] == ['/s1', '/s0'], [d.dims[1][i].name for i in range(len(d.dims[1]))]\n\
+         assert d.dims[0].label == 'rows', d.dims[0].label\n\
+         rl = f['s0'].attrs['REFERENCE_LIST']\n\
+         assert [(f[r].name, int(i)) for r, i in rl] == [('/data', 0), ('/data', 1)], rl\n\
+         assert h5py.h5ds.is_scale(f['s1'].id)\n\
+         assert f['s1'].attrs.get_id('CLASS').dtype == np.dtype('S16')\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// What one append session does to the headers libhdf5 and this crate wrote
+/// before it: `data` grows past its chunk 0, `s0` shrinks, `g` and `g/inner`
+/// grow, and the root gains a link.
+fn rewrite_every_header(path: &std::path::Path) {
+    let file = H5File::open_rw(path).unwrap();
+    let data = file.dataset_writer("data").unwrap();
+    for i in 0..4 {
+        data.new_attr::<f64>()
+            .shape([32])
+            .create(&format!("wide{i}"))
+            .unwrap()
+            .write_array(&[f64::from(i); 32])
+            .unwrap();
+    }
+    let s0 = file.dataset_writer("s0").unwrap();
+    s0.set_scale(Some("s")).unwrap();
+    let g = file.root_group().group("g").unwrap();
+    g.set_attr_array_numeric("marks", &[7i64; 16]).unwrap();
+    let inner = file.dataset_writer("g/inner").unwrap();
+    for i in 0..3 {
+        inner
+            .new_attr::<f64>()
+            .shape([32])
+            .create(&format!("wide{i}"))
+            .unwrap()
+            .write_array(&[1.5; 32])
+            .unwrap();
+    }
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("appended")
+        .unwrap()
+        .write_raw(&[1i32, 2, 3, 4])
+        .unwrap();
+    file.close().unwrap();
+}
+
+/// h5py writes references to objects of a crate-written file, records every
+/// object's header address, and reads them all back after the session above.
+const ADDRESSES_AND_REFERENCES: &str = "\
+import h5py, numpy as np
+f = h5py.File(PATH, 'r+')
+names = ['/', 'data', 's0', 'g', 'g/inner']
+f.attrs['addresses'] = np.array([h5py.h5o.get_info(f[n].id).addr for n in names], dtype='u8')
+refs = f.create_dataset('refs', (4,), dtype=h5py.ref_dtype)
+refs[...] = [f['data'].ref, f['s0'].ref, f['g'].ref, f['g/inner'].ref]
+f['data'].attrs['to_s0'] = f['s0'].ref
+f.attrs['to_inner'] = f['g/inner'].ref
+f.close()
+";
+
+const ADDRESSES_AND_REFERENCES_HELD: &str = "\
+names = ['/', 'data', 's0', 'g', 'g/inner']
+addresses = [h5py.h5o.get_info(f[n].id).addr for n in names]
+assert addresses == list(f.attrs['addresses']), (addresses, list(f.attrs['addresses']))
+assert [f[r].name for r in f['refs'][...]] == ['/data', '/s0', '/g', '/g/inner']
+assert f[f['data'].attrs['to_s0']].name == '/s0'
+assert f[f.attrs['to_inner']].name == '/g/inner'
+assert f[f['data'].attrs['by_rust'][0]].name == '/g/inner'
+assert (f['data'].attrs['wide3'] == 3.0).all()
+assert (f['g'].attrs['marks'] == 7).all()
+assert (f['g/inner'].attrs['wide2'] == 1.5).all()
+assert f['s0'].attrs['NAME'] == b's'
+assert h5py.h5ds.is_attached(f['data'].id, f['s0'].id, 0)
+assert f['data'].dims[0][0].name == '/s0'
+rl = f['s0'].attrs['REFERENCE_LIST']
+assert [(f[r].name, int(i)) for r, i in rl] == [('/data', 0)], rl
+assert list(f['appended'][...]) == [1, 2, 3, 4]
+";
+
+/// Create `data`, the scale `s0` on its axis 0, and `g/inner`, with a
+/// Rust-written reference attribute, at the given bound.
+fn create_referenced_objects(path: &std::path::Path, libver: Option<rust_hdf5::LibverBound>) {
+    let mut options = H5File::options();
+    if let Some(libver) = libver {
+        options = options.libver(libver);
+    }
+    let file = options.create(path).unwrap();
+    let data = file
+        .new_dataset::<u16>()
+        .shape([2, 3])
+        .create("data")
+        .unwrap();
+    data.write_raw(&[1u16, 2, 3, 4, 5, 6]).unwrap();
+    let s0 = file.new_dataset::<f32>().shape([2]).create("s0").unwrap();
+    s0.write_raw(&[10.0f32, 20.0]).unwrap();
+    s0.set_scale(Some("a scale with a long name")).unwrap();
+    data.attach_scale(0, &s0).unwrap();
+    let g = file.create_group("g").unwrap();
+    let inner = g.new_dataset::<i32>().shape([3]).create("inner").unwrap();
+    inner.write_raw(&[1i32, 2, 3]).unwrap();
+    data.new_attr::<u64>()
+        .shape([1usize])
+        .create("by_rust")
+        .unwrap()
+        .write_object_references(&["/g/inner"])
+        .unwrap();
+    file.close().unwrap();
+}
+
+/// An append session writes every header it rebuilds back over the chunk 0
+/// it already had — padded when it shrank, chained into a continuation chunk
+/// when it grew — so the object references h5py wrote into the file, which
+/// this crate never sees, still resolve: the address they hold is the
+/// address the object is still at.
+#[test]
+fn rewritten_headers_keep_the_addresses_h5py_references_hold() {
+    let Some(py) = python() else { return };
+    let path = tmp("kept_headers");
+    create_referenced_objects(&path, None);
+    run_python(
+        py,
+        &ADDRESSES_AND_REFERENCES.replace("PATH", &format!("r'{}'", path.display())),
+    );
+    rewrite_every_header(&path);
+    read_back_with_h5py(py, &path, ADDRESSES_AND_REFERENCES_HELD);
+
+    // And this crate's own reader walks the chained headers.
+    let file = H5File::open(&path).unwrap();
+    let data = file.dataset("data").unwrap();
+    assert_eq!(
+        data.attr_names().unwrap().len(),
+        7,
+        "{:?}",
+        data.attr_names()
+    );
+    assert_eq!(
+        file.dataset("g/inner").unwrap().attr_names().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        file.dataset("s0")
+            .unwrap()
+            .attr("NAME")
+            .unwrap()
+            .read_string()
+            .unwrap(),
+        "s"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The same under the earliest bound, where the headers are version 1: a
+/// grown header chains into a bare continuation chunk and a shrunk one is
+/// padded with a NIL message, both of which libhdf5 has to read back.
+#[test]
+fn rewritten_legacy_headers_keep_the_addresses_h5py_references_hold() {
+    let Some(py) = python() else { return };
+    let path = tmp("kept_legacy_headers");
+    create_referenced_objects(&path, Some(rust_hdf5::LibverBound::Earliest));
+    run_python(
+        py,
+        &ADDRESSES_AND_REFERENCES.replace("PATH", &format!("r'{}'", path.display())),
+    );
+    rewrite_every_header(&path);
+    read_back_with_h5py(py, &path, ADDRESSES_AND_REFERENCES_HELD);
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.dataset("data").unwrap().attr_names().unwrap().len(), 7);
+    std::fs::remove_file(&path).ok();
+}
+
+/// And when the session is a SWMR one: `start_swmr` publishes every header
+/// of the reopened file over the chunk 0 it already had, and the close-time
+/// finalize writes over it once more — a reader of the live file may be
+/// holding any of these addresses, so neither may move a header.
+#[test]
+fn swmr_sessions_keep_the_addresses_h5py_references_hold() {
+    let Some(py) = python() else { return };
+    let path = tmp("kept_swmr_headers");
+    create_referenced_objects(&path, Some(rust_hdf5::LibverBound::V110));
+    run_python(
+        py,
+        &ADDRESSES_AND_REFERENCES.replace("PATH", &format!("r'{}'", path.display())),
+    );
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::open_append(&path).unwrap();
+        // `data` and `g/inner` outgrow their chunk 0; `g` grows within its
+        // estimate; the root gains a link.
+        let data = w.dataset_index("data").unwrap();
+        for i in 0..4 {
+            w.set_dataset_attr_array::<f64>(data, &format!("wide{i}"), &[32], &[f64::from(i); 32])
+                .unwrap();
+        }
+        let inner = w.dataset_index("g/inner").unwrap();
+        for i in 0..3 {
+            w.set_dataset_attr_array::<f64>(inner, &format!("wide{i}"), &[32], &[1.5; 32])
+                .unwrap();
+        }
+        w.set_group_attr_numeric::<i64>("/g", "mark", &7).unwrap();
+        let frames = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(frames, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(frames, &[5u8, 6, 7, 8]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+names = ['/', 'data', 's0', 'g', 'g/inner']
+addresses = [h5py.h5o.get_info(f[n].id).addr for n in names]
+assert addresses == list(f.attrs['addresses']), (addresses, list(f.attrs['addresses']))
+assert [f[r].name for r in f['refs'][...]] == ['/data', '/s0', '/g', '/g/inner']
+assert f[f['data'].attrs['to_s0']].name == '/s0'
+assert f[f.attrs['to_inner']].name == '/g/inner'
+assert f[f['data'].attrs['by_rust'][0]].name == '/g/inner'
+assert (f['data'].attrs['wide3'] == 3.0).all()
+assert f['g'].attrs['mark'] == 7
+assert (f['g/inner'].attrs['wide2'] == 1.5).all()
+assert h5py.h5ds.is_attached(f['data'].id, f['s0'].id, 0)
+assert f['frames'].shape == (2, 2, 2), f['frames'].shape
+assert f['frames'][1].tolist() == [[5, 6], [7, 8]]
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

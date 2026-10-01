@@ -26,8 +26,8 @@ use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
 use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use rust_hdf5::format::messages::data_layout::DataLayoutMessage;
 use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
-use rust_hdf5::format::messages::{MSG_DATA_LAYOUT, MSG_LINK};
-use rust_hdf5::format::object_header::ObjectHeader;
+use rust_hdf5::format::messages::{MSG_DATA_LAYOUT, MSG_LINK, MSG_OBJ_HEADER_CONTINUATION};
+use rust_hdf5::format::object_header::{ObjectHeader, ObjectHeaderMessage};
 use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
 use rust_hdf5::format::symbol_table::SymbolTableNode;
 use rust_hdf5::format::FormatContext;
@@ -98,10 +98,7 @@ fn modern_layout_message_of(bytes: &[u8], name: &str) -> (Vec<u8>, FormatContext
         sizeof_size: sb.sizeof_lengths,
     };
     let at = |addr: u64| (sb.base_address + addr) as usize;
-    let (root, _) =
-        ObjectHeader::decode(&bytes[at(sb.root_group_object_header_address)..]).unwrap();
-    let addr = root
-        .messages
+    let addr = root_messages(bytes, &sb, &ctx)
         .iter()
         .filter(|m| m.msg_type == MSG_LINK)
         .filter_map(|m| LinkMessage::decode(&m.data, &ctx).ok())
@@ -112,6 +109,50 @@ fn modern_layout_message_of(bytes: &[u8], name: &str) -> (Vec<u8>, FormatContext
         .unwrap_or_else(|| panic!("no link '{name}' in the root group"));
     let (header, _) = ObjectHeader::decode(&bytes[at(addr)..]).unwrap();
     (layout_body(&header, name), ctx)
+}
+
+/// Every message of the root group's header: chunk 0's, then those of each
+/// continuation chunk it names. A reopen writes the root header back over
+/// its own chunk 0 and spills a link it no longer has room for into a
+/// continuation chunk, which is where the appended dataset's link is found.
+fn root_messages(
+    bytes: &[u8],
+    sb: &SuperblockV2V3,
+    ctx: &FormatContext,
+) -> Vec<ObjectHeaderMessage> {
+    let at = |addr: u64| (sb.base_address + addr) as usize;
+    let (root, _) =
+        ObjectHeader::decode(&bytes[at(sb.root_group_object_header_address)..]).unwrap();
+    let envelope = if root.has_creation_order() { 6 } else { 4 };
+    let mut messages = root.messages;
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].msg_type == MSG_OBJ_HEADER_CONTINUATION {
+            let sa = ctx.sizeof_addr as usize;
+            let data = &messages[i].data;
+            let cont_addr = u64::from_le_bytes(data[..sa].try_into().unwrap());
+            let cont_len = u64::from_le_bytes(data[sa..sa + 8].try_into().unwrap()) as usize;
+            let chunk = &bytes[at(cont_addr)..at(cont_addr) + cont_len];
+            assert_eq!(&chunk[..4], b"OCHK");
+            // Messages up to the checksum; a gap shorter than an envelope ends them.
+            let (mut pos, end) = (4, cont_len - 4);
+            while pos + envelope <= end {
+                let msg_type = chunk[pos];
+                let size = u16::from_le_bytes([chunk[pos + 1], chunk[pos + 2]]) as usize;
+                let flags = chunk[pos + 3];
+                let body = pos + envelope;
+                messages.push(ObjectHeaderMessage {
+                    msg_type,
+                    flags,
+                    creation_index: 0,
+                    data: chunk[body..body + size].to_vec(),
+                });
+                pos = body + size;
+            }
+        }
+        i += 1;
+    }
+    messages
 }
 
 fn classic_layout_message_of(bytes: &[u8], name: &str) -> (Vec<u8>, FormatContext) {

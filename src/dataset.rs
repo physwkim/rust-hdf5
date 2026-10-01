@@ -8,7 +8,9 @@ use std::borrow::Cow;
 
 use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
-use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::file::{
+    borrow_inner, borrow_inner_mut, clone_inner, same_inner, H5FileInner, SharedInner,
+};
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
@@ -4172,6 +4174,79 @@ impl H5Dataset {
             DatasetInfo::Reader { .. } => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
             }
+        }
+    }
+
+    /// Mark this dataset as a dimension scale — `H5DSset_scale`, h5py's
+    /// `ds.make_scale(name)`.
+    ///
+    /// Writes the `CLASS` attribute as the fixed-length null-terminated
+    /// string `DIMENSION_SCALE` (16 bytes, the width `H5DSis_scale` checks
+    /// for) and, when `name` is given, `NAME` the same way. A dataset that
+    /// has scales attached to it cannot become one. Write mode only.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("scales.h5").unwrap();
+    /// let x = file.new_dataset::<f64>().shape([4]).create("x").unwrap();
+    /// x.write_raw(&[0.0, 0.5, 1.0, 1.5]).unwrap();
+    /// x.set_scale(Some("x")).unwrap();
+    /// ```
+    pub fn set_scale(&self, name: Option<&str>) -> Result<()> {
+        let index = self.writer_index("set_scale")?;
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => Ok(writer.set_dimension_scale(index, name)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "file is no longer in write mode".into(),
+            )),
+        }
+    }
+
+    /// Attach `scale` as a dimension scale of this dataset's `axis` —
+    /// `H5DSattach_scale`, h5py's `ds.dims[axis].attach_scale(scale)`.
+    ///
+    /// Records the attachment in this dataset's `DIMENSION_LIST` and the
+    /// scale's `REFERENCE_LIST`, and marks `scale` as a dimension scale if it
+    /// is not one yet. An axis may carry several scales: each attach appends.
+    /// Attaching a scale already on that axis changes nothing. Both datasets
+    /// must belong to this file, in write mode; a scale cannot have scales of
+    /// its own, a dataset that is a scale cannot have scales attached, and
+    /// `axis` must be below the rank (a scalar dataset counts as rank 1).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("scales.h5").unwrap();
+    /// let data = file.new_dataset::<i32>().shape([2, 3]).create("data").unwrap();
+    /// let x = file.new_dataset::<f64>().shape([3]).create("x").unwrap();
+    /// x.set_scale(Some("x")).unwrap();
+    /// data.attach_scale(1, &x).unwrap();
+    /// ```
+    pub fn attach_scale(&self, axis: usize, scale: &H5Dataset) -> Result<()> {
+        let did = self.writer_index("attach_scale")?;
+        let dsid = scale.writer_index("attach_scale")?;
+        if !same_inner(&self.file_inner, &scale.file_inner) {
+            return Err(Hdf5Error::InvalidState(
+                "the dimension scale belongs to another file".into(),
+            ));
+        }
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => Ok(writer.attach_dimension_scale(did, dsid, axis)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "file is no longer in write mode".into(),
+            )),
+        }
+    }
+
+    /// This dataset's index in the writer's registry, or the error a
+    /// write-only operation `what` reports on a read-mode handle.
+    fn writer_index(&self, what: &str) -> Result<usize> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => Ok(*index),
+            DatasetInfo::Reader { .. } => Err(Hdf5Error::InvalidState(format!(
+                "{what} is only available in write mode"
+            ))),
         }
     }
 
