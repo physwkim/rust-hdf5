@@ -140,23 +140,28 @@ pub struct ChunkPlan {
     /// Bytes the continuation chunk occupies, signature and checksum
     /// included; zero when every message fits chunk 0.
     pub continuation_size: usize,
-    /// The flags byte chunk 0 is encoded under: the header's own, except that
-    /// a plan into an existing block ([`ObjectHeader::plan_chunks_in`]) picks
-    /// the chunk-0 size field width that fits the block, as `H5O_apply_ohdr`
-    /// picks it for the size it is handed.
+    /// The flags byte chunk 0 is encoded under: the header's own with the
+    /// chunk-0 size field width that fits the area — the narrowest that
+    /// expresses it, or, in a plan into an existing block
+    /// ([`ObjectHeader::plan_chunks_in`]), the one that makes chunk 0 the
+    /// block's length.
     flags: u8,
 }
 
 /// Object Header v2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectHeader {
-    /// Header flags byte. Bits 0-1 control chunk0 size encoding. Other bits
-    /// control optional fields (attr thresholds, creation order).
+    /// Header flags byte: the optional prefix fields (attribute thresholds)
+    /// and the attribute creation-order policy.
     ///
-    /// Bit 5 (`H5O_HDR_STORE_TIMES`) is *not* held here: it is derived from
-    /// [`times`](Self::times) at encode and stripped at decode, so the flag and
-    /// the four values it announces cannot disagree. Setting it by hand here
-    /// does nothing — the encoder's flag byte comes from `times`.
+    /// Two groups of bits are *not* held here, because each describes the
+    /// image rather than the header. Bit 5 (`H5O_HDR_STORE_TIMES`) is derived
+    /// from [`times`](Self::times) at encode and stripped at decode, so the
+    /// flag and the four values it announces cannot disagree. Bits 0-1, the
+    /// chunk-0 size field width, are chosen at encode for the size chunk 0
+    /// turns out to have — the narrowest field that expresses it, as
+    /// `H5O_apply_ohdr` picks it (H5Oint.c:459-464) — and stripped at decode
+    /// for the same reason. Setting either by hand here does nothing.
     pub flags: u8,
     /// The stored times, when this object tracks them.
     pub times: Option<ObjectTimes>,
@@ -165,13 +170,11 @@ pub struct ObjectHeader {
 }
 
 impl ObjectHeader {
-    /// Create a new, empty object header with default flags.
-    ///
-    /// Defaults: bits 0-1 = 2 (4-byte chunk size encoding), no timestamps,
+    /// Create a new, empty object header with default flags: no timestamps,
     /// no attribute creation order, no non-default thresholds.
     pub fn new() -> Self {
         Self {
-            flags: 0x02, // bits 0-1 = 2 => 4-byte chunk0 size
+            flags: 0,
             times: None,
             messages: Vec::new(),
         }
@@ -263,18 +266,27 @@ impl ObjectHeader {
     /// [`times`](Self::times) — the one place the two are joined, so a header
     /// can neither claim times it does not have nor carry times it does not
     /// declare.
-    fn encoded_flags(&self) -> u8 {
-        let base = self.flags & !FLAG_STORE_TIMESTAMPS;
+    fn encoded_flags(&self, flags: u8) -> u8 {
+        let base = flags & !FLAG_STORE_TIMESTAMPS;
         match self.times {
             Some(_) => base | FLAG_STORE_TIMESTAMPS,
             None => base,
         }
     }
 
-    /// Returns the number of bytes used to encode chunk0's data size, based on
-    /// flags bits 0-1.
-    fn chunk0_size_bytes(&self) -> usize {
-        Self::size_field_width(self.flags)
+    /// The flags chunk 0 is encoded under when its message area is `area`
+    /// bytes: this header's, with bits 0-1 naming the narrowest size field
+    /// that expresses the area — `H5O_apply_ohdr`'s choice for a new header
+    /// (H5Oint.c:459-464), and what `H5O__alloc_extend_chunk` widens to as
+    /// chunk 0 grows (H5Oalloc.c:538-557).
+    fn flags_for_area(&self, area: usize) -> u8 {
+        let bits = match area as u64 {
+            0..=0xFF => 0,
+            0x100..=0xFFFF => 1,
+            0x1_0000..=0xFFFF_FFFF => 2,
+            _ => 3,
+        };
+        (self.flags & !FLAG_SIZE_MASK) | bits
     }
 
     /// Whether attribute creation order tracking is enabled (flags bit 2).
@@ -305,14 +317,9 @@ impl ObjectHeader {
         self.messages_size(&self.messages)
     }
 
-    /// Bytes chunk 0 spends before its message area: signature, version,
-    /// flags, the optional prefix fields, and the chunk-0 size field.
-    fn prefix_size(&self) -> usize {
-        self.prefix_size_under(self.flags)
-    }
-
-    /// [`prefix_size`](Self::prefix_size) for a header encoded under `flags`
-    /// in place of its own.
+    /// Bytes chunk 0 spends before its message area when encoded under
+    /// `flags`: signature, version, flags, the optional prefix fields, and
+    /// the chunk-0 size field.
     fn prefix_size_under(&self, flags: u8) -> usize {
         let mut size = 4 + 1 + 1; // OHDR + version + flags
         if self.times.is_some() {
@@ -396,24 +403,27 @@ impl ObjectHeader {
     /// Fails when any message payload exceeds [`MAX_MESSAGE_SIZE`] — see
     /// `check_message_sizes`.
     pub fn encode(&self) -> FormatResult<Vec<u8>> {
-        self.encode_chunk0(&self.messages, self.messages_data_size())
+        let exact = self.messages_data_size();
+        self.encode_chunk0(&self.messages, exact, self.flags_for_area(exact))
     }
 
     /// Chunk 0 holding `messages`, with a message area of exactly `data_size`
-    /// bytes — the sole producer of a version-2 chunk-0 image.
+    /// bytes, encoded under `flags` — the sole producer of a version-2
+    /// chunk-0 image.
     fn encode_chunk0(
         &self,
         messages: &[ObjectHeaderMessage],
         data_size: usize,
+        flags: u8,
     ) -> FormatResult<Vec<u8>> {
         Self::check_message_sizes(messages)?;
         debug_assert!(data_size >= self.messages_size(messages));
-        let total = self.prefix_size() + data_size + 4; // + checksum
+        let total = self.prefix_size_under(flags) + data_size + 4; // + checksum
         let mut buf = Vec::with_capacity(total);
 
         buf.extend_from_slice(&OHDR_SIGNATURE);
         buf.push(OHDR_VERSION);
-        buf.push(self.encoded_flags());
+        buf.push(self.encoded_flags(flags));
 
         // Optional timestamps (bit 5), in `H5O__cache_serialize` order.
         if let Some(t) = self.times {
@@ -423,13 +433,13 @@ impl ObjectHeader {
         }
 
         // Optional attr storage thresholds (bit 4) -- write defaults if enabled
-        if self.flags & FLAG_NON_DEFAULT_ATTR_THRESHOLDS != 0 {
+        if flags & FLAG_NON_DEFAULT_ATTR_THRESHOLDS != 0 {
             // max_compact = 8, min_dense = 6 (HDF5 defaults)
             buf.extend_from_slice(&8u16.to_le_bytes());
             buf.extend_from_slice(&6u16.to_le_bytes());
         }
 
-        let csb = self.chunk0_size_bytes();
+        let csb = Self::size_field_width(flags);
         buf.extend_from_slice(&(data_size as u64).to_le_bytes()[..csb]);
 
         self.write_messages(&mut buf, messages, data_size);
@@ -527,19 +537,22 @@ impl ObjectHeader {
         capacity: usize,
         ctx: &FormatContext,
     ) -> FormatResult<ChunkPlan> {
-        self.plan_under(format, capacity, ctx, self.flags)
+        self.plan_under(format, capacity, ctx, None)
     }
 
-    /// [`plan_chunks`](Self::plan_chunks) with chunk 0 encoded under `flags`.
+    /// [`plan_chunks`](Self::plan_chunks) with chunk 0 encoded under `flags`
+    /// when given, and otherwise under the narrowest size field for the area
+    /// the plan gives chunk 0.
     fn plan_under(
         &self,
         format: ObjectFormat,
         capacity: usize,
         ctx: &FormatContext,
-        flags: u8,
+        flags: Option<u8>,
     ) -> FormatResult<ChunkPlan> {
         let exact = self.messages_size_for(format, &self.messages);
         if exact <= capacity {
+            let flags = flags.unwrap_or_else(|| self.flags_for_area(exact));
             return Ok(ChunkPlan {
                 split: self.messages.len(),
                 chunk0_size: self.chunk0_overhead(format, flags) + exact,
@@ -547,6 +560,7 @@ impl ObjectHeader {
                 flags,
             });
         }
+        let flags = flags.unwrap_or_else(|| self.flags_for_area(capacity));
         // Chunk 0 has to keep room for the message naming the continuation,
         // whose body is the block's address and length (`H5O_CONT_ID`).
         let continuation_message =
@@ -584,10 +598,10 @@ impl ObjectHeader {
     /// `H5O__chunk_serialize` leaves a chunk whose messages shrank; past it,
     /// the plan is [`plan_chunks`](Self::plan_chunks)'s over the block's
     /// message area. A version-2 chunk 0 is sized under the narrowest chunk-0
-    /// size field that can express its area — `H5O_apply_ohdr`'s choice, and
-    /// the one that leaves the most of the block to messages — so a header
-    /// libhdf5 sized exactly for its messages takes them back without
-    /// spilling. Refused for a block the chunk cannot describe: one too short
+    /// size field that can express its area, the one that leaves the most of
+    /// the block to messages, so a header libhdf5 sized exactly for its
+    /// messages takes them back without spilling. Refused for a block the
+    /// chunk cannot describe: one too short
     /// for the prefix, or, in version 1, one whose message area is not a
     /// multiple of eight — version 1 has no gap, so every byte of the area
     /// has to belong to a message.
@@ -628,7 +642,7 @@ impl ObjectHeader {
                 fit.ok_or_else(too_short)?
             }
         };
-        let mut plan = self.plan_under(format, area, ctx, flags)?;
+        let mut plan = self.plan_under(format, area, ctx, Some(flags))?;
         if plan.continuation_size == 0 {
             plan.chunk0_size = block;
         }
@@ -650,45 +664,29 @@ impl ObjectHeader {
         continuation_addr: u64,
         nlink: u32,
     ) -> FormatResult<(Vec<u8>, Option<Vec<u8>>)> {
-        // Under the plan's flags, which may name a narrower size field than
-        // this header's own; every prefix field they govern is read off
-        // `header` below.
-        let resized;
-        let header = if plan.flags == self.flags {
-            self
-        } else {
-            resized = ObjectHeader {
-                flags: plan.flags,
-                times: self.times,
-                messages: self.messages.clone(),
-            };
-            &resized
-        };
-        let area = plan.chunk0_size - header.chunk0_overhead(format, plan.flags);
+        let area = plan.chunk0_size - self.chunk0_overhead(format, plan.flags);
         if plan.continuation_size == 0 {
             let chunk0 = match format {
-                ObjectFormat::Legacy => {
-                    header.encode_v1_chunk0(&header.messages, area, nlink, 0)?
-                }
-                ObjectFormat::Modern => header.encode_chunk0(&header.messages, area)?,
+                ObjectFormat::Legacy => self.encode_v1_chunk0(&self.messages, area, nlink, 0)?,
+                ObjectFormat::Modern => self.encode_chunk0(&self.messages, area, plan.flags)?,
             };
             return Ok((chunk0, None));
         }
-        let mut chunk0 = header.messages[..plan.split].to_vec();
+        let mut chunk0 = self.messages[..plan.split].to_vec();
         chunk0.push(Self::continuation_message(
             ctx,
             continuation_addr,
             plan.continuation_size,
         ));
-        let spilled = &header.messages[plan.split..];
+        let spilled = &self.messages[plan.split..];
         let (chunk0, continuation) = match format {
             ObjectFormat::Legacy => (
-                header.encode_v1_chunk0(&chunk0, area, nlink, spilled.len())?,
-                header.encode_v1_continuation(spilled)?,
+                self.encode_v1_chunk0(&chunk0, area, nlink, spilled.len())?,
+                self.encode_v1_continuation(spilled)?,
             ),
             ObjectFormat::Modern => (
-                header.encode_chunk0(&chunk0, area)?,
-                header.encode_continuation(spilled)?,
+                self.encode_chunk0(&chunk0, area, plan.flags)?,
+                self.encode_continuation(spilled)?,
             ),
         };
         debug_assert_eq!(continuation.len(), plan.continuation_size);
@@ -717,9 +715,10 @@ impl ObjectHeader {
             return Err(FormatError::InvalidVersion(version));
         }
 
-        // Bit 5 is stripped here and carried by `times` instead, so the two
-        // can only ever agree — see [`ObjectHeader::flags`].
-        let flags = buf[5] & !FLAG_STORE_TIMESTAMPS;
+        // Bit 5 is stripped here and carried by `times` instead, and bits 0-1
+        // are stripped and carried by the image's own width, so neither can
+        // disagree with what it describes — see [`ObjectHeader::flags`].
+        let flags = buf[5] & !(FLAG_STORE_TIMESTAMPS | FLAG_SIZE_MASK);
         let mut pos: usize = 6;
 
         // Optional timestamps (bit 5)
@@ -758,13 +757,7 @@ impl ObjectHeader {
         }
 
         // Chunk0 data size
-        let chunk0_size_bytes = match flags & FLAG_SIZE_MASK {
-            0 => 1,
-            1 => 2,
-            2 => 4,
-            3 => 8,
-            _ => unreachable!(),
-        };
+        let chunk0_size_bytes = Self::size_field_width(buf[5]);
 
         if buf.len() < pos + chunk0_size_bytes {
             return Err(FormatError::BufferTooShort {
@@ -1157,7 +1150,7 @@ impl ObjectHeader {
 
         Ok((
             ObjectHeader {
-                flags: 0x02, // default flags (not meaningful for v1)
+                flags: 0,
                 // A v1 header keeps its modification time in a message
                 // (`H5O_MSG_MTIME`), never in the prefix.
                 times: None,
@@ -1407,10 +1400,13 @@ mod tests {
         let hdr = ObjectHeader::new();
         let encoded = hdr.encode().unwrap();
 
-        // OHDR(4) + version(1) + flags(1) + chunk0_size(4) + checksum(4) = 14
-        assert_eq!(encoded.len(), 14);
+        // OHDR(4) + version(1) + flags(1) + chunk0_size(1) + checksum(4) = 11:
+        // no messages, so the narrowest size field, as `H5O_apply_ohdr`
+        // picks it.
+        assert_eq!(encoded.len(), 11);
         assert_eq!(&encoded[..4], b"OHDR");
         assert_eq!(encoded[4], 2); // version
+        assert_eq!(encoded[5] & FLAG_SIZE_MASK, 0);
 
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
@@ -1518,8 +1514,7 @@ mod tests {
         hdr.set_attribute_creation_order(CreationOrder::Indexed);
         hdr.set_attribute_creation_order(CreationOrder::Untracked);
         assert_eq!(hdr.attribute_creation_order(), CreationOrder::Untracked);
-        // Bits 0-1 (the chunk0 size encoding) are untouched.
-        assert_eq!(hdr.flags, 0x02);
+        assert_eq!(hdr.flags, 0);
     }
 
     /// The four times survive a round trip in `H5O__cache_serialize` order,
@@ -1731,7 +1726,7 @@ mod tests {
     #[test]
     fn test_default() {
         let hdr = ObjectHeader::default();
-        assert_eq!(hdr.flags, 0x02);
+        assert_eq!(hdr.flags, 0);
         assert!(hdr.messages.is_empty());
     }
 
@@ -2034,8 +2029,9 @@ mod tests {
     /// of area widens the field rather than being refused.
     #[test]
     fn a_plan_into_a_block_takes_the_narrowest_size_field() {
-        let hdr = chunked_header();
-        assert_eq!(hdr.flags & FLAG_SIZE_MASK, 2, "four bytes by default");
+        let mut hdr = chunked_header();
+        // The header's own field would be the widest: the plan ignores it.
+        hdr.flags |= 3;
         let ctx = FormatContext::default_v3();
 
         // libhdf5's exact fit for these messages: a one-byte field.
@@ -2048,8 +2044,8 @@ mod tests {
             .encode_chunked(&plan, ObjectFormat::Modern, &ctx, 0, 1)
             .unwrap();
         assert_eq!(chunk0.len(), exact);
+        assert_eq!(chunk0[5] & FLAG_SIZE_MASK, 0);
         let (decoded, _) = ObjectHeader::decode(&chunk0).unwrap();
-        assert_eq!(decoded.flags & FLAG_SIZE_MASK, 0);
         assert_eq!(decoded.messages, hdr.messages);
 
         // 300 bytes of area need a two-byte field.
@@ -2060,12 +2056,12 @@ mod tests {
             .encode_chunked(&plan, ObjectFormat::Modern, &ctx, 0, 1)
             .unwrap();
         assert_eq!(chunk0.len(), 8 + 300 + 4);
+        assert_eq!(chunk0[5] & FLAG_SIZE_MASK, 1);
         let (decoded, consumed) = ObjectHeader::decode(&chunk0).unwrap();
         assert_eq!(consumed, chunk0.len());
-        assert_eq!(decoded.flags & FLAG_SIZE_MASK, 1);
         assert_eq!(decoded.messages[..3], hdr.messages[..]);
 
         // The header itself is left as it was.
-        assert_eq!(hdr.flags & FLAG_SIZE_MASK, 2);
+        assert_eq!(hdr.flags & FLAG_SIZE_MASK, 3);
     }
 }

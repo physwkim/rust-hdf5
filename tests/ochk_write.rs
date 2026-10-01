@@ -167,6 +167,58 @@ fn a_header_that_fits_its_estimate_stays_one_chunk() {
     cleanup(&path);
 }
 
+/// A fresh header's chunk-0 size field is as narrow as its area allows, as
+/// `H5O_apply_ohdr` (H5Oint.c) sizes it: one byte for the root group of an
+/// otherwise empty file, two for a dataset whose 300-byte attribute pushes
+/// its area past 255 bytes. The flags byte is read straight off the file,
+/// since the decoder keeps the width out of the header's own flags.
+#[test]
+fn a_fresh_header_takes_the_narrowest_size_field() {
+    let path = unique_tmp("width");
+    {
+        let file = H5File::create(&path).unwrap();
+        let data = file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .create("data")
+            .unwrap();
+        data.write_raw(&(0..8i32).collect::<Vec<_>>()).unwrap();
+        data.new_attr::<u8>()
+            .shape([300usize])
+            .create("wide")
+            .unwrap()
+            .write_array(&[7u8; 300])
+            .unwrap();
+        file.close().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let superblock = SuperblockV2V3::decode(&bytes).unwrap();
+    let root = (superblock.base_address + superblock.root_group_object_header_address) as usize;
+    assert_eq!(&bytes[root..root + 4], b"OHDR");
+    assert_eq!(bytes[root + 5] & 0x03, 0, "the root group's one link");
+    let dataset = (0..bytes.len() - 4)
+        .find(|&at| at != root && &bytes[at..at + 4] == b"OHDR")
+        .expect("the dataset's header");
+    assert_eq!(bytes[dataset + 5] & 0x03, 1, "300 bytes of attribute");
+    assert_eq!(
+        bytes[dataset + 6..dataset + 8],
+        u16::try_from(ObjectHeader::decode(&bytes[dataset..]).unwrap().1 - 8 - 4)
+            .unwrap()
+            .to_le_bytes()
+    );
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("data")
+            .unwrap()
+            .attr("wide")
+            .unwrap()
+            .read_raw()
+            .unwrap(),
+        vec![7u8; 300]
+    );
+    cleanup(&path);
+}
+
 /// Reopening such a file reads the whole chain and writes it back whole: the
 /// attributes that lived in the continuation chunk are still there, and so is
 /// the one added on top.

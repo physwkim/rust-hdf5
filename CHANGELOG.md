@@ -25,6 +25,11 @@
   session. Previously every rewritten header was laid out afresh at an
   exact-size block and references to it went stale.
 
+- A new version-2 object header takes the narrowest chunk-0 size field
+  that can express its size, as `H5O_apply_ohdr` picks it, instead of
+  always a four-byte one. Rewriting a header libhdf5 sized exactly for
+  its messages now fits the block again.
+
 - A global heap object released by a replaced attribute or a rewritten
   element no longer keeps its finalize-time address stamp registered,
   which could have stamped a later object inserted at the same index.
