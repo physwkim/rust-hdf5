@@ -444,14 +444,24 @@ fn a_body_only_one_object_uses_stays_in_its_header() {
 /// header address differs, the two writers laying a file out differently.
 ///
 /// h5py exposes no `H5Pset_shared_mesg_*`, so the creation properties are set
-/// through `ctypes` on the libhdf5 h5py is linked against — the same library
-/// `tests/fixtures/gen_sohm.c` was run against.
+/// through `ctypes` on the libhdf5 h5py is linked against — the one in the
+/// environment, or the one a wheel bundles under `h5py.libs`.
+///
+/// The dataset is added at the `H5F_LIBVER_V18` bound, named outright. The
+/// record hashes the dataspace message's bytes, and that message's version
+/// follows the bound: a version-2 superblock, which a shared-message table
+/// requires, floors this crate's bound at V18, and so did libhdf5 1.14's
+/// `H5F__super_read`. libhdf5 2.0 dropped that raise (#4939), and h5py pins
+/// `H5F_LIBVER_EARLIEST` on every open, so left to the default the same
+/// dataset would be written under a version-1 header with a version-1
+/// dataspace and the record would hash a different body.
 fn libhdf5_writes_the_same_single_use_record(record: &[u8]) {
     let Some(py) = python() else { return };
     let theirs = unique_tmp("in_ohdr_h5py");
     let script = format!(
         "import ctypes, glob, os, sys, h5py, numpy as np\n\
-         so = sorted(glob.glob(os.path.join(sys.prefix, 'lib', 'libhdf5.so.*')))\n\
+         so = sorted(glob.glob(os.path.join(sys.prefix, 'lib', 'libhdf5.so.*'))) or sorted(\n\
+         \x20   glob.glob(os.path.join(os.path.dirname(h5py.__file__), '..', 'h5py.libs', 'libhdf5-*.so*')))\n\
          if not so:\n\
          \x20   raise SystemExit(0)\n\
          h5 = ctypes.CDLL(so[0])\n\
@@ -471,7 +481,7 @@ fn libhdf5_writes_the_same_single_use_record(record: &[u8]) {
          assert fid >= 0\n\
          h5.H5Pclose(fcpl)\n\
          h5.H5Fclose(fid)\n\
-         f = h5py.File(r'{}', 'r+')\n\
+         f = h5py.File(r'{}', 'r+', libver=('v108', 'latest'))\n\
          f.create_dataset('only', data=np.arange(8, dtype='<i4'))\n\
          f.close()\n",
         theirs.display(),
