@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A reopened file is appended to at the bound the caller named, or the
+  writer's default when none was, whatever its superblock version — as
+  libhdf5 2.0 opens a file (HDFGroup/hdf5#4939). The superblock version
+  used to raise the bound to its own row, as libhdf5 1.14 did, so a
+  version-2 superblock took version-1 B-tree chunk indexes on append and
+  a bound named below the row was ignored. Now a reopen with no bound
+  named appends the same structures a fresh file gets, and
+  `set_libver_bound(Earliest)` on a version-2 or version-3 superblock is
+  honoured, as h5py on libhdf5 2.x writes it. The superblock version is
+  still never rewritten. Starting SWMR on a reopened file now also
+  refuses a named bound below `V110`, the check `H5F__start_swmr_write`
+  makes.
+
 ## 0.6.1
 
 ### Added

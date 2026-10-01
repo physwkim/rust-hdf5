@@ -1,21 +1,17 @@
-//! Reopening a file never changes its superblock version, and the version it
-//! already has is what the appended structures are written at.
+//! Reopening a file never changes its superblock version, and that version
+//! says nothing about the bound the appended structures are written at.
 //!
 //! `H5F__super_init` is the only place libhdf5 decides a superblock version
 //! (H5Fsuper.c:1154). `H5F__super_read` validates the version it finds and
-//! never recomputes one; what it does instead is raise the file's *low*
-//! library-version bound to the row that version belongs to — version 2 to at
-//! least `H5F_LIBVER_V18`, version 3 to at least `H5F_LIBVER_V110`
-//! (hdf5_1.14.6 H5Fsuper.c:460-466). So a reopen with no bound named writes
-//! the generation the file already is: the v1.8 row's version-3 data layout
-//! message over the version-1 chunk B-tree for a version-2 superblock, and the
-//! v1.10 row's version-4 message over one of the v1.10 indexes for a version-3
-//! one.
-//!
-//! The two halves are one rule. A superblock version that is never re-decided
-//! is only meaningful if nothing appended can need a newer one, and nothing
-//! can because the bound the appends are written at is floored — not raised —
-//! by that version.
+//! never recomputes one. libhdf5 1.14 also raised the file's *low*
+//! library-version bound to the row that version belongs to; libhdf5 2.0
+//! dropped that (HDFGroup/hdf5#4939, H5Fsuper.c:438-453 keeps only the
+//! SWMR-write raise), so the bound a reopened file is appended at is the
+//! fapl's — what the caller named, or the default — whatever its superblock
+//! says. A version-3 superblock opened at `H5F_LIBVER_EARLIEST` gets a
+//! version-3 layout message over the version-1 chunk B-tree appended, and a
+//! version-2 superblock opened at `V110` gets a version-4 message over a v1.10
+//! index, the superblock version untouched either way.
 //!
 //! Checked here for all three generations a reopen can find: version 0
 //! (classic), version 2 (v1.8) and version 3 (v1.10). Each case reads the
@@ -290,25 +286,25 @@ fn reopening_a_classic_file_appends_classic_structures() {
     cleanup(&path);
 }
 
-/// A version-2 superblock: the v1.8 row, whose layout version of 3 keeps the
-/// append off every v1.10 index. This is the case the reopen used to get
-/// wrong, taking the v1.10 index and lifting the superblock to 3.
+/// A version-2 superblock, reopened with no bound named: the append is
+/// written at the writer's default, whose layout row is `V110`'s, so it takes
+/// a v1.10 index — and the superblock stays at version 2, which is the case
+/// the reopen used to get wrong by lifting it to 3.
 #[test]
-fn reopening_a_v18_file_appends_v18_structures() {
+fn reopening_a_v18_file_appends_at_the_default_bound() {
     let path = reopen_keeps_generation("v18", Some(LibverBound::V18), 2);
     assert_eq!(
         layout_version_of(&path, "appended"),
-        3,
-        "H5O_layout_ver_bounds[H5F_LIBVER_V18] is H5O_LAYOUT_VERSION_3, and a \
-         reopen of a version-2 superblock is written at no newer bound"
+        4,
+        "the default layout row is H5F_LIBVER_V110's, whatever the superblock"
     );
     assert!(
         matches!(
             layout_of(&path, "appended"),
-            DataLayoutMessage::ChunkedV3 { .. }
+            DataLayoutMessage::ChunkedV4 { .. }
         ),
-        "the appended dataset must be on the version-1 B-tree, as libhdf5 \
-         writes it for the same reopen"
+        "a version-4 layout message inside a version-2 superblock, which \
+         libhdf5 reads by the message's own version"
     );
     cleanup(&path);
 }
@@ -347,13 +343,11 @@ fn reopening_the_default_file_keeps_its_superblock_version() {
     cleanup(&path);
 }
 
-/// The bound a caller names on a reopened file still applies: libhdf5's
-/// superblock-derived bound is a floor on `H5F_LOW_BOUND`, not a ceiling, and
-/// `H5Fopen` with `low = V110` on a version-2 superblock writes a version-4
-/// layout into it without touching the superblock. Verified against libhdf5
-/// 1.14.6 directly.
+/// The bound a caller names on a reopened file applies above the row its
+/// superblock sits on: `H5Fopen` with `low = V110` on a version-2 superblock
+/// writes a version-4 layout into it without touching the superblock.
 #[test]
-fn a_named_bound_above_the_floor_still_applies_on_reopen() {
+fn a_named_bound_above_the_superblocks_row_applies_on_reopen() {
     let path = tmp("named");
     create_generation(&path, Some(LibverBound::V18));
     assert_eq!(superblock_version(&path), 2);
@@ -378,15 +372,18 @@ fn a_named_bound_above_the_floor_still_applies_on_reopen() {
     cleanup(&path);
 }
 
-/// The other side of the same floor. `H5F__super_read` writes
-/// `low_bound = MAX(H5F_LIBVER_V18, low_bound)`, so a bound named *below* the
-/// row the superblock version sits on is raised, not honoured: a version-2
-/// superblock never gets the classic generation's version-1 structures poured
-/// into it.
+/// And below it. A bound named under the row the superblock version sits on
+/// is honoured, as libhdf5 2.0 honours a fapl's `low` on `H5Fopen`
+/// (HDFGroup/hdf5#4939): a version-3 superblock opened at `Earliest` gets the
+/// classic generation's version-3 layout message and version-1 B-tree
+/// appended — the file h5py on libhdf5 2.x leaves behind, since it pins
+/// `H5F_LIBVER_EARLIEST` on every open — and keeps its version. libhdf5 1.14
+/// raised the bound to the row instead.
 #[test]
-fn a_named_bound_below_the_floor_is_raised_to_it() {
+fn a_named_bound_below_the_superblocks_row_is_honoured() {
     let path = tmp("below");
-    create_generation(&path, Some(LibverBound::V18));
+    create_generation(&path, Some(LibverBound::V110));
+    assert_eq!(superblock_version(&path), 3);
 
     let file = H5File::open_rw(&path).unwrap();
     file.set_libver_bound(LibverBound::Earliest).unwrap();
@@ -399,11 +396,14 @@ fn a_named_bound_below_the_floor_is_raised_to_it() {
         .unwrap();
     file.close().unwrap();
 
-    assert_eq!(superblock_version(&path), 2);
-    assert_eq!(
-        layout_version_of(&path, "appended"),
-        3,
-        "the V18 floor holds: H5O_layout_ver_bounds[EARLIEST] of 1 is below it"
+    assert_eq!(superblock_version(&path), 3);
+    assert_eq!(layout_version_of(&path, "appended"), 3);
+    assert!(
+        matches!(
+            layout_of(&path, "appended"),
+            DataLayoutMessage::ChunkedV3 { .. }
+        ),
+        "a version-1 B-tree inside a version-3 superblock"
     );
     cleanup(&path);
 }

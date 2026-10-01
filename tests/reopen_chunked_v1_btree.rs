@@ -194,11 +194,10 @@ fn a_classic_chunked_dataset_is_writable_through_a_reopen() {
 /// The second-generation reopen: a dataset that was itself *appended* on a
 /// reopen, reopened again.
 ///
-/// This case exists only because the superblock version now floors the append
-/// — before that, appending a chunked dataset to a version-2 file produced a
-/// v1.10 index, so the file this reopens could not be written in the first
-/// place. Getting the version-3 layout right on the first reopen is what makes
-/// a second one meet it.
+/// The first reopen names the `V18` bound, whose layout version of 3 puts the
+/// appended chunks on the version-1 B-tree; a reopen that names none appends
+/// at the writer's default, a v1.10 index. Getting the version-3 layout right
+/// on the first reopen is what makes a second one meet it.
 #[test]
 fn a_chunked_dataset_appended_on_a_reopen_survives_a_second_reopen() {
     let path = tmp("second_gen");
@@ -215,9 +214,10 @@ fn a_chunked_dataset_appended_on_a_reopen_survives_a_second_reopen() {
             .unwrap();
         file.close().unwrap();
     }
-    // First reopen: the append whose index the file's own generation decides.
+    // First reopen: the append whose index the named bound decides.
     {
         let file = H5File::open_rw(&path).unwrap();
+        file.set_libver_bound(LibverBound::V18).unwrap();
         file.new_dataset::<i32>()
             .shape([8usize])
             .max_shape(&[None])

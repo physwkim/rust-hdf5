@@ -3282,10 +3282,10 @@ fn libver_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult
 
 /// The same file, reopened without a bound and appended to.
 ///
-/// No `libver` on the reopen, deliberately: the file's own superblock version
-/// is what settles the generation the appended dataset is written in, the way
-/// `H5F__super_read` raises the low bound to match the version it finds. The
-/// superblock version itself must come out of the reopen unchanged.
+/// No `libver` on the reopen, deliberately: the appended dataset is written at
+/// the writer's default, the file's own superblock version saying nothing
+/// about the bound (libhdf5 2.0, HDFGroup/hdf5#4939). The superblock version
+/// itself must come out of the reopen unchanged.
 fn reopen_append_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult> {
     if let Err(unsupported) = libver_case(path, libver)? {
         return Ok(Err(unsupported));

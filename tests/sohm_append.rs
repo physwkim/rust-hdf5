@@ -694,16 +694,16 @@ fn a_list_index_file_takes_a_new_dataset() {
 /// A reopen re-encodes every header it rewrites, so the encoding it picks has
 /// to be the one the file already holds.
 ///
-/// libhdf5 never rewrites a message it did not touch. Opening a version-2
-/// superblock raises the low bound to `H5F_LIBVER_V18` (hdf5_1.14.6
-/// H5Fsuper.c:460-462), and that bound governs only the objects the reopening
-/// session goes on to create. `sohm_list.h5` was written at
-/// `H5F_LIBVER_EARLIEST`, so its four datasets carry version-1 dataspaces (24
-/// bytes for one dimension with a maximum) and immutable `H5T_STD_I32LE`
-/// datatypes that `H5SM__can_share_common` refuses (H5SM.c:895-899,
-/// H5Odtype.c:1893-1901); the dataset the append adds gets the version-2
-/// dataspace (20 bytes) and the shareable copied type the raised bound calls
-/// for (H5Dint.c:569-572).
+/// libhdf5 never rewrites a message it did not touch, and the bound a
+/// reopening session is given governs only the objects it goes on to create.
+/// `sohm_list.h5` was written at `H5F_LIBVER_EARLIEST`, so its four datasets
+/// carry version-1 dataspaces (24 bytes for one dimension with a maximum) and
+/// immutable `H5T_STD_I32LE` datatypes that `H5SM__can_share_common` refuses
+/// (H5SM.c:895-899, H5Odtype.c:1893-1901). The dataset the append adds, at
+/// this crate's default, keeps the immutable predefined type too — only a
+/// bound of `V18` or newer makes `H5D__init_type` copy it into a shareable
+/// one (H5Dint.c:569-572) — under the version-2 dataspace (20 bytes) this
+/// crate gives every non-classic file.
 ///
 /// This writer has to lay the whole header out again whenever the
 /// shared-message heap moves, so the preservation is a decision it makes
@@ -744,7 +744,7 @@ fn an_append_keeps_the_encoding_the_datasets_it_found_were_written_in() {
     assert_eq!(
         seen,
         vec![
-            ("appended".into(), Some(2), 20, true),
+            ("appended".into(), Some(2), 20, false),
             ("shared0".into(), Some(1), 24, false),
             ("shared1".into(), None, 10, false),
             ("shared2".into(), None, 10, false),
@@ -862,10 +862,10 @@ fn a_second_attribute_body_takes_its_own_reference_on_the_shared_internals() {
 }
 
 /// A file with shared messages is a version-2 superblock over symbol-table
-/// groups, and `H5F__super_read` reads that superblock as `H5F_LIBVER_V18`. The
-/// bound decides what a *new* group is made as; it does not move a group that
-/// already exists, so the root here stays a symbol table and gains its link as
-/// an entry — the same file shape libhdf5's own reopen leaves behind.
+/// groups. The bound decides what a *new* group is made as; it does not move
+/// a group that already exists, so the root here stays a symbol table and
+/// gains its link as an entry — the same file shape libhdf5's own reopen
+/// leaves behind.
 #[test]
 fn a_reopened_symbol_table_group_keeps_its_symbol_table() {
     use rust_hdf5::format::messages::{MSG_LINK, MSG_LINK_INFO, MSG_SYMBOL_TABLE};

@@ -3284,9 +3284,8 @@ fn encode_refcount(refcount: u32) -> Vec<u8> {
 /// an entry (H5Gobj.c:512), so a symbol table survives a reopen at any bound.
 /// A file with shared messages is where the two come apart, because its
 /// superblock extension forces a version-2 superblock over symbol-table groups
-/// (H5Fsuper.c:1135) and `H5F__super_read` then raises the low bound to
-/// `H5F_LIBVER_V18` on reopen — new objects are the modern generation while the
-/// groups already there stay symbol tables.
+/// (H5Fsuper.c:1135) — a group the session adds is made as the session's
+/// bound says while the groups already there stay symbol tables.
 struct SymbolTables {
     /// The scopes the reopen found a Symbol Table message on. Fixed for the
     /// session: a group already in that storage stays in it, whatever bound
@@ -3543,21 +3542,23 @@ impl Default for CarriedExtension {
 }
 
 /// Where a file's superblock version comes from — the two cases libhdf5 keeps
-/// strictly apart, and this writer's single source for both the version it
-/// writes back and the generation it writes new structures in.
+/// strictly apart, and this writer's single source for the version it writes
+/// back.
 ///
-/// INVARIANT: reopening a file never changes its superblock version, and every
-/// structure appended to it is written at a library-version bound of at least
-/// the row that version belongs to.
+/// INVARIANT: reopening a file never changes its superblock version.
 ///
 /// libhdf5 splits the same way. `H5F__super_init` is the only place a version
 /// is *decided* — content first, then `MAX(super_vers,
 /// HDF5_superblock_ver_bounds[low_bound])` (H5Fsuper.c:1128-1154).
-/// `H5F__super_read` never recomputes one; it validates what it read and
-/// raises the file's low bound to match, version 2 to at least
-/// `H5F_LIBVER_V18` and version 3 to at least `H5F_LIBVER_V110`
-/// (hdf5_1.14.6 H5Fsuper.c:460-466). One direction only: the version bounds
-/// the structures, the structures never bound the version back.
+/// `H5F__super_read` never recomputes one. Nor does it bound anything by it:
+/// the structures a session appends are written at the bound the caller
+/// named, or the writer's default, whatever version the superblock has.
+/// libhdf5 1.14 raised a reopened file's low bound to the row its superblock
+/// version belongs to; libhdf5 2.0 dropped that (HDFGroup/hdf5#4939), and the
+/// one raise left is SWMR write access, to `H5F_LIBVER_V110`
+/// (H5Fsuper.c:453), which [`reject_swmr`](Hdf5Writer::reject_swmr) asks of
+/// the caller instead. One direction only: the bound decides a created
+/// file's version, the version never decides the bound.
 ///
 /// Two variants rather than one number with a rule attached, because the
 /// number means different things on the two paths — a floor to raise on the
@@ -3567,33 +3568,13 @@ impl Default for CarriedExtension {
 enum SuperblockVersion {
     /// A file this writer created. The version its creation options start
     /// from, which [`superblock_version_for`](Hdf5Writer::superblock_version_for)
-    /// raises to what the content and the named bound need. Nothing is on
-    /// disk yet, so nothing floors the bound.
+    /// raises to what the content and the named bound need.
     Chosen(u8),
-    /// A file this writer reopened: the version already in the file. Written
-    /// back unchanged, and the floor under every bound this session writes at.
+    /// A file this writer reopened: the version already in the file, written
+    /// back unchanged. `Existing(0..=1)` and `Hdf5Writer::legacy` say the same
+    /// thing from two directions and cannot disagree: `open_append_with_locking`
+    /// builds the `LegacyFile` from exactly those versions.
     Existing(u8),
-}
-
-impl SuperblockVersion {
-    /// The oldest library-version bound this file may be written at.
-    ///
-    /// `H5F__super_read`'s upgrade, as a table rather than two `if`s: the
-    /// oldest row of `HDF5_superblock_ver_bounds` (H5Fsuper.c:68) whose entry
-    /// is the version on disk. A created file has no superblock on disk, so
-    /// its floor is the oldest bound there is.
-    ///
-    /// `Existing(0..=1)` and `Hdf5Writer::legacy` say the same thing from two
-    /// directions and cannot disagree: `open_append_with_locking` builds the
-    /// `LegacyFile` from exactly the versions this arm covers.
-    fn libver_floor(self) -> LibverBound {
-        match self {
-            Self::Chosen(_) => LibverBound::Earliest,
-            Self::Existing(0..=1) => LibverBound::Earliest,
-            Self::Existing(2) => LibverBound::V18,
-            Self::Existing(_) => LibverBound::V110,
-        }
-    }
 }
 
 /// A registry entry that has held some name.
@@ -3721,11 +3702,12 @@ pub struct Hdf5Writer {
     /// write path takes it, so it cannot deadlock with the registry locks.
     pub(crate) create_lock: Slot<()>,
     /// The low `H5Pset_libver_bounds` bound the *caller named*, or `None`
-    /// when none was: the oldest libhdf5 a file this writer creates must stay
-    /// readable by. It is the one switch the version-bearing messages read —
-    /// the datatype message version (`H5O_dtype_ver_bounds`), the data layout
-    /// message version (`H5O_layout_ver_bounds`) and with it the chunk index,
-    /// and the superblock floor (`HDF5_superblock_ver_bounds`).
+    /// when none was: the oldest libhdf5 the objects this writer creates must
+    /// stay readable by. It is the one switch the version-bearing messages
+    /// read — the datatype message version (`H5O_dtype_ver_bounds`), the data
+    /// layout message version (`H5O_layout_ver_bounds`) and with it the chunk
+    /// index, and the superblock floor (`HDF5_superblock_ver_bounds`) of a
+    /// file this writer creates.
     ///
     /// `None` is not `Some(Earliest)`. No single libhdf5 bound describes this
     /// crate's default file: it takes the earliest row of the datatype and
@@ -3737,10 +3719,9 @@ pub struct Hdf5Writer {
     ///
     /// Nothing reads this directly:
     /// [`session_libver`](Hdf5Writer::session_libver) is the only reader, and
-    /// it is where the default meets the floor the file's own superblock puts
-    /// under it (see [`SuperblockVersion`]). A default is a bound the *writer*
-    /// picks, and on a reopened file the writer has no say — which is exactly
-    /// the difference this field cannot express on its own.
+    /// it is where `None` becomes the default of the family asking, the same
+    /// on a created file and a reopened one: the superblock a reopened file
+    /// already has says nothing about the bound (see [`SuperblockVersion`]).
     libver: Option<LibverBound>,
     closed: bool,
     /// Set once `finalize_for_swmr` has published a readable file.
@@ -3770,9 +3751,8 @@ pub struct Hdf5Writer {
     /// finalize can free the block its rewrite supersedes.
     superseded_root_header: crate::io::object_header_io::HeaderBlocks,
     /// Where this file's superblock version comes from. The single owner of
-    /// both halves of the reopen invariant — see [`SuperblockVersion`],
-    /// [`superblock_version_for`](Self::superblock_version_for) and
-    /// [`libver_floor`](Self::libver_floor).
+    /// the reopen invariant — see [`SuperblockVersion`] and
+    /// [`superblock_version_for`](Self::superblock_version_for).
     superblock_version: SuperblockVersion,
     /// Objects whose attributes this finalize spilled to dense storage, and
     /// the `Attribute Info` message naming what was written for each.
@@ -4894,11 +4874,12 @@ impl Hdf5Writer {
     /// `H5Pset_libver_bounds`'s `low` argument. Objects created after this
     /// call encode their messages at the versions that bound calls for.
     ///
-    /// On a reopened file the bound is raised to the row the file's superblock
-    /// version belongs to if it names an older one, exactly as
-    /// `H5F__super_read` raises the fapl's value — see
-    /// [`libver_floor`](Self::libver_floor). Only a bound the file's format
-    /// cannot express at all is refused.
+    /// On a reopened file the bound is taken as named, above or below the row
+    /// the file's superblock version belongs to, as `H5Fopen` takes a fapl's
+    /// since libhdf5 2.0 (HDFGroup/hdf5#4939): a version-3 superblock opened
+    /// at `Earliest` gets version-1 B-tree chunk indexes appended, as h5py on
+    /// libhdf5 2.x appends them. Only a bound the file's format cannot express
+    /// at all is refused.
     pub fn set_libver_bound(&mut self, libver: LibverBound) -> IoResult<()> {
         // A classic file cannot honour a newer bound: every encoder in it
         // reads `H5F_LOW_BOUND`, and raising that is what makes libhdf5 write
@@ -5061,54 +5042,24 @@ impl Hdf5Writer {
         self.header_format(track)
     }
 
-    /// The oldest bound this file may be written at, and the single owner of
-    /// the reopen half of the [`SuperblockVersion`] invariant.
-    ///
-    /// A reopened file's superblock version is the only thing on disk that
-    /// says which generation the file is, and `H5F__super_read` reads it as
-    /// exactly that: it raises `H5F_LOW_BOUND` to the row that version belongs
-    /// to (hdf5_1.14.6 H5Fsuper.c:460-466). Every version-selecting site below
-    /// goes through [`session_libver`](Self::session_libver) rather than
-    /// reading the `libver` field, so none of them can hand a reopened file a
-    /// structure older than the file already claims to hold.
-    ///
-    /// A floor, not a ceiling. `H5Fopen` takes a fapl like `H5Fcreate` does,
-    /// and a bound named above this one applies: libhdf5 1.14.6 writes a
-    /// version-4 layout message into a version-2 superblock when asked at
-    /// `H5F_LIBVER_V110`, leaving the superblock version alone. The ceiling is
-    /// the separate question [`set_libver_bound`](Self::set_libver_bound)
-    /// answers — no bound but `Earliest` may be named on a classic file.
-    fn libver_floor(&self) -> LibverBound {
-        self.superblock_version.libver_floor()
-    }
-
     /// The bound one family of encoders is written at, and the single reader
     /// of the `libver` field.
     ///
-    /// Three inputs, in the order libhdf5 applies them. A bound the caller
-    /// named is the fapl's `low`, raised to the floor exactly as
-    /// `H5F__super_read` raises it. With no bound named the answer depends on
-    /// which superblock this file has:
-    ///
-    /// * A file this writer created has none yet, so the writer picks —
-    ///   `create_default`, which differs per family because this crate's
-    ///   default file is two rows rather than one bound (see the `libver`
-    ///   field, [`encoding_libver`] and [`layout_version_bound`]). The
-    ///   superblock is then written to match what was picked.
-    /// * A reopened file has already said which generation it is, and its
-    ///   superblock cannot be rewritten to match a newer pick. So the floor is
-    ///   the whole answer — the same value `H5F_LOW_BOUND` has after
-    ///   `H5F__super_read` under a default fapl.
+    /// A bound the caller named is the fapl's `low`, as it was named: since
+    /// libhdf5 2.0 `H5F__super_read` raises nothing but an SWMR-write open
+    /// (HDFGroup/hdf5#4939), so a reopened file's superblock version says
+    /// which generation the file *is* and nothing about the generation this
+    /// session appends in. With no bound named the answer is `create_default`,
+    /// which differs per family because this crate's default file is two rows
+    /// rather than one bound (see the `libver` field, [`encoding_libver`] and
+    /// [`layout_version_bound`]) — the same default on a created file, whose
+    /// superblock is then written to match, and on a reopened one, whose
+    /// superblock is written back as found.
     ///
     /// [`encoding_libver`]: Self::encoding_libver
     /// [`layout_version_bound`]: Self::layout_version_bound
     fn session_libver(&self, create_default: LibverBound) -> LibverBound {
-        let floor = self.libver_floor();
-        let bound = match (self.libver, self.superblock_version) {
-            (Some(named), _) => named.max(floor),
-            (None, SuperblockVersion::Existing(_)) => floor,
-            (None, SuperblockVersion::Chosen(_)) => create_default,
-        };
+        let bound = self.libver.unwrap_or(create_default);
         match self.message_format() {
             // `H5F_LIBVER_EARLIEST` is the only low bound under which libhdf5
             // writes a version-0/1 superblock at all, so a newer structure
@@ -5136,10 +5087,10 @@ impl Hdf5Writer {
     /// default file uses the v1.10 chunk indexes, which is exactly what that
     /// row says and what no other row does (see the `libver` field for why the
     /// default is not `Earliest` here even though the datatype and superblock
-    /// tables read it that way). A file whose superblock already places it on
-    /// an older row takes that row instead — a reopened version-2 superblock
-    /// is the `V18` row, whose layout version of 3 has no index-type field at
-    /// all, so its appended chunked datasets go on the version-1 B-tree.
+    /// tables read it that way). A reopened file takes the same default: a
+    /// version-2 superblock gets v1.10 indexes appended unless a bound below
+    /// `V110` is named, whose layout version of 3 has no index-type field at
+    /// all and puts the appended chunks on the version-1 B-tree.
     fn layout_version_bound(&self) -> u8 {
         self.session_libver(LibverBound::V110).layout_version()
     }
@@ -5185,22 +5136,24 @@ impl Hdf5Writer {
     /// the oldest bound whose `HDF5_superblock_ver_bounds` row reaches version
     /// 3.
     ///
-    /// Which of the two applies is the [`SuperblockVersion`] question. A
-    /// reopened file already has its version and reopening never rewrites one,
-    /// so the first check decides and the second cannot fail after it: the
-    /// version-3 floor is `V110`. A file this writer created has no version on
-    /// disk yet, so only the second is askable — and a caller who named no
-    /// bound at all passes it, because nothing in such a file says the
-    /// superblock may not be version 3 and SWMR is what makes it one.
+    /// The first is the [`SuperblockVersion`] question: a reopened file
+    /// already has its version and reopening never rewrites one, so it is
+    /// checked as found; a file this writer created has no version on disk
+    /// yet, and nothing in it says the superblock may not be version 3 — SWMR
+    /// is what makes it one. The second is asked of the bound the caller
+    /// named on either path, since a reopened file's superblock no longer
+    /// raises it (HDFGroup/hdf5#4939); a caller who named none passes,
+    /// because the default's layout row is `V110`'s, the row the v1.10 chunk
+    /// indexes an SWMR reader follows belong to.
     ///
     /// Named, not silently upgraded. libhdf5 upgrades in the one case where
     /// SWMR is asked for at *create* time (`H5F_ACC_SWMR_WRITE` raises the
     /// bound to V110 in `H5F__super_init`, H5Fsuper.c:1131); on the reopen
     /// path it refuses instead, and so does this.
     fn reject_swmr(&self) -> IoResult<()> {
+        let below_v110 = self.libver.is_some_and(|b| b < LibverBound::V110);
         let why = match self.superblock_version {
-            SuperblockVersion::Existing(version) if version >= SUPERBLOCK_V3 => return Ok(()),
-            SuperblockVersion::Existing(version) => format!(
+            SuperblockVersion::Existing(version) if version < SUPERBLOCK_V3 => format!(
                 "its superblock is version {version}, and reopening a file never \
                  rewrites that"
             ),
@@ -5209,12 +5162,10 @@ impl Hdf5Writer {
                  H5F_LIBVER_EARLIEST selects"
                     .to_string()
             }
-            SuperblockVersion::Chosen(_) if self.libver.is_some_and(|b| b < LibverBound::V110) => {
-                "it was asked for at a library-version bound below H5F_LIBVER_V110, \
-                 whose superblock row is version 2"
-                    .to_string()
-            }
-            SuperblockVersion::Chosen(_) => return Ok(()),
+            _ if below_v110 => "it was asked for at a library-version bound below \
+                 H5F_LIBVER_V110, whose superblock row is version 2"
+                .to_string(),
+            _ => return Ok(()),
         };
         Err(crate::io::IoError::Unsupported(format!(
             "cannot start an SWMR session on this file: {why}, and SWMR needs a \
@@ -6201,19 +6152,16 @@ impl Hdf5Writer {
             name_index: Slot::new(Box::new(NameIndex::new())),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
-            // A reopen names no bound: the file already is whichever
-            // generation it is, and the version in its superblock is what
-            // says so — see `libver_floor`. `set_libver_bound` is where a
-            // caller asks for a newer one, exactly as `H5Fopen` takes a fapl.
+            // A reopen names no bound, so the session appends at the same
+            // default a create uses. `set_libver_bound` is where a caller
+            // names one, exactly as `H5Fopen` takes a fapl.
             libver: None,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             superseded_root_header: root_header_blocks,
-            // The version the file already has. It is written back unchanged
-            // and it floors every bound this session writes at, so the append
-            // hands the file back in the generation it found it in.
+            // The version the file already has, written back unchanged.
             superblock_version: SuperblockVersion::Existing(version),
             // The reopened file's own policy, so objects added in this
             // session are made the way the file already declares.
@@ -16741,10 +16689,8 @@ impl Hdf5Writer {
     ///
     /// None of that applies to a reopened file. `H5F__super_read` validates
     /// the version it finds and never recomputes one, so the version written
-    /// back is the version read — see [`SuperblockVersion`], which is also
-    /// where the other half of that rule lives: the version floors the bound
-    /// the appended structures are written at, which is why nothing this
-    /// session adds can need a newer one.
+    /// back is the version read, whatever this session appends — see
+    /// [`SuperblockVersion`].
     fn superblock_version_for(&self, flags: u8) -> u8 {
         let chosen = match self.superblock_version {
             SuperblockVersion::Existing(version) => return version,
@@ -17334,13 +17280,12 @@ impl Hdf5Writer {
 
         // Every message below is written in the format this dataset already
         // has, not the one this session would pick. libhdf5 grows a header in
-        // place and never re-encodes a message it did not touch, so reopening
-        // a superblock-v2 file — which raises the low bound to V18
-        // (hdf5_1.14.6 H5Fsuper.c:460-462) — leaves the version-1 dataspaces
-        // an EARLIEST-bound creating session wrote exactly as they are. This
-        // writer has to lay the whole header out again whenever the
-        // shared-message heap moves, so preserving the encoding is the only
-        // way to land on the same bytes.
+        // place and never re-encodes a message it did not touch, so a reopen
+        // at a newer bound leaves the version-1 dataspaces an EARLIEST-bound
+        // creating session wrote exactly as they are. This writer has to lay
+        // the whole header out again whenever the shared-message heap moves,
+        // so preserving the encoding is the only way to land on the same
+        // bytes.
         let format = m.read_format.unwrap_or_else(|| self.message_format());
         let libver = match format {
             ObjectFormat::Legacy => LibverBound::Earliest,
@@ -20338,6 +20283,41 @@ mod tests {
         let writer = Hdf5Writer::open_append(&path).unwrap();
         assert_eq!(writer.ds(0).lock().obj_header_written_addr, Some(published));
         assert_eq!(writer.ds(0).lock().attributes.len(), 4);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `H5F__start_swmr_write` refuses a low bound below `H5F_LIBVER_V110`
+    /// (H5Fint.c:3818) on a reopened file as on a created one, now that the
+    /// superblock no longer raises it: an SWMR reader follows the v1.10 chunk
+    /// indexes, which a lower bound's layout version cannot name. No bound
+    /// named passes, the default's layout row being `V110`'s.
+    #[test]
+    fn swmr_on_a_reopened_file_refuses_a_named_bound_below_v110() {
+        let path = temp_path("swmr_reopen_bound");
+        let writer = Hdf5Writer::create_with_options(
+            &path,
+            FileCreateOptions {
+                libver: Some(LibverBound::V110),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer
+            .create_dataset("d", DatatypeMessage::i32_type(), &[2])
+            .unwrap();
+        writer.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
+
+        for bound in [LibverBound::Earliest, LibverBound::V18] {
+            let mut writer = Hdf5Writer::open_append(&path).unwrap();
+            writer.set_libver_bound(bound).unwrap();
+            let err = writer.finalize_for_swmr().unwrap_err().to_string();
+            assert!(err.contains("H5F_LIBVER_V110"), "{bound:?}: {err}");
+            writer.close().unwrap();
+        }
+        let mut writer = Hdf5Writer::open_append(&path).unwrap();
+        writer.finalize_for_swmr().unwrap();
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 

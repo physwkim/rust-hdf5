@@ -448,13 +448,14 @@ fn a_body_only_one_object_uses_stays_in_its_header() {
 /// environment, or the one a wheel bundles under `h5py.libs`.
 ///
 /// The dataset is added at the `H5F_LIBVER_V18` bound, named outright. The
-/// record hashes the dataspace message's bytes, and that message's version
-/// follows the bound: a version-2 superblock, which a shared-message table
-/// requires, floors this crate's bound at V18, and so did libhdf5 1.14's
-/// `H5F__super_read`. libhdf5 2.0 dropped that raise (#4939), and h5py pins
-/// `H5F_LIBVER_EARLIEST` on every open, so left to the default the same
-/// dataset would be written under a version-1 header with a version-1
-/// dataspace and the record would hash a different body.
+/// record hashes the dataspace message's bytes, and in libhdf5 that message's
+/// version follows the bound; this crate gives every non-classic file the
+/// version-2 dataspace, which is what V18 selects. libhdf5 1.14 reached it on
+/// its own by raising a reopened version-2 superblock's bound to V18; 2.0
+/// dropped that raise (#4939), and h5py pins `H5F_LIBVER_EARLIEST` on every
+/// open, so left to the default the same dataset would be written under a
+/// version-1 header with a version-1 dataspace and the record would hash a
+/// different body.
 fn libhdf5_writes_the_same_single_use_record(record: &[u8]) {
     let Some(py) = python() else { return };
     let theirs = unique_tmp("in_ohdr_h5py");

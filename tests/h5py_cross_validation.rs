@@ -2196,6 +2196,69 @@ fn committed_datatypes_read_back_through_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A version-3 superblock reopened at `Earliest` gets a version-1 B-tree
+/// chunked dataset appended, the file h5py on libhdf5 2.x leaves behind since
+/// it pins `H5F_LIBVER_EARLIEST` on every open (libhdf5 2.0 no longer raises
+/// the bound to the superblock's row, HDFGroup/hdf5#4939); h5py reads the
+/// mixed file whole.
+#[test]
+fn a_classic_index_appended_into_a_v110_file_reads_back_in_h5py() {
+    use rust_hdf5::{ChunkIndex, LibverBound};
+    let Some(py) = python() else { return };
+    let path = tmp("earliest_in_v110");
+    {
+        let file = H5File::options()
+            .libver(LibverBound::V110)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([4usize])
+            .chunk(&[2])
+            .create("first")
+            .unwrap()
+            .write_raw(&[1i32, 2, 3, 4])
+            .unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.set_libver_bound(LibverBound::Earliest).unwrap();
+        file.new_dataset::<i32>()
+            .shape([4usize])
+            .max_shape(&[None])
+            .chunk(&[2])
+            .create("appended")
+            .unwrap()
+            .write_raw(&[5i32, 6, 7, 8])
+            .unwrap();
+        file.close().unwrap();
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap()[8],
+        3,
+        "the superblock version"
+    );
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("appended").unwrap().chunk_index().unwrap(),
+        Some(ChunkIndex::BtreeV1)
+    );
+    assert_ne!(
+        file.dataset("first").unwrap().chunk_index().unwrap(),
+        Some(ChunkIndex::BtreeV1)
+    );
+    drop(file);
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert list(f['first'][...]) == [1, 2, 3, 4]\n\
+         assert list(f['appended'][...]) == [5, 6, 7, 8]\n\
+         assert f['appended'].maxshape == (None,)\n\
+         assert f['appended'].chunks == (2,)\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A committed datatype's object header is created from the datatype creation
 /// property list and nothing else (`H5T__commit`, H5Tcommit.c:468), so
 /// `H5O__set_version` gives it the file's floor exactly as it gives every
