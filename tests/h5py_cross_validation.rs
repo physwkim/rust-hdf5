@@ -5610,3 +5610,164 @@ fn dimension_scales_attached_by_h5py_are_extended_by_rust() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// What one append session does to the headers libhdf5 and this crate wrote
+/// before it: `data` grows past its chunk 0, `s0` shrinks, `g` and `g/inner`
+/// grow, and the root gains a link.
+fn rewrite_every_header(path: &std::path::Path) {
+    let file = H5File::open_rw(path).unwrap();
+    let data = file.dataset_writer("data").unwrap();
+    for i in 0..4 {
+        data.new_attr::<f64>()
+            .shape([32])
+            .create(&format!("wide{i}"))
+            .unwrap()
+            .write_array(&[f64::from(i); 32])
+            .unwrap();
+    }
+    let s0 = file.dataset_writer("s0").unwrap();
+    s0.set_scale(Some("s")).unwrap();
+    let g = file.root_group().group("g").unwrap();
+    g.set_attr_array_numeric("marks", &[7i64; 16]).unwrap();
+    let inner = file.dataset_writer("g/inner").unwrap();
+    for i in 0..3 {
+        inner
+            .new_attr::<f64>()
+            .shape([32])
+            .create(&format!("wide{i}"))
+            .unwrap()
+            .write_array(&[1.5; 32])
+            .unwrap();
+    }
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("appended")
+        .unwrap()
+        .write_raw(&[1i32, 2, 3, 4])
+        .unwrap();
+    file.close().unwrap();
+}
+
+/// h5py writes references to objects of a crate-written file, records every
+/// object's header address, and reads them all back after the session above.
+const ADDRESSES_AND_REFERENCES: &str = "\
+import h5py, numpy as np
+f = h5py.File(PATH, 'r+')
+names = ['/', 'data', 's0', 'g', 'g/inner']
+f.attrs['addresses'] = np.array([h5py.h5o.get_info(f[n].id).addr for n in names], dtype='u8')
+refs = f.create_dataset('refs', (4,), dtype=h5py.ref_dtype)
+refs[...] = [f['data'].ref, f['s0'].ref, f['g'].ref, f['g/inner'].ref]
+f['data'].attrs['to_s0'] = f['s0'].ref
+f.attrs['to_inner'] = f['g/inner'].ref
+f.close()
+";
+
+const ADDRESSES_AND_REFERENCES_HELD: &str = "\
+names = ['/', 'data', 's0', 'g', 'g/inner']
+addresses = [h5py.h5o.get_info(f[n].id).addr for n in names]
+assert addresses == list(f.attrs['addresses']), (addresses, list(f.attrs['addresses']))
+assert [f[r].name for r in f['refs'][...]] == ['/data', '/s0', '/g', '/g/inner']
+assert f[f['data'].attrs['to_s0']].name == '/s0'
+assert f[f.attrs['to_inner']].name == '/g/inner'
+assert f[f['data'].attrs['by_rust'][0]].name == '/g/inner'
+assert (f['data'].attrs['wide3'] == 3.0).all()
+assert (f['g'].attrs['marks'] == 7).all()
+assert (f['g/inner'].attrs['wide2'] == 1.5).all()
+assert f['s0'].attrs['NAME'] == b's'
+assert h5py.h5ds.is_attached(f['data'].id, f['s0'].id, 0)
+assert f['data'].dims[0][0].name == '/s0'
+rl = f['s0'].attrs['REFERENCE_LIST']
+assert [(f[r].name, int(i)) for r, i in rl] == [('/data', 0)], rl
+assert list(f['appended'][...]) == [1, 2, 3, 4]
+";
+
+/// Create `data`, the scale `s0` on its axis 0, and `g/inner`, with a
+/// Rust-written reference attribute, at the given bound.
+fn create_referenced_objects(path: &std::path::Path, libver: Option<rust_hdf5::LibverBound>) {
+    let mut options = H5File::options();
+    if let Some(libver) = libver {
+        options = options.libver(libver);
+    }
+    let file = options.create(path).unwrap();
+    let data = file
+        .new_dataset::<u16>()
+        .shape([2, 3])
+        .create("data")
+        .unwrap();
+    data.write_raw(&[1u16, 2, 3, 4, 5, 6]).unwrap();
+    let s0 = file.new_dataset::<f32>().shape([2]).create("s0").unwrap();
+    s0.write_raw(&[10.0f32, 20.0]).unwrap();
+    s0.set_scale(Some("a scale with a long name")).unwrap();
+    data.attach_scale(0, &s0).unwrap();
+    let g = file.create_group("g").unwrap();
+    let inner = g.new_dataset::<i32>().shape([3]).create("inner").unwrap();
+    inner.write_raw(&[1i32, 2, 3]).unwrap();
+    data.new_attr::<u64>()
+        .shape([1usize])
+        .create("by_rust")
+        .unwrap()
+        .write_object_references(&["/g/inner"])
+        .unwrap();
+    file.close().unwrap();
+}
+
+/// An append session writes every header it rebuilds back over the chunk 0
+/// it already had — padded when it shrank, chained into a continuation chunk
+/// when it grew — so the object references h5py wrote into the file, which
+/// this crate never sees, still resolve: the address they hold is the
+/// address the object is still at.
+#[test]
+fn rewritten_headers_keep_the_addresses_h5py_references_hold() {
+    let Some(py) = python() else { return };
+    let path = tmp("kept_headers");
+    create_referenced_objects(&path, None);
+    run_python(
+        py,
+        &ADDRESSES_AND_REFERENCES.replace("PATH", &format!("r'{}'", path.display())),
+    );
+    rewrite_every_header(&path);
+    read_back_with_h5py(py, &path, ADDRESSES_AND_REFERENCES_HELD);
+
+    // And this crate's own reader walks the chained headers.
+    let file = H5File::open(&path).unwrap();
+    let data = file.dataset("data").unwrap();
+    assert_eq!(
+        data.attr_names().unwrap().len(),
+        7,
+        "{:?}",
+        data.attr_names()
+    );
+    assert_eq!(
+        file.dataset("g/inner").unwrap().attr_names().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        file.dataset("s0")
+            .unwrap()
+            .attr("NAME")
+            .unwrap()
+            .read_string()
+            .unwrap(),
+        "s"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The same under the earliest bound, where the headers are version 1: a
+/// grown header chains into a bare continuation chunk and a shrunk one is
+/// padded with a NIL message, both of which libhdf5 has to read back.
+#[test]
+fn rewritten_legacy_headers_keep_the_addresses_h5py_references_hold() {
+    let Some(py) = python() else { return };
+    let path = tmp("kept_legacy_headers");
+    create_referenced_objects(&path, Some(rust_hdf5::LibverBound::Earliest));
+    run_python(
+        py,
+        &ADDRESSES_AND_REFERENCES.replace("PATH", &format!("r'{}'", path.display())),
+    );
+    rewrite_every_header(&path);
+    read_back_with_h5py(py, &path, ADDRESSES_AND_REFERENCES_HELD);
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.dataset("data").unwrap().attr_names().unwrap().len(), 7);
+    std::fs::remove_file(&path).ok();
+}

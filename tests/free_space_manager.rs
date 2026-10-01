@@ -463,11 +463,15 @@ fn the_paged_fixture_persists_no_manager_to_rewrite() {
     );
     // Paged allocation is the file's whether or not it persists managers, so
     // the append still lands on the page grid and ends the file on it. It
-    // grows by a page: with no managers on disk there is nothing that says
-    // the space the fixture is not using is free, so this session cannot
-    // reuse it any more than libhdf5 could.
+    // grows by two pages, one per class: with no managers on disk there is
+    // nothing that says the space the fixture is not using is free, so this
+    // session cannot reuse it any more than libhdf5 could — and the root
+    // header, written back over its own 51-byte chunk 0, spills the new link
+    // into a continuation chunk on the metadata page rather than being laid
+    // out afresh. h5py's `create_dataset` on the fixture grows it by the
+    // same two pages and leaves the root header at the same address.
     assert_eq!(after.total % info.page_size, 0, "{after:?}");
-    assert_eq!(after.total, before.total + info.page_size, "{after:?}");
+    assert_eq!(after.total, before.total + 2 * info.page_size, "{after:?}");
     h5clear_accepts(py, &path);
     // The fixture's own datasets, not the ones the persisting file has.
     let script = format!(

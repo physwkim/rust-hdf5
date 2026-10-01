@@ -15,6 +15,16 @@
 
 ### Fixed
 
+- An append session no longer moves the object headers it rewrites. A
+  reopened dataset, group or root header is written back over the
+  chunk 0 it already occupies — padded when its messages shrank,
+  spilling into a continuation chunk when they grew, as libhdf5 grows
+  a header it cannot extend in place — so every object reference the
+  file already holds, in a reference dataset, a reference attribute or
+  a `REFERENCE_LIST`, whoever wrote it, still resolves after the
+  session. Previously every rewritten header was laid out afresh at an
+  exact-size block and references to it went stale.
+
 - A global heap object released by a replaced attribute or a rewritten
   element no longer keeps its finalize-time address stamp registered,
   which could have stamped a later object inserted at the same index.
