@@ -12666,6 +12666,17 @@ impl Hdf5Writer {
             return Ok(());
         }
 
+        // An object on its way out can hold no stamp: a reference this
+        // session wrote into it would otherwise be stamped into whatever a
+        // later insert puts at the same index. Pruned here, by the one owner
+        // of removal, so no release path — attribute replacement, element
+        // rewrite, dataset deletion — can leave one behind.
+        self.pending_heap_references.lock().retain(|p| {
+            !per_collection
+                .get(&p.collection)
+                .is_some_and(|indices| indices.contains(&p.index))
+        });
+
         // The `cwfs` lock is held across the sweep: it serializes these
         // collection-block rewrites (and frees) against
         // `insert_vlen_objects`, which may be packing new objects into the
