@@ -26,7 +26,7 @@ zlib-rs = { version = "0.6", default-features = false, features = [
 ], optional = true }
 lz4_flex = { version = "0.11", optional = true }
 bzip2 = { version = "0.5", optional = true }
-rust-zstd = { version = "0.1", default-features = false, optional = true }
+rust-zstd = { version = "0.2", default-features = false, optional = true }
 snap = { version = "1", optional = true }
 rayon = { version = "1", optional = true }
 memmap2 = { version = "0.9", optional = true }

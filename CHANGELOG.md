@@ -16,6 +16,9 @@
 
 ### Changed
 
+- The optional `zstd` filter now uses `rust-zstd` 0.2, whose frames are
+  byte-identical to libzstd 1.5.7's; 0.1.0 could emit corrupt frames and
+  is yanked.
 - A reopened file is appended to at the bound the caller named, or the
   writer's default when none was, whatever its superblock version — as
   libhdf5 2.0 opens a file (HDFGroup/hdf5#4939). The superblock version
