@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+### Changed
+
+- The optional `zstd` filter uses `rust-zstd` 0.3, which decodes
+  multithreaded end to end; frames stay byte-identical to libzstd 1.5.7's.
+
 ## 0.7.0
 
 ### Fixed
