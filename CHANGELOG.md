@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2
+
+### Changed
+
+- The optional `zstd` filter uses `rust-zstd` 0.4.1; the compress and
+  decompress surface this crate uses is unchanged, and frames round-trip
+  with h5py/hdf5plugin (libzstd) in both directions.
+
 ## 0.7.1
 
 ### Changed
