@@ -2051,6 +2051,10 @@ struct CollectedLinks {
     /// Links written back unchanged: the class this writer cannot express,
     /// and the hard links whose object it cannot model.
     preserved: Vec<PreservedEntry>,
+    /// The creation order each hard link carried on disk (`H5O_LINK_STORE_CORDER`),
+    /// by full link path without a leading `/`. Present only for groups that
+    /// track link creation order, as every NetCDF-4 group does.
+    link_corder: std::collections::HashMap<String, i64>,
 }
 
 /// One hard link the reopen walk met: what it names, and the exact message
@@ -2661,6 +2665,9 @@ impl<'a> ReopenWalk<'a> {
                 });
                 continue;
             };
+            if let Some(corder) = link.creation_order {
+                self.out.link_corder.insert(full_name.clone(), corder);
+            }
             let entry = HardEntry {
                 path: full_name.clone(),
                 address: *address,
@@ -5703,6 +5710,7 @@ impl Hdf5Writer {
         let collected = walk.finish();
         let mut link_entries = collected.hard;
         let mut preserved = collected.preserved;
+        let link_corder = collected.link_corder;
         // Objects the loop below could not rebuild, by header address, so the
         // other links to one are preserved with it rather than left pointing
         // at a registry entry that is no longer there.
@@ -6033,24 +6041,42 @@ impl Hdf5Writer {
             });
         }
 
-        // Stamp the creation sequence a reopened file cannot supply. Nothing
-        // on disk says which link was made first unless the group tracked
-        // creation order, and this reader does not carry that back out, so
-        // discovery order is what there is: datasets, then groups, then the
-        // hard links found beside them — the order the writer emitted links
-        // in before it ordered them at all.
-        let mut creation_seq = 0u64;
+        // Stamp the creation sequence of every reopened link. A group that
+        // tracks creation order (every NetCDF-4 group) recorded it on each
+        // link, and `group_links` sorts by this sequence before renumbering,
+        // so the stored order is what keeps an append session from reordering
+        // the group — netcdf-c lists variables, and numbers them, in creation
+        // order. Links with no stored order (untracked groups) fall back to
+        // discovery order: datasets, then groups, then the hard links found
+        // beside them, all after every stored order so new links stay last.
+        let mut creation_seq = link_corder
+            .values()
+            .copied()
+            .filter(|c| *c >= 0)
+            .max()
+            .map_or(0, |max| max as u64 + 1);
+        let mut stamp = |path: &str| -> u64 {
+            match link_corder.get(path.trim_start_matches('/')) {
+                Some(&corder) if corder >= 0 => corder as u64,
+                _ => {
+                    let seq = creation_seq;
+                    creation_seq += 1;
+                    seq
+                }
+            }
+        };
         for d in &mut existing_datasets {
-            d.creation_seq = creation_seq;
-            creation_seq += 1;
+            d.creation_seq = stamp(&d.name);
         }
         for g in &mut groups {
-            g.creation_seq = creation_seq;
-            creation_seq += 1;
+            g.creation_seq = stamp(&g.name);
         }
         for l in &mut hard_links {
-            l.creation_seq = creation_seq;
-            creation_seq += 1;
+            let path = match l.parent {
+                Some(p) => format!("{}/{}", groups[p].name.trim_start_matches('/'), l.name),
+                None => l.name.clone(),
+            };
+            l.creation_seq = stamp(&path);
         }
 
         // The strategy is the file's, not this session's: a paged file

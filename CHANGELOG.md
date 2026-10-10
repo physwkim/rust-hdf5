@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- An append session keeps each group's link creation order. Reopening
+  stamped every link's creation sequence in discovery order, which for a
+  compact group is header-message order, so any `open_rw` + `close` —
+  even one that wrote nothing — renumbered the links of a group that
+  tracks creation order. netcdf-c lists and numbers NetCDF-4 variables in
+  that order, so a pure data edit reordered them. Links now keep the
+  creation order stored on disk; links without one keep discovery order
+  after them, and links added in the session still come last.
+
 ## 0.7.2
 
 ### Changed
