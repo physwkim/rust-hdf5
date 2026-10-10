@@ -142,3 +142,117 @@ with h5py.File(r"{}", "w", libver="latest", track_order=True) as f:
     run_python(&py, &check_script(&path, &names, &["c", "a", "b"]));
     std::fs::remove_file(&path).ok();
 }
+
+/// Links the writer carries through by their bytes (here a soft link in the
+/// root and one in `grp`) are renumbered with the modelled links, so no two
+/// links of a group share a creation order after the rewrite.
+#[test]
+fn preserved_links_keep_their_place_in_the_creation_order() {
+    let Some(py) = python() else { return };
+    let path = tmp("preserved");
+    run_python(
+        &py,
+        &format!(
+            r#"
+import h5py, numpy as np
+with h5py.File(r"{}", "w", libver="latest", track_order=True) as f:
+    f.create_dataset("a", data=np.zeros(1))
+    f["s"] = h5py.SoftLink("/a")
+    f.create_dataset("b", data=np.zeros(1))
+    g = f.create_group("grp", track_order=True)
+    g.create_dataset("c", data=np.zeros(1))
+    g["t"] = h5py.SoftLink("/a")
+    g.create_dataset("d", data=np.zeros(1))
+"#,
+            path.display()
+        ),
+    );
+    let corders = |root: &[&str], sub: &[&str]| {
+        format!(
+            r#"
+import h5py
+def order(g):
+    names = []
+    g.id.links.iterate(lambda n: names.append(n.decode()), idx_type=h5py.h5.INDEX_CRT_ORDER)
+    return names
+def corders(g):
+    return [g.id.links.get_info(n.encode()).corder for n in order(g)]
+with h5py.File(r"{}", "r") as f:
+    assert order(f) == {:?}, order(f)
+    assert corders(f) == list(range({})), corders(f)
+    assert order(f["grp"]) == {:?}, order(f["grp"])
+    assert corders(f["grp"]) == list(range({})), corders(f["grp"])
+"#,
+            path.display(),
+            root,
+            root.len(),
+            sub,
+            sub.len()
+        )
+    };
+
+    let file = H5File::open_rw(&path).unwrap();
+    file.close().unwrap();
+    run_python(&py, &corders(&["a", "s", "b", "grp"], &["c", "t", "d"]));
+
+    let file = H5File::open_rw(&path).unwrap();
+    file.new_dataset::<f32>()
+        .shape([1])
+        .create("added")
+        .unwrap();
+    file.close().unwrap();
+    run_python(
+        &py,
+        &corders(&["a", "s", "b", "grp", "added"], &["c", "t", "d"]),
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A preserved link pins its group to compact storage however many links
+/// sit beside it, and the one phase-change decision covers the whole set:
+/// the dense layout pass and the header emission must not disagree.
+#[test]
+fn preserved_link_pins_a_large_group_to_compact_storage() {
+    let Some(py) = python() else { return };
+    let path = tmp("pins");
+    let names: Vec<String> = (0..9).map(|i| format!("v{i}")).collect();
+    run_python(
+        &py,
+        &format!(
+            r#"
+import h5py, numpy as np
+with h5py.File(r"{}", "w", libver="latest", track_order=True) as f:
+    f.create_dataset("a", data=np.zeros(1))
+    f["s"] = h5py.SoftLink("/a")
+"#,
+            path.display()
+        ),
+    );
+    let file = H5File::open_rw(&path).unwrap();
+    for n in &names {
+        file.new_dataset::<f32>().shape([1]).create(n).unwrap();
+    }
+    file.close().unwrap();
+    let mut expected = vec!["a".to_string(), "s".to_string()];
+    expected.extend(names.iter().cloned());
+    run_python(
+        &py,
+        &format!(
+            r#"
+import h5py
+def order(g):
+    names = []
+    g.id.links.iterate(lambda n: names.append(n.decode()), idx_type=h5py.h5.INDEX_CRT_ORDER)
+    return names
+with h5py.File(r"{}", "r") as f:
+    assert order(f) == {:?}, order(f)
+    assert [f.id.links.get_info(n.encode()).corder for n in order(f)] == list(range({}))
+    assert f["s"].shape == (1,)
+"#,
+            path.display(),
+            expected,
+            expected.len()
+        ),
+    );
+    std::fs::remove_file(&path).ok();
+}

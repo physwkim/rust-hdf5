@@ -12,6 +12,13 @@
   that order, so a pure data edit reordered them. Links now keep the
   creation order stored on disk; links without one keep discovery order
   after them, and links added in the session still come last.
+- The links an append session carries through by their bytes (soft and
+  external links, objects this writer cannot model) are renumbered with the
+  rest of their group, instead of keeping the creation order they had before
+  the hard links beside them were renumbered — which left two links of a
+  tracked group with one order and moved the preserved link in a listing.
+  Past eight links the dense layout pass ignored the compact pin such a
+  link imposes, and the preserved link dropped out of the group entirely.
 
 ## 0.7.2
 

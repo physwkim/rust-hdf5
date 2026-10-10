@@ -2029,8 +2029,16 @@ pub struct PreservedLink {
     /// The link's class, decoded once at collection so listings can report
     /// it. Never the source of what gets written — `encoded` is.
     pub class: crate::io::reader::LinkClass,
-    /// The encoded `Link` message body, exactly as read from the file.
+    /// The decoded message, for the questions the emitters ask of every link
+    /// (does it fit a symbol table entry, what does it name). Never the source
+    /// of what gets written — `encoded` is.
+    pub link: LinkMessage,
+    /// The encoded `Link` message body, exactly as read from the file. The
+    /// one byte range the rewrite touches is the creation order, which
+    /// `group_links` renumbers together with the modelled links.
     pub encoded: Vec<u8>,
+    /// When this link was created; see [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
     /// Why the object this link names could not be modelled, for the callers
     /// that ask for it by name. `None` when the link's own class — not its
     /// target — is what this writer cannot express.
@@ -2038,6 +2046,18 @@ pub struct PreservedLink {
     /// What the object this link names is, when the walk could tell. A
     /// listing asks this; `reason` is prose for the caller that asks why.
     pub kind: PreservedKind,
+}
+
+/// One link of a group as the close emits it, in both forms the emitters
+/// ask for: the message for what it says, the bytes for what gets written.
+/// A modelled link's bytes are its encoding; a preserved link's are the ones
+/// the reopen read, with only the creation order restamped.
+pub(crate) struct GroupLink {
+    pub(crate) link: LinkMessage,
+    pub(crate) encoded: Vec<u8>,
+    /// Carried through by its bytes from a reopen, so it pins the group to
+    /// compact storage.
+    pub(crate) preserved: bool,
 }
 
 /// Every link a reopen walk met, split by what the writer can do with it.
@@ -2051,7 +2071,7 @@ struct CollectedLinks {
     /// Links written back unchanged: the class this writer cannot express,
     /// and the hard links whose object it cannot model.
     preserved: Vec<PreservedEntry>,
-    /// The creation order each hard link carried on disk (`H5O_LINK_STORE_CORDER`),
+    /// The creation order each link carried on disk (`H5O_LINK_STORE_CORDER`),
     /// by full link path without a leading `/`. Present only for groups that
     /// track link creation order, as every NetCDF-4 group does.
     link_corder: std::collections::HashMap<String, i64>,
@@ -2652,6 +2672,9 @@ impl<'a> ReopenWalk<'a> {
                 format!("{}/{}", prefix, link.name)
             };
 
+            if let Some(corder) = link.creation_order {
+                self.out.link_corder.insert(full_name.clone(), corder);
+            }
             // Only a hard link names an object this writer can rebuild. Every
             // other class is kept by its bytes, because a close that emitted
             // only what the registry models would drop it from the file.
@@ -2665,9 +2688,6 @@ impl<'a> ReopenWalk<'a> {
                 });
                 continue;
             };
-            if let Some(corder) = link.creation_order {
-                self.out.link_corder.insert(full_name.clone(), corder);
-            }
             let entry = HardEntry {
                 path: full_name.clone(),
                 address: *address,
@@ -5015,18 +5035,12 @@ impl Hdf5Writer {
     /// obj_lnk->type > H5L_TYPE_BUILTIN_MAX` test (H5Gobj.c:514), asked of the
     /// whole set.
     ///
-    /// A link a reopen carried through verbatim counts too, and one this
-    /// writer cannot even decode counts as not fitting: the entry would have
-    /// to be built from the decoded form, while a link message is re-emitted
-    /// byte for byte.
+    /// A link a reopen carried through verbatim counts too, by its decoded
+    /// form: the entry would have to be built from that.
     fn links_fit_symbol_table(&self, scope: LinkScope, order: CreationOrder) -> bool {
         self.group_links(scope, order)
             .iter()
-            .all(LinkMessage::fits_symbol_table)
-            && self.preserved_links_for(scope).iter().all(|encoded| {
-                LinkMessage::decode(encoded, &self.ctx)
-                    .is_ok_and(|(link, _)| link.fits_symbol_table())
-            })
+            .all(|l| l.link.fits_symbol_table())
     }
 
     /// The header format of the registered dataset at `index`.
@@ -6031,13 +6045,16 @@ impl Hdf5Writer {
                     )
                 }
             };
+            let (link, _) = LinkMessage::decode(&encoded, &meta.ctx)?;
             preserved_links.push(PreservedLink {
                 parent,
                 name: link_name,
                 class,
+                link,
                 encoded,
                 reason,
                 kind,
+                creation_seq: 0,
             });
         }
 
@@ -6048,7 +6065,8 @@ impl Hdf5Writer {
         // the group — netcdf-c lists variables, and numbers them, in creation
         // order. Links with no stored order (untracked groups) fall back to
         // discovery order: datasets, then groups, then the hard links found
-        // beside them, all after every stored order so new links stay last.
+        // beside them, then the links kept by their bytes, all after every
+        // stored order so new links stay last.
         let mut creation_seq = link_corder
             .values()
             .copied()
@@ -6071,12 +6089,15 @@ impl Hdf5Writer {
         for g in &mut groups {
             g.creation_seq = stamp(&g.name);
         }
+        let link_path = |parent: Option<usize>, name: &str| match parent {
+            Some(p) => format!("{}/{}", groups[p].name.trim_start_matches('/'), name),
+            None => name.to_string(),
+        };
         for l in &mut hard_links {
-            let path = match l.parent {
-                Some(p) => format!("{}/{}", groups[p].name.trim_start_matches('/'), l.name),
-                None => l.name.clone(),
-            };
-            l.creation_seq = stamp(&path);
+            l.creation_seq = stamp(&link_path(l.parent, &l.name));
+        }
+        for l in &mut preserved_links {
+            l.creation_seq = stamp(&link_path(l.parent, &l.name));
         }
 
         // The strategy is the file's, not this session's: a paged file
@@ -8855,8 +8876,10 @@ impl Hdf5Writer {
     /// same messages inside a fractal heap) are built from this one list, so
     /// the phase-change decision, the storage it selects and the creation
     /// order recorded in either can never disagree about what the group
-    /// contains.
-    fn group_links(&self, scope: LinkScope, order: CreationOrder) -> Vec<LinkMessage> {
+    /// contains. The links a reopen kept by their bytes are in it too: they
+    /// take their rank in the same numbering, or a group that tracks
+    /// creation order would hold two links with one order.
+    fn group_links(&self, scope: LinkScope, order: CreationOrder) -> Vec<GroupLink> {
         let mut links: Vec<(u64, LinkMessage)> = Vec::new();
         match scope {
             LinkScope::Root => {
@@ -8940,19 +8963,50 @@ impl Hdf5Writer {
                 self.push_committed_datatypes(&mut links, Some(group_idx));
             }
         }
+        let parent = match scope {
+            LinkScope::Root => None,
+            LinkScope::Group(i) => Some(i),
+        };
+        let mut links: Vec<(u64, LinkMessage, Option<Vec<u8>>)> = links
+            .into_iter()
+            .map(|(seq, link)| (seq, link, None))
+            .collect();
+        for l in self.preserved_links.lock().iter() {
+            if l.parent == parent {
+                links.push((l.creation_seq, l.link.clone(), Some(l.encoded.clone())));
+            }
+        }
         // Creation order, not order by kind: a run of create_group and
         // create_dataset draws from one counter, so this is the order the
         // caller made them in. `H5G_obj_insert` numbers from zero within the
         // group, so the rank here is the link's creation order.
-        links.sort_by_key(|(seq, _)| *seq);
+        links.sort_by_key(|(seq, ..)| *seq);
         links
             .into_iter()
             .enumerate()
-            .map(|(rank, (_, link))| {
+            .map(|(rank, (_, mut link, preserved))| {
                 if order.is_tracked() {
-                    link.with_creation_order(rank as i64)
-                } else {
-                    link
+                    link.creation_order = Some(rank as i64);
+                }
+                let is_preserved = preserved.is_some();
+                let encoded = match preserved {
+                    None => link.encode(&self.ctx),
+                    Some(mut bytes) => {
+                        // Only the creation order field changes. Bytes that
+                        // have none in a group that tracks it are not a
+                        // libhdf5 group's; re-encoding is what gives them one.
+                        if let Some(corder) = link.creation_order {
+                            if !LinkMessage::restamp_encoded_creation_order(&mut bytes, corder) {
+                                bytes = link.encode(&self.ctx);
+                            }
+                        }
+                        bytes
+                    }
+                };
+                GroupLink {
+                    link,
+                    encoded,
+                    preserved: is_preserved,
                 }
             })
             .collect()
@@ -8971,11 +9025,14 @@ impl Hdf5Writer {
     /// The answer depends only on the link names and kinds, never on the
     /// addresses they point at, which is what lets a group header be sized
     /// before [`prepare_dense_links`](Self::prepare_dense_links) has run.
-    fn links_need_dense(&self, links: &[LinkMessage]) -> bool {
-        links.len() > MAX_COMPACT_LINKS
-            || links
-                .iter()
-                .any(|l| l.encode(&self.ctx).len() > MAX_MESSAGE_SIZE)
+    ///
+    /// A link a reopen carried through by its bytes pins the group to compact
+    /// storage: dense storage would have to re-encode each link into the
+    /// heap, which is exactly the byte fidelity preserving them is for.
+    fn links_need_dense(&self, links: &[GroupLink]) -> bool {
+        !links.iter().any(|l| l.preserved)
+            && (links.len() > MAX_COMPACT_LINKS
+                || links.iter().any(|l| l.encoded.len() > MAX_MESSAGE_SIZE))
     }
 
     /// The single owner of link emission into a group object header: the Link
@@ -8996,7 +9053,7 @@ impl Hdf5Writer {
         &self,
         header: &mut ObjectHeader,
         scope: LinkScope,
-        links: &[LinkMessage],
+        links: &[GroupLink],
         order: CreationOrder,
     ) {
         // A symbol-table group holds no link messages at all: its links are the
@@ -9023,14 +9080,7 @@ impl Hdf5Writer {
             header.add_message(MSG_SYMBOL_TABLE, 0x00, stab.encode(&self.ctx));
             return;
         }
-        // Links a reopen carried through verbatim because this writer cannot
-        // express them. They are emitted here rather than by a second caller
-        // so that no header-rewrite path can drop them, and their presence
-        // pins the group to compact storage: dense storage would have to
-        // re-encode each link into the heap, which is exactly the byte
-        // fidelity preserving them is for.
-        let preserved = self.preserved_links_for(scope);
-        let dense = preserved.is_empty() && self.links_need_dense(links);
+        let dense = self.links_need_dense(links);
         let link_info = self.dense_links.lock().get(&scope).cloned();
         let link_info = link_info.unwrap_or_else(|| {
             let mut info = LinkInfoMessage::compact();
@@ -9067,25 +9117,8 @@ impl Hdf5Writer {
             return;
         }
         for link in links {
-            header.add_message(MSG_LINK, 0x00, link.encode(&self.ctx));
+            header.add_message(MSG_LINK, 0x00, link.encoded.clone());
         }
-        for encoded in preserved {
-            header.add_message(MSG_LINK, 0x00, encoded);
-        }
-    }
-
-    /// The verbatim link bodies a reopen carried into `scope`.
-    fn preserved_links_for(&self, scope: LinkScope) -> Vec<Vec<u8>> {
-        let parent = match scope {
-            LinkScope::Root => None,
-            LinkScope::Group(i) => Some(i),
-        };
-        self.preserved_links
-            .lock()
-            .iter()
-            .filter(|l| l.parent == parent)
-            .map(|l| l.encoded.clone())
-            .collect()
     }
 
     /// Lay out and write dense link storage for every group that needs it,
@@ -9100,7 +9133,7 @@ impl Hdf5Writer {
     /// rewrite whichever form the new link set takes, and freeing it first is
     /// what lets the replacement reuse those blocks.
     fn prepare_dense_links(&self) -> IoResult<()> {
-        let mut scopes: Vec<(LinkScope, Vec<LinkMessage>, CreationOrder)> = Vec::new();
+        let mut scopes: Vec<(LinkScope, Vec<GroupLink>, CreationOrder)> = Vec::new();
         for gi in 0..self.group_count() {
             let (deleted, order) = {
                 let grp = self.grp(gi);
@@ -9135,7 +9168,8 @@ impl Hdf5Writer {
             if self.dense_links.lock().contains_key(&scope) {
                 continue;
             }
-            let dense = build_dense_links(&links, &self.ctx, order, &mut |len| {
+            let messages: Vec<LinkMessage> = links.into_iter().map(|l| l.link).collect();
+            let dense = build_dense_links(&messages, &self.ctx, order, &mut |len| {
                 self.allocator.allocate(len, FreeSpaceClass::Metadata)
             })?;
             for block in &dense.blocks {
@@ -9240,20 +9274,16 @@ impl Hdf5Writer {
 
     /// `scope`'s links as symbol table entries.
     ///
-    /// A link a reopen carried through verbatim is decoded back out of its
-    /// encoded Link message here, because a classic group has no link message
-    /// to preserve it into. Nothing is lost in the round trip: the walk built
-    /// that message from a symbol table entry in the first place, and the two
-    /// forms carry the same three facts.
+    /// A link a reopen carried through verbatim goes in by its decoded form,
+    /// because a classic group has no link message to preserve it into.
+    /// Nothing is lost in the round trip: the walk built that message from a
+    /// symbol table entry in the first place, and the two forms carry the same
+    /// three facts.
     fn stab_links_for(&self, scope: LinkScope, order: CreationOrder) -> IoResult<Vec<StabLink>> {
         let groups = self.group_header_scopes();
         let mut out = Vec::new();
         for link in self.group_links(scope, order) {
-            out.push(self.stab_link(&link, &groups)?);
-        }
-        for encoded in self.preserved_links_for(scope) {
-            let (link, _) = LinkMessage::decode(&encoded, &self.ctx)?;
-            out.push(self.stab_link(&link, &groups)?);
+            out.push(self.stab_link(&link.link, &groups)?);
         }
         Ok(out)
     }

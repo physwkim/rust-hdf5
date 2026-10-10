@@ -161,6 +161,21 @@ impl LinkMessage {
         self
     }
 
+    /// Restamp the creation order inside an already-encoded link message,
+    /// touching no other byte. `false` when the message carries no creation
+    /// order field, as a link from a group that does not track it does not.
+    pub fn restamp_encoded_creation_order(encoded: &mut [u8], corder: i64) -> bool {
+        if encoded.len() < 2 || encoded[0] != VERSION || encoded[1] & FLAG_CREATION_ORDER == 0 {
+            return false;
+        }
+        let at = 2 + usize::from(encoded[1] & FLAG_LINK_TYPE != 0);
+        let Some(field) = encoded.get_mut(at..at + 8) else {
+            return false;
+        };
+        field.copy_from_slice(&corder.to_le_bytes());
+        true
+    }
+
     /// The same link, stamped with a character set the name does not imply.
     ///
     /// The one producer that needs it is the symbol table: an entry carries no
@@ -534,6 +549,23 @@ mod tests {
             sizeof_addr: 8,
             sizeof_size: 8,
         }
+    }
+
+    #[test]
+    fn restamp_rewrites_only_the_creation_order_field() {
+        let soft = LinkMessage::soft("s", "/a").with_creation_order(7);
+        let mut encoded = soft.encode(&ctx8());
+        assert!(LinkMessage::restamp_encoded_creation_order(&mut encoded, 2));
+        assert_eq!(encoded, soft.with_creation_order(2).encode(&ctx8()));
+
+        let hard = LinkMessage::hard("h", 0x1000);
+        let mut encoded = hard.encode(&ctx8());
+        let before = encoded.clone();
+        assert!(!LinkMessage::restamp_encoded_creation_order(
+            &mut encoded,
+            2
+        ));
+        assert_eq!(encoded, before);
     }
 
     fn ctx4() -> FormatContext {
