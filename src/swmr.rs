@@ -94,7 +94,19 @@ impl SwmrFileWriter {
         name: &str,
         frame_dims: &[u64],
     ) -> Result<usize> {
-        let datatype = T::hdf5_type();
+        self.create_streaming_dataset_with_datatype(name, T::hdf5_type(), frame_dims)
+    }
+
+    /// [`Self::create_streaming_dataset`] with an explicit stored datatype instead of a
+    /// carrier `T`, for a type no `T` describes (e.g. a reduced-precision
+    /// type for [`FilterPipeline::nbit`](crate::FilterPipeline::nbit)); an
+    /// element is `datatype.element_size()` bytes.
+    pub fn create_streaming_dataset_with_datatype(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        frame_dims: &[u64],
+    ) -> Result<usize> {
         let idx = self
             .inner
             .create_streaming_dataset(name, datatype, frame_dims)?;
@@ -113,12 +125,28 @@ impl SwmrFileWriter {
         frame_dims: &[u64],
         pipeline: crate::format::messages::filter::FilterPipeline,
     ) -> Result<usize> {
-        let idx = self.inner.create_streaming_dataset_compressed(
+        self.create_streaming_dataset_compressed_with_datatype(
             name,
             T::hdf5_type(),
             frame_dims,
             pipeline,
-        )?;
+        )
+    }
+
+    /// [`Self::create_streaming_dataset_compressed`] with an explicit stored datatype instead of a
+    /// carrier `T`, for a type no `T` describes (e.g. a reduced-precision
+    /// type for [`FilterPipeline::nbit`](crate::FilterPipeline::nbit)); an
+    /// element is `datatype.element_size()` bytes.
+    pub fn create_streaming_dataset_compressed_with_datatype(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        frame_dims: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        let idx = self
+            .inner
+            .create_streaming_dataset_compressed(name, datatype, frame_dims, pipeline)?;
         Ok(idx)
     }
 
@@ -161,9 +189,30 @@ impl SwmrFileWriter {
         frame_chunk: &[u64],
         pipeline: crate::format::messages::filter::FilterPipeline,
     ) -> Result<usize> {
-        let idx = self.inner.create_streaming_dataset_tiled_compressed(
+        self.create_streaming_dataset_tiled_compressed_with_datatype(
             name,
             T::hdf5_type(),
+            frame_dims,
+            frame_chunk,
+            pipeline,
+        )
+    }
+
+    /// [`Self::create_streaming_dataset_tiled_compressed`] with an explicit stored datatype instead of a
+    /// carrier `T`, for a type no `T` describes (e.g. a reduced-precision
+    /// type for [`FilterPipeline::nbit`](crate::FilterPipeline::nbit)); an
+    /// element is `datatype.element_size()` bytes.
+    pub fn create_streaming_dataset_tiled_compressed_with_datatype(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        frame_dims: &[u64],
+        frame_chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_tiled_compressed(
+            name,
+            datatype,
             frame_dims,
             frame_chunk,
             pipeline,
@@ -204,12 +253,29 @@ impl SwmrFileWriter {
         chunk: &[u64],
         pipeline: crate::format::messages::filter::FilterPipeline,
     ) -> Result<usize> {
-        let idx = self.inner.create_streaming_dataset_chunked_compressed(
+        self.create_streaming_dataset_chunked_compressed_with_datatype(
             name,
             T::hdf5_type(),
             frame_dims,
             chunk,
             pipeline,
+        )
+    }
+
+    /// [`Self::create_streaming_dataset_chunked_compressed`] with an explicit stored datatype instead of a
+    /// carrier `T`, for a type no `T` describes (e.g. a reduced-precision
+    /// type for [`FilterPipeline::nbit`](crate::FilterPipeline::nbit)); an
+    /// element is `datatype.element_size()` bytes.
+    pub fn create_streaming_dataset_chunked_compressed_with_datatype(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        frame_dims: &[u64],
+        chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_chunked_compressed(
+            name, datatype, frame_dims, chunk, pipeline,
         )?;
         Ok(idx)
     }
@@ -232,9 +298,23 @@ impl SwmrFileWriter {
         dims: &[u64],
         chunk: &[u64],
     ) -> Result<usize> {
+        self.create_grid_dataset_with_datatype(name, T::hdf5_type(), dims, chunk)
+    }
+
+    /// [`Self::create_grid_dataset`] with an explicit stored datatype instead of a
+    /// carrier `T`, for a type no `T` describes (e.g. a reduced-precision
+    /// type for [`FilterPipeline::nbit`](crate::FilterPipeline::nbit)); an
+    /// element is `datatype.element_size()` bytes.
+    pub fn create_grid_dataset_with_datatype(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        dims: &[u64],
+        chunk: &[u64],
+    ) -> Result<usize> {
         let idx = self
             .inner
-            .create_grid_dataset(name, T::hdf5_type(), dims, chunk)?;
+            .create_grid_dataset(name, datatype, dims, chunk)?;
         Ok(idx)
     }
 

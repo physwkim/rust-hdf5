@@ -5966,3 +5966,49 @@ assert d[:].tolist() == [1, 2, 3, 4, 0xabc, 0xabc, 0xabc, 0xabc], d[:].tolist()
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A SWMR streaming dataset built on a 12-bit type with the N-bit filter
+/// through `create_streaming_dataset_compressed_with_datatype` reads in
+/// libhdf5 with the narrowed precision and the filter it records.
+#[test]
+fn swmr_with_datatype_nbit_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_with_datatype_nbit");
+    let u12 = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::LittleEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_streaming_dataset_compressed_with_datatype(
+                "frames",
+                u12.clone(),
+                &[2, 3],
+                rust_hdf5::FilterPipeline::nbit(&u12, 6),
+            )
+            .unwrap();
+        w.start_swmr().unwrap();
+        for s in [0u16, 4000] {
+            let frame: Vec<u8> = (0..6u16).flat_map(|i| (i + s).to_le_bytes()).collect();
+            w.append_frame(ds, &frame).unwrap();
+        }
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['frames']
+assert d.dtype == np.dtype('<u2'), d.dtype
+assert d.id.get_type().get_precision() == 12
+assert d.id.get_create_plist().get_filter(0)[0] == h5py.h5z.FILTER_NBIT
+assert d[0].tolist() == [[0, 1, 2], [3, 4, 5]]
+assert d[1].tolist() == [[4000, 4001, 4002], [4003, 4004, 4005]]
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

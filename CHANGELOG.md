@@ -12,6 +12,10 @@
   encoded in the stored datatype, for a type no carrier `T` describes (an
   N-bit override, a runtime compound). `create` refuses a fill value whose
   length is not the stored element size.
+- `SwmrFileWriter` `create_streaming_dataset`, `_compressed`,
+  `_tiled_compressed`, `_chunked_compressed` and `create_grid_dataset`
+  have `_with_datatype` variants taking the stored `DatatypeMessage`, so a
+  SWMR dataset can store a narrowed N-bit type.
 
 ## 0.7.3
 
