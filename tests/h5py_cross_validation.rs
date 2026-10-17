@@ -5890,3 +5890,214 @@ assert f['frames'][1].tolist() == [[5, 6], [7, 8]]
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// Frames appended already compressed through `SwmrFileWriter::append_frame_raw`
+/// decode in libhdf5 under the recorded deflate pipeline, and a frame stored
+/// with filter mask 1 is read without inflating it.
+#[test]
+#[cfg(feature = "deflate")]
+fn swmr_append_frame_raw_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_append_frame_raw");
+    let pipeline = rust_hdf5::FilterPipeline::deflate(4);
+    let frame = |s: u16| -> Vec<u8> { (0..6u16).flat_map(|i| (i + s).to_le_bytes()).collect() };
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_streaming_dataset_compressed::<u16>("frames", &[2, 3], pipeline.clone())
+            .unwrap();
+        w.start_swmr().unwrap();
+        let packed =
+            rust_hdf5::format::messages::filter::apply_filters(&pipeline, &frame(0)).unwrap();
+        w.append_frame_raw(ds, &packed, 0).unwrap();
+        w.append_frame_raw(ds, &frame(10), 1).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['frames']
+assert d.compression == 'gzip', d.compression
+assert d[0].tolist() == [[0, 1, 2], [3, 4, 5]]
+assert d[1].tolist() == [[10, 11, 12], [13, 14, 15]]
+mask, raw = d.id.read_direct_chunk((1, 0, 0))
+assert mask == 1 and len(raw) == 12, (mask, len(raw))
+",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// `fill_value_bytes` on a big-endian 12-bit N-bit dataset is the fill
+/// libhdf5 reports and the value it reads for a chunk never written.
+#[test]
+fn fill_value_bytes_on_nbit_type_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("fill_value_bytes_nbit");
+    let be12 = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::BigEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u16>()
+            .shape([8])
+            .chunk(&[4])
+            .datatype(be12.clone())
+            .filter_pipeline(rust_hdf5::FilterPipeline::nbit(&be12, 4))
+            .fill_value_bytes(&0x0abcu16.to_ne_bytes())
+            .create("vals")
+            .unwrap();
+        ds.write_chunk_at(&[0], &[0, 1, 0, 2, 0, 3, 0, 4]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['vals']
+assert d.fillvalue == 0xabc, d.fillvalue
+assert d.dtype == np.dtype('>u2'), d.dtype
+assert d[:].tolist() == [1, 2, 3, 4, 0xabc, 0xabc, 0xabc, 0xabc], d[:].tolist()
+",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A SWMR streaming dataset built on a 12-bit type with the N-bit filter
+/// through `create_streaming_dataset_compressed_with_datatype` reads in
+/// libhdf5 with the narrowed precision and the filter it records.
+#[test]
+fn swmr_with_datatype_nbit_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_with_datatype_nbit");
+    let u12 = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::LittleEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_streaming_dataset_compressed_with_datatype(
+                "frames",
+                u12.clone(),
+                &[2, 3],
+                rust_hdf5::FilterPipeline::nbit(&u12, 6),
+            )
+            .unwrap();
+        w.start_swmr().unwrap();
+        for s in [0u16, 4000] {
+            let frame: Vec<u8> = (0..6u16).flat_map(|i| (i + s).to_le_bytes()).collect();
+            w.append_frame(ds, &frame).unwrap();
+        }
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['frames']
+assert d.dtype == np.dtype('<u2'), d.dtype
+assert d.id.get_type().get_precision() == 12
+assert d.id.get_create_plist().get_filter(0)[0] == h5py.h5z.FILTER_NBIT
+assert d[0].tolist() == [[0, 1, 2], [3, 4, 5]]
+assert d[1].tolist() == [[4000, 4001, 4002], [4003, 4004, 4005]]
+",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Chunks placed already compressed through `SwmrFileWriter::write_chunk_raw_at`
+/// on a `create_grid_dataset_compressed` grid decode in libhdf5; an unwritten
+/// position reads as fill and a mask-1 chunk is read without inflating.
+#[test]
+#[cfg(feature = "deflate")]
+fn swmr_write_chunk_raw_at_grid_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_write_chunk_raw_at_grid");
+    let pipeline = rust_hdf5::FilterPipeline::deflate(4);
+    let frame = |s: u16| -> Vec<u8> { (0..6u16).flat_map(|i| (i + s).to_le_bytes()).collect() };
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_grid_dataset_compressed::<u16>(
+                "grid",
+                &[2, 2, 2, 3],
+                &[1, 1, 2, 3],
+                pipeline.clone(),
+            )
+            .unwrap();
+        w.start_swmr().unwrap();
+        let packed =
+            rust_hdf5::format::messages::filter::apply_filters(&pipeline, &frame(0)).unwrap();
+        w.write_chunk_raw_at(ds, &[0, 1, 0, 0], &packed, 0).unwrap();
+        w.write_chunk_raw_at(ds, &[1, 0, 0, 0], &frame(10), 1)
+            .unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['grid']
+assert d.compression == 'gzip', d.compression
+assert d.maxshape == (2, 2, 2, 3), d.maxshape
+assert d[0, 1].tolist() == [[0, 1, 2], [3, 4, 5]]
+assert d[1, 0].tolist() == [[10, 11, 12], [13, 14, 15]]
+assert d[0, 0].tolist() == [[0, 0, 0], [0, 0, 0]]
+mask, raw = d.id.read_direct_chunk((1, 0, 0, 0))
+assert mask == 1 and len(raw) == 12, (mask, len(raw))
+",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// `SwmrFileWriter::set_dataset_fill_value_bytes` on a big-endian 12-bit N-bit
+/// grid is the fill libhdf5 reports and reads at unwritten positions.
+#[test]
+fn swmr_fill_value_bytes_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_fill_value_bytes");
+    let be12 = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::BigEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_grid_dataset_compressed_with_datatype(
+                "grid",
+                be12.clone(),
+                &[2, 3],
+                &[1, 3],
+                rust_hdf5::FilterPipeline::nbit(&be12, 3),
+            )
+            .unwrap();
+        w.set_dataset_fill_value_bytes(ds, &0x0abcu16.to_ne_bytes())
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.write_chunk_at(ds, &[1, 0], &[0, 1, 0, 2, 0, 3]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['grid']
+assert d.fillvalue == 0xabc, d.fillvalue
+assert d.dtype == np.dtype('>u2'), d.dtype
+assert d[:].tolist() == [[0xabc, 0xabc, 0xabc], [1, 2, 3]], d[:].tolist()
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

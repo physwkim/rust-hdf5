@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.4
+
+### Added
+
+- `SwmrFileWriter::append_frame_raw` appends a frame that is already
+  filtered (e.g. compressed by a codec upstream) verbatim under a caller
+  filter mask, for a streaming dataset storing one frame per chunk — the
+  SWMR form of `H5Dwrite_chunk`.
+- `DatasetBuilder::fill_value_bytes` sets the fill value from one element
+  encoded in the stored datatype, for a type no carrier `T` describes (an
+  N-bit override, a runtime compound). `create` refuses a fill value whose
+  length is not the stored element size.
+- `SwmrFileWriter` `create_streaming_dataset`, `_compressed`,
+  `_tiled_compressed`, `_chunked_compressed` and `create_grid_dataset`
+  have `_with_datatype` variants taking the stored `DatatypeMessage`, so a
+  SWMR dataset can store a narrowed N-bit type.
+- `SwmrFileWriter::create_grid_dataset_compressed{,_with_datatype}` build a
+  filtered fixed grid, and `SwmrFileWriter::write_chunk_raw_at` places an
+  already-filtered chunk verbatim at a grid position under a caller filter
+  mask — NDFileHDF5's direct chunk write with extra dimensions.
+- `SwmrFileWriter::set_dataset_fill_value_bytes` sets a dataset's fill
+  value from one element of its stored datatype, for a `_with_datatype`
+  dataset no `T` describes. It and the typed `set_dataset_fill_value` put
+  the value in the order the datatype declares and refuse a wrong length.
+
 ## 0.7.3
 
 ### Fixed
