@@ -1,6 +1,8 @@
 //! `SwmrFileWriter::append_frame_raw` / `write_chunk_raw_at`: already-filtered
 //! chunks are stored verbatim under the dataset's recorded pipeline.
 
+#![cfg(feature = "deflate")]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 

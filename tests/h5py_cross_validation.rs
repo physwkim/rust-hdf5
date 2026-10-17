@@ -5895,6 +5895,7 @@ assert f['frames'][1].tolist() == [[5, 6], [7, 8]]
 /// decode in libhdf5 under the recorded deflate pipeline, and a frame stored
 /// with filter mask 1 is read without inflating it.
 #[test]
+#[cfg(feature = "deflate")]
 fn swmr_append_frame_raw_reads_in_h5py() {
     let Some(py) = python() else { return };
     let path = tmp("swmr_append_frame_raw");
@@ -6017,6 +6018,7 @@ assert d[1].tolist() == [[4000, 4001, 4002], [4003, 4004, 4005]]
 /// on a `create_grid_dataset_compressed` grid decode in libhdf5; an unwritten
 /// position reads as fill and a mask-1 chunk is read without inflating.
 #[test]
+#[cfg(feature = "deflate")]
 fn swmr_write_chunk_raw_at_grid_reads_in_h5py() {
     let Some(py) = python() else { return };
     let path = tmp("swmr_write_chunk_raw_at_grid");
