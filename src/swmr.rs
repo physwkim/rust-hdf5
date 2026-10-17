@@ -318,6 +318,45 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Compressed variant of [`create_grid_dataset`](Self::create_grid_dataset);
+    /// each chunk is filtered independently through `pipeline`, and
+    /// [`write_chunk_raw_at`](Self::write_chunk_raw_at) can place chunks a
+    /// codec already compressed.
+    pub fn create_grid_dataset_compressed<T: H5Type>(
+        &mut self,
+        name: &str,
+        dims: &[u64],
+        chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        self.create_grid_dataset_compressed_with_datatype(
+            name,
+            T::hdf5_type(),
+            dims,
+            chunk,
+            pipeline,
+        )
+    }
+
+    /// [`Self::create_grid_dataset_compressed`] with an explicit stored
+    /// datatype instead of a carrier `T`, for a type no `T` describes (e.g. a
+    /// reduced-precision type for
+    /// [`FilterPipeline::nbit`](crate::FilterPipeline::nbit)); an element is
+    /// `datatype.element_size()` bytes.
+    pub fn create_grid_dataset_compressed_with_datatype(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        dims: &[u64],
+        chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        let idx = self
+            .inner
+            .create_grid_dataset_compressed(name, datatype, dims, chunk, pipeline)?;
+        Ok(idx)
+    }
+
     /// Create a hard link: an additional name for a dataset or group that
     /// already exists in the file.
     ///
@@ -611,6 +650,24 @@ impl SwmrFileWriter {
         filter_mask: u32,
     ) -> Result<()> {
         self.inner.append_frame_raw(ds_index, data, filter_mask)?;
+        Ok(())
+    }
+
+    /// Write one already-filtered chunk verbatim at an explicit chunk
+    /// position of a grid dataset made by
+    /// [`create_grid_dataset_compressed`](Self::create_grid_dataset_compressed)
+    /// — HDF5's direct chunk write (`H5Dwrite_chunk`) at a chunk offset.
+    /// `filter_mask` bit *i* set means filter *i* was not applied to this
+    /// chunk; pass 0 when the whole pipeline was.
+    pub fn write_chunk_raw_at(
+        &mut self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+        filter_mask: u32,
+    ) -> Result<()> {
+        self.inner
+            .write_chunk_raw_at(ds_index, chunk_coords, data, filter_mask)?;
         Ok(())
     }
 

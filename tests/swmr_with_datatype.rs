@@ -72,6 +72,15 @@ fn with_datatype_constructors_store_the_given_type() {
         let grid = w
             .create_grid_dataset_with_datatype("grid", dt.clone(), &[2, 4, 8], &[1, 4, 8])
             .unwrap();
+        let packed_grid = w
+            .create_grid_dataset_compressed_with_datatype(
+                "packed_grid",
+                dt.clone(),
+                &[2, 4, 8],
+                &[1, 4, 8],
+                FilterPipeline::nbit(&dt, 32),
+            )
+            .unwrap();
         w.start_swmr().unwrap();
         for s in 0..3 {
             for ds in [plain, packed, tiled, banded] {
@@ -82,6 +91,10 @@ fn with_datatype_constructors_store_the_given_type() {
             .unwrap();
         w.write_chunk_at(grid, &[0, 0, 0], &bytes(&frame(8)))
             .unwrap();
+        for (c, seed) in [(0u64, 8u16), (1, 9)] {
+            w.write_chunk_at(packed_grid, &[c, 0, 0], &bytes(&frame(seed)))
+                .unwrap();
+        }
         w.close().unwrap();
     }
     let f = H5File::open(&path).unwrap();
@@ -92,11 +105,14 @@ fn with_datatype_constructors_store_the_given_type() {
         assert_eq!(ds.shape(), vec![3, 4, 8], "{name}");
         assert_eq!(ds.read_raw::<u16>().unwrap(), expect, "{name}");
     }
-    let grid = f.dataset("grid").unwrap();
-    assert_eq!(grid.datatype().unwrap(), dt);
-    assert_eq!(
-        grid.read_raw::<u16>().unwrap(),
-        [frame(8), frame(9)].concat()
-    );
+    for name in ["grid", "packed_grid"] {
+        let grid = f.dataset(name).unwrap();
+        assert_eq!(grid.datatype().unwrap(), dt, "{name}");
+        assert_eq!(
+            grid.read_raw::<u16>().unwrap(),
+            [frame(8), frame(9)].concat(),
+            "{name}"
+        );
+    }
     let _ = std::fs::remove_file(&path);
 }

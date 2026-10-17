@@ -16,6 +16,10 @@
   `_tiled_compressed`, `_chunked_compressed` and `create_grid_dataset`
   have `_with_datatype` variants taking the stored `DatatypeMessage`, so a
   SWMR dataset can store a narrowed N-bit type.
+- `SwmrFileWriter::create_grid_dataset_compressed{,_with_datatype}` build a
+  filtered fixed grid, and `SwmrFileWriter::write_chunk_raw_at` places an
+  already-filtered chunk verbatim at a grid position under a caller filter
+  mask — NDFileHDF5's direct chunk write with extra dimensions.
 
 ## 0.7.3
 

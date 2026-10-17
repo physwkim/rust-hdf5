@@ -6012,3 +6012,47 @@ assert d[1].tolist() == [[4000, 4001, 4002], [4003, 4004, 4005]]
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// Chunks placed already compressed through `SwmrFileWriter::write_chunk_raw_at`
+/// on a `create_grid_dataset_compressed` grid decode in libhdf5; an unwritten
+/// position reads as fill and a mask-1 chunk is read without inflating.
+#[test]
+fn swmr_write_chunk_raw_at_grid_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_write_chunk_raw_at_grid");
+    let pipeline = rust_hdf5::FilterPipeline::deflate(4);
+    let frame = |s: u16| -> Vec<u8> { (0..6u16).flat_map(|i| (i + s).to_le_bytes()).collect() };
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_grid_dataset_compressed::<u16>(
+                "grid",
+                &[2, 2, 2, 3],
+                &[1, 1, 2, 3],
+                pipeline.clone(),
+            )
+            .unwrap();
+        w.start_swmr().unwrap();
+        let packed =
+            rust_hdf5::format::messages::filter::apply_filters(&pipeline, &frame(0)).unwrap();
+        w.write_chunk_raw_at(ds, &[0, 1, 0, 0], &packed, 0).unwrap();
+        w.write_chunk_raw_at(ds, &[1, 0, 0, 0], &frame(10), 1)
+            .unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['grid']
+assert d.compression == 'gzip', d.compression
+assert d.maxshape == (2, 2, 2, 3), d.maxshape
+assert d[0, 1].tolist() == [[0, 1, 2], [3, 4, 5]]
+assert d[1, 0].tolist() == [[10, 11, 12], [13, 14, 15]]
+assert d[0, 0].tolist() == [[0, 0, 0], [0, 0, 0]]
+mask, raw = d.id.read_direct_chunk((1, 0, 0, 0))
+assert mask == 1 and len(raw) == 12, (mask, len(raw))
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

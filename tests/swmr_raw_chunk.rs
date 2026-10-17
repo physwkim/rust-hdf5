@@ -1,4 +1,5 @@
-//! `SwmrFileWriter::append_frame_raw`: already-filtered frames are stored verbatim under the dataset's recorded pipeline.
+//! `SwmrFileWriter::append_frame_raw` / `write_chunk_raw_at`: already-filtered
+//! chunks are stored verbatim under the dataset's recorded pipeline.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,4 +88,45 @@ fn append_frame_raw_refuses_layouts_without_one_frame_per_chunk() {
     }
     w.close().unwrap();
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn write_chunk_raw_at_places_filtered_grid_chunks() {
+    let path = tmp("grid");
+    let pipeline = FilterPipeline::deflate(4);
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let grid = w
+            .create_grid_dataset_compressed::<u16>("grid", &[3, 4, 8], &[1, 4, 8], pipeline.clone())
+            .unwrap();
+        let plain = w
+            .create_grid_dataset::<u16>("plain", &[2, 4, 8], &[1, 4, 8])
+            .unwrap();
+        w.start_swmr().unwrap();
+        assert!(w
+            .write_chunk_raw_at(plain, &[0, 0, 0], &frame(0), 0)
+            .is_err());
+        let packed = apply_filters(&pipeline, &frame(7)).unwrap();
+        w.write_chunk_raw_at(grid, &[1, 0, 0], &packed, 0).unwrap();
+        w.write_chunk_raw_at(grid, &[0, 0, 0], &frame(5), 1)
+            .unwrap();
+        // The compressing path on the same dataset.
+        w.write_chunk_at(grid, &[2, 0, 0], &frame(9)).unwrap();
+        w.flush().unwrap();
+        w.close().unwrap();
+    }
+    let f = H5File::open(&path).unwrap();
+    let ds = f.dataset("grid").unwrap();
+    assert_eq!(ds.read_chunk_raw_at(&[0, 0, 0]).unwrap(), (frame(5), 1));
+    assert_eq!(ds.read_chunk_raw_at(&[1, 0, 0]).unwrap(), (packed_of(7), 0));
+    let expect: Vec<u16> = [5u16, 7, 9]
+        .iter()
+        .flat_map(|&s| (0..32u16).map(move |i| i * 3 + s))
+        .collect();
+    assert_eq!(ds.read_raw::<u16>().unwrap(), expect);
+    let _ = std::fs::remove_file(&path);
+}
+
+fn packed_of(seed: u16) -> Vec<u8> {
+    apply_filters(&FilterPipeline::deflate(4), &frame(seed)).unwrap()
 }
