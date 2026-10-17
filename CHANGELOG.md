@@ -8,6 +8,11 @@
   filtered (e.g. compressed by a codec upstream) verbatim under a caller
   filter mask, for a streaming dataset storing one frame per chunk — the
   SWMR form of `H5Dwrite_chunk`.
+- `DatasetBuilder::fill_value_bytes` sets the fill value from one element
+  encoded in the stored datatype, for a type no carrier `T` describes (an
+  N-bit override, a runtime compound). `create` refuses a fill value whose
+  length is not the stored element size.
+
 ## 0.7.3
 
 ### Fixed

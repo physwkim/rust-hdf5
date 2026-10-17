@@ -5926,3 +5926,43 @@ assert mask == 1 and len(raw) == 12, (mask, len(raw))
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// `fill_value_bytes` on a big-endian 12-bit N-bit dataset is the fill
+/// libhdf5 reports and the value it reads for a chunk never written.
+#[test]
+fn fill_value_bytes_on_nbit_type_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("fill_value_bytes_nbit");
+    let be12 = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::BigEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u16>()
+            .shape([8])
+            .chunk(&[4])
+            .datatype(be12.clone())
+            .filter_pipeline(rust_hdf5::FilterPipeline::nbit(&be12, 4))
+            .fill_value_bytes(&0x0abcu16.to_ne_bytes())
+            .create("vals")
+            .unwrap();
+        ds.write_chunk_at(&[0], &[0, 1, 0, 2, 0, 3, 0, 4]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['vals']
+assert d.fillvalue == 0xabc, d.fillvalue
+assert d.dtype == np.dtype('>u2'), d.dtype
+assert d[:].tolist() == [1, 2, 3, 4, 0xabc, 0xabc, 0xabc, 0xabc], d[:].tolist()
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

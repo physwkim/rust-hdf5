@@ -689,6 +689,20 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Set the fill value from one element already encoded in the dataset's
+    /// stored datatype — for a stored type no `T` carries, such as an N-bit
+    /// [`datatype`](Self::datatype) override or a runtime compound.
+    ///
+    /// `bytes` is the element's host-order image; [`create`](Self::create)
+    /// checks its length against the stored datatype's element size and puts
+    /// it in the declared byte order, as [`fill_value`](Self::fill_value)
+    /// does.
+    #[must_use]
+    pub fn fill_value_bytes(mut self, bytes: &[u8]) -> Self {
+        self.fill_value = Some(bytes.to_vec());
+        self
+    }
+
     /// Set when the fill value is written into allocated storage —
     /// `H5Pset_fill_time`.
     ///
@@ -810,11 +824,18 @@ impl<T: H5Type> DatasetBuilder<T> {
         // allocation, and the `write_raw` length check all agree with the bytes
         // libhdf5/h5py will read.
         let element_size = datatype.element_size() as usize;
-        // `fill_value` took the host image of a `T`; the fill-value message
+        // `fill_value` took the host image of a `T` (or `fill_value_bytes` one
+        // element of the stored type); the fill-value message
         // holds one element in the dataset's own datatype, so it is converted
         // here — the order is only known once the override is resolved, and
         // the builder's calls can arrive in either order.
         let fill_value = match self.fill_value.as_deref() {
+            Some(bytes) if bytes.len() != element_size => {
+                return Err(Hdf5Error::TypeMismatch(format!(
+                    "fill value is {} bytes but datatype {datatype} stores {element_size}",
+                    bytes.len()
+                )))
+            }
             Some(bytes) => Some(to_stored_byte_order(bytes, &datatype, element_size)?.into_owned()),
             None => None,
         };
@@ -7486,6 +7507,45 @@ mod tests {
                 writer.ds(idx).lock().fill_value,
                 Some((-7i32).to_le_bytes().to_vec())
             );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fill_value_bytes_takes_the_stored_type_in_its_declared_order() {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        let be12 = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::BigEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 12,
+        };
+        let path = temp_path("fill_value_bytes");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<u16>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .datatype(be12.clone())
+                .fill_value_bytes(&0x0abcu16.to_ne_bytes())
+                .create("vals")
+                .unwrap();
+            let err = file
+                .new_dataset::<u16>()
+                .shape([4])
+                .datatype(be12)
+                .fill_value_bytes(&[1, 2, 3])
+                .create("short");
+            assert!(matches!(err, Err(crate::Hdf5Error::TypeMismatch(_))));
+            file.close().unwrap();
+        }
+        {
+            let writer = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
+            let idx = writer.dataset_index("vals").unwrap();
+            assert_eq!(writer.ds(idx).lock().fill_value, Some(vec![0x0a, 0xbc]));
+            assert!(writer.dataset_index("short").is_none());
         }
         std::fs::remove_file(&path).ok();
     }
