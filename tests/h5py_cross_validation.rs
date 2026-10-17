@@ -6056,3 +6056,46 @@ assert mask == 1 and len(raw) == 12, (mask, len(raw))
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// `SwmrFileWriter::set_dataset_fill_value_bytes` on a big-endian 12-bit N-bit
+/// grid is the fill libhdf5 reports and reads at unwritten positions.
+#[test]
+fn swmr_fill_value_bytes_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_fill_value_bytes");
+    let be12 = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::BigEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    {
+        let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_grid_dataset_compressed_with_datatype(
+                "grid",
+                be12.clone(),
+                &[2, 3],
+                &[1, 3],
+                rust_hdf5::FilterPipeline::nbit(&be12, 3),
+            )
+            .unwrap();
+        w.set_dataset_fill_value_bytes(ds, &0x0abcu16.to_ne_bytes())
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.write_chunk_at(ds, &[1, 0], &[0, 1, 0, 2, 0, 3]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+d = f['grid']
+assert d.fillvalue == 0xabc, d.fillvalue
+assert d.dtype == np.dtype('>u2'), d.dtype
+assert d[:].tolist() == [[0xabc, 0xabc, 0xabc], [1, 2, 3]], d[:].tolist()
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

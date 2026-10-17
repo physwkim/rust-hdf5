@@ -11,7 +11,7 @@ use crate::io::locking::FileLocking;
 use crate::io::Hdf5Reader;
 use crate::io::SwmrWriter as IoSwmrWriter;
 
-use crate::error::Result;
+use crate::error::{Hdf5Error, Result};
 use crate::types::H5Type;
 
 /// SWMR writer for streaming frame-based data to an HDF5 file.
@@ -599,9 +599,31 @@ impl SwmrFileWriter {
     /// determines the value of chunk regions that are never written (a
     /// partial final band, or unwritten tiles).
     pub fn set_dataset_fill_value<T: H5Type>(&mut self, ds_index: usize, value: &T) -> Result<()> {
-        self.inner
-            .writer_mut()
-            .set_dataset_fill_value(ds_index, scalar_to_bytes(value))?;
+        self.set_dataset_fill_value_bytes(ds_index, &scalar_to_bytes(value))
+    }
+
+    /// [`set_dataset_fill_value`](Self::set_dataset_fill_value) from one
+    /// element encoded in the dataset's stored datatype — for a type no `T`
+    /// carries, such as one made with a `_with_datatype` constructor.
+    /// `bytes` is the element's host-order image, `datatype.element_size()`
+    /// bytes long; it is put in the order the datatype declares.
+    pub fn set_dataset_fill_value_bytes(&mut self, ds_index: usize, bytes: &[u8]) -> Result<()> {
+        let writer = self.inner.writer_mut();
+        if ds_index >= writer.dataset_count() {
+            return Err(Hdf5Error::InvalidState(format!(
+                "dataset index {ds_index} out of range"
+            )));
+        }
+        let datatype = writer.ds(ds_index).lock().datatype.clone();
+        let width = datatype.element_size() as usize;
+        if bytes.len() != width {
+            return Err(Hdf5Error::TypeMismatch(format!(
+                "fill value is {} bytes but datatype {datatype} stores {width}",
+                bytes.len()
+            )));
+        }
+        let stored = crate::dataset::to_stored_byte_order(bytes, &datatype, width)?;
+        writer.set_dataset_fill_value(ds_index, stored.into_owned())?;
         Ok(())
     }
 

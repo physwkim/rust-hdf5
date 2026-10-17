@@ -20,6 +20,10 @@
   filtered fixed grid, and `SwmrFileWriter::write_chunk_raw_at` places an
   already-filtered chunk verbatim at a grid position under a caller filter
   mask — NDFileHDF5's direct chunk write with extra dimensions.
+- `SwmrFileWriter::set_dataset_fill_value_bytes` sets a dataset's fill
+  value from one element of its stored datatype, for a `_with_datatype`
+  dataset no `T` describes. It and the typed `set_dataset_fill_value` put
+  the value in the order the datatype declares and refuse a wrong length.
 
 ## 0.7.3
 

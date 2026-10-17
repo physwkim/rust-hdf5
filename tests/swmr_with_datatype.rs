@@ -116,3 +116,56 @@ fn with_datatype_constructors_store_the_given_type() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// `set_dataset_fill_value_bytes` takes the stored type's host image and puts
+/// it in the declared order; the typed setter goes through the same step, so
+/// a big-endian dataset gets a big-endian fill either way.
+#[test]
+fn fill_value_bytes_follow_the_declared_byte_order() {
+    let path = tmp("fill");
+    let be = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::BigEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let by_bytes = w
+            .create_grid_dataset_compressed_with_datatype(
+                "by_bytes",
+                be.clone(),
+                &[2, 4],
+                &[1, 4],
+                FilterPipeline::nbit(&be, 4),
+            )
+            .unwrap();
+        let typed = w
+            .create_grid_dataset_with_datatype("typed", be.clone(), &[2, 4], &[1, 4])
+            .unwrap();
+        w.set_dataset_fill_value_bytes(by_bytes, &0x0abcu16.to_ne_bytes())
+            .unwrap();
+        w.set_dataset_fill_value(typed, &0x0123u16).unwrap();
+        assert!(w.set_dataset_fill_value_bytes(typed, &[1, 2, 3]).is_err());
+        assert!(w.set_dataset_fill_value_bytes(99, &[1, 2]).is_err());
+        w.start_swmr().unwrap();
+        let row: Vec<u8> = [1u16, 2, 3, 4]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        w.write_chunk_at(by_bytes, &[0, 0], &row).unwrap();
+        w.write_chunk_at(typed, &[0, 0], &row).unwrap();
+        w.close().unwrap();
+    }
+    let f = H5File::open(&path).unwrap();
+    for (name, fill) in [("by_bytes", 0x0abcu16), ("typed", 0x0123)] {
+        let raw = f.dataset(name).unwrap().read_raw_bytes().unwrap();
+        let expect: Vec<u8> = [1u16, 2, 3, 4, fill, fill, fill, fill]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        assert_eq!(raw, expect, "{name}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
