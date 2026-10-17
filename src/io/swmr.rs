@@ -464,6 +464,54 @@ impl SwmrWriter {
         Ok(())
     }
 
+    /// Append one frame whose bytes are already filtered, storing them
+    /// verbatim under `filter_mask` — the streaming form of HDF5's direct
+    /// chunk write (`H5Dwrite_chunk`).
+    ///
+    /// The dataset must be filtered and store one frame per chunk: a
+    /// compressed frame cannot be split into tiles or buffered into a
+    /// multi-frame band.
+    pub fn append_frame_raw(
+        &mut self,
+        ds_index: usize,
+        data: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        let (frame_idx, whole_frame) = {
+            let ds = self.writer.ds(ds_index);
+            let g = ds.lock();
+            let chunk_dims = &g
+                .chunked
+                .as_ref()
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState(
+                        "append_frame_raw requires a chunked dataset".into(),
+                    )
+                })?
+                .chunk_dims;
+            let dims = &g.dataspace.dims;
+            (
+                dims[0],
+                chunk_dims[0] == 1 && chunk_dims[1..] == dims[1..] && g.fixed_array.is_none(),
+            )
+        };
+        if !whole_frame {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "append_frame_raw: dataset {ds_index} does not store one whole frame per \
+                 chunk on an unlimited frame axis"
+            )));
+        }
+        {
+            let ds = self.writer.ds(ds_index);
+            let _op = ds.op.lock();
+            self.writer
+                .write_compressed_chunk_inner(ds_index, frame_idx, data, filter_mask)?;
+        }
+        let mut new_dims = self.writer.ds(ds_index).lock().dataspace.dims.clone();
+        new_dims[0] = frame_idx + 1;
+        self.writer.extend_dataset(ds_index, &new_dims)
+    }
+
     /// Write one chunk at explicit chunk-grid coordinates of a fixed grid
     /// dataset (see [`create_grid_dataset`](Self::create_grid_dataset)).
     ///

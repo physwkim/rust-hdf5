@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `SwmrFileWriter::append_frame_raw` appends a frame that is already
+  filtered (e.g. compressed by a codec upstream) verbatim under a caller
+  filter mask, for a streaming dataset storing one frame per chunk — the
+  SWMR form of `H5Dwrite_chunk`.
 ## 0.7.3
 
 ### Fixed

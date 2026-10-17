@@ -513,6 +513,27 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Append a frame that is already filtered (e.g. compressed by a codec
+    /// plugin upstream), storing its bytes verbatim — HDF5's direct chunk
+    /// write (`H5Dwrite_chunk`) for a streaming dataset.
+    ///
+    /// `data` is the stored (compressed) image of one frame; the dataset's
+    /// filter pipeline, recorded when it was created with a `_compressed`
+    /// constructor, is what readers run to decode it. `filter_mask` bit *i*
+    /// set means filter *i* was not applied to this frame; pass 0 when the
+    /// whole pipeline was. The dataset must store one whole frame per chunk
+    /// ([`create_streaming_dataset_compressed`](Self::create_streaming_dataset_compressed)
+    /// or a `_chunked_compressed` chunk of `[1, frame_dims...]`).
+    pub fn append_frame_raw(
+        &mut self,
+        ds_index: usize,
+        data: &[u8],
+        filter_mask: u32,
+    ) -> Result<()> {
+        self.inner.append_frame_raw(ds_index, data, filter_mask)?;
+        Ok(())
+    }
+
     /// Write one frame at an explicit chunk position of a grid dataset
     /// created with [`create_grid_dataset`](Self::create_grid_dataset).
     ///
