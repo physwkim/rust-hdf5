@@ -457,6 +457,25 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Set a scalar attribute of a caller-supplied datatype on a group, or on
+    /// the root group when `group_path` is `"/"` — the SWMR form of
+    /// [`H5Group::set_attr_typed`](crate::H5Group::set_attr_typed). Refused
+    /// after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
+    pub fn set_group_attr_typed(
+        &mut self,
+        group_path: &str,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let attr = crate::attribute::typed_scalar_attr(name, datatype, value)?;
+        self.inner
+            .writer_mut()
+            .set_attribute(group_attr_target(group_path), attr)?;
+        Ok(())
+    }
+
     /// Create a fixed-shape (non-streaming) dataset and write all its data in
     /// one call. Returns the dataset index.
     ///
@@ -547,6 +566,25 @@ impl SwmrFileWriter {
         value: &T,
     ) -> Result<()> {
         let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), scalar_to_bytes(value));
+        self.inner
+            .writer_mut()
+            .add_dataset_attribute(ds_index, attr)?;
+        Ok(())
+    }
+
+    /// Set a scalar attribute of a caller-supplied datatype on a dataset,
+    /// addressed by its index — the SWMR form of
+    /// [`H5Dataset::set_attr_typed`](crate::H5Dataset::set_attr_typed).
+    /// Refused after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
+    pub fn set_dataset_attr_typed(
+        &mut self,
+        ds_index: usize,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let attr = crate::attribute::typed_scalar_attr(name, datatype, value)?;
         self.inner
             .writer_mut()
             .add_dataset_attribute(ds_index, attr)?;

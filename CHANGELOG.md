@@ -2,6 +2,16 @@
 
 ## 0.7.6
 
+### Added
+
+- `H5Group::set_attr_typed`, `H5Dataset::set_attr_typed`,
+  `SwmrFileWriter::set_group_attr_typed` and
+  `SwmrFileWriter::set_dataset_attr_typed` set a scalar attribute of a
+  caller-supplied datatype, as `H5File::set_attr_typed` does on the root
+  group. This writes the NUL-terminated fixed-length string attributes
+  NDFileHDF5 builds with `H5Tset_size` and `H5Tset_strpad`, where
+  `set_attr_string` writes a variable-length one.
+
 ### Fixed
 
 - A streaming dataset of rank-0 frames (`frame_dims` empty, one scalar
