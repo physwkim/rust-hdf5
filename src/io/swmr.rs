@@ -431,10 +431,8 @@ impl SwmrWriter {
             return self.append_frame_banded(ds_index, data);
         }
 
-        // Current frame count (dim 0).
-        let frame_idx = self.writer.ds(ds_index).lock().dataspace.dims[0];
-
-        let dims = self.writer.dataset_dims(ds_index).to_vec();
+        // A chunked dataset has a frame axis (`validate_chunk_geometry`); a
+        // contiguous one may be scalar, so it is refused before dim 0 is read.
         let chunk_dims = self
             .writer
             .dataset_chunk_dims(ds_index)
@@ -442,6 +440,9 @@ impl SwmrWriter {
                 crate::io::IoError::InvalidState("append_frame requires a chunked dataset".into())
             })?
             .to_vec();
+        let dims = self.writer.dataset_dims(ds_index);
+        // Current frame count (dim 0).
+        let frame_idx = dims[0];
 
         // A multi-frame chunk (`chunk[0] > 1`) not tracked in `band_buffers`
         // can only be a dataset reopened via `open_append`: its final partial
@@ -1102,6 +1103,25 @@ mod swmr_hardlink_tests {
             assert_eq!(r.dataset_shape(name).unwrap(), vec![5]);
             assert_eq!(r.read_dataset_raw(name).unwrap(), bytes(5));
         }
+    }
+
+    /// `append_frame` on a contiguous scalar dataset is refused, not a
+    /// panic on its missing frame axis.
+    #[test]
+    fn append_frame_refuses_a_contiguous_scalar_dataset() {
+        let dir = TmpDir::new("scalar");
+        let mut w = SwmrWriter::create(&dir.file()).unwrap();
+        let idx = w
+            .writer_mut()
+            .create_dataset("s", DatatypeMessage::u8_type(), &[])
+            .unwrap();
+        let err = w.append_frame(idx, &[1u8]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("append_frame requires a chunked dataset"),
+            "unexpected error: {err}"
+        );
+        w.close().unwrap();
     }
 
     /// A dataset deleted with frames buffered takes its band buffer with it:
