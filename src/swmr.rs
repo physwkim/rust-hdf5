@@ -457,6 +457,25 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Set a numeric array attribute on a group, or on the root group when
+    /// `group_path` is `"/"` — the group form of
+    /// [`set_dataset_attr_array`](Self::set_dataset_attr_array), with the
+    /// same shape rule. Refused after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
+    pub fn set_group_attr_array<T: H5Type>(
+        &mut self,
+        group_path: &str,
+        name: &str,
+        dims: &[u64],
+        values: &[T],
+    ) -> Result<()> {
+        let attr = array_attr(name, dims, values)?;
+        self.inner
+            .writer_mut()
+            .set_attribute(group_attr_target(group_path), attr)?;
+        Ok(())
+    }
+
     /// Set a scalar attribute of a caller-supplied datatype on a group, or on
     /// the root group when `group_path` is `"/"` — the SWMR form of
     /// [`H5Group::set_attr_typed`](crate::H5Group::set_attr_typed). Refused
@@ -611,20 +630,7 @@ impl SwmrFileWriter {
         dims: &[u64],
         values: &[T],
     ) -> Result<()> {
-        // Product of an empty shape is 1 (a scalar holds one element).
-        let expected: u64 = dims.iter().product();
-        if values.len() as u64 != expected {
-            return Err(crate::error::Hdf5Error::InvalidState(format!(
-                "set_dataset_attr_array: {} values but shape {dims:?} needs {expected}",
-                values.len()
-            )));
-        }
-        let attr = AttributeMessage::array_numeric(
-            name,
-            T::hdf5_type(),
-            dims,
-            slice_to_bytes(values).to_vec(),
-        );
+        let attr = array_attr(name, dims, values)?;
         self.inner
             .writer_mut()
             .add_dataset_attribute(ds_index, attr)?;
@@ -1011,6 +1017,24 @@ fn bytes_to_typed<T: H5Type>(mut raw: Vec<u8>, datatype: &DatatypeMessage) -> Re
         result.set_len(count);
     }
     Ok(result)
+}
+
+/// The array attribute message for `values` of shape `dims`, whose product
+/// must be the value count (an empty shape is a scalar, one value).
+fn array_attr<T: H5Type>(name: &str, dims: &[u64], values: &[T]) -> Result<AttributeMessage> {
+    let expected: u64 = dims.iter().product();
+    if values.len() as u64 != expected {
+        return Err(crate::error::Hdf5Error::InvalidState(format!(
+            "attribute '{name}': {} values but shape {dims:?} needs {expected}",
+            values.len()
+        )));
+    }
+    Ok(AttributeMessage::array_numeric(
+        name,
+        T::hdf5_type(),
+        dims,
+        slice_to_bytes(values).to_vec(),
+    ))
 }
 
 /// Raw bytes of one `H5Type` scalar.

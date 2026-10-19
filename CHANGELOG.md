@@ -11,6 +11,8 @@
   group. This writes the NUL-terminated fixed-length string attributes
   NDFileHDF5 builds with `H5Tset_size` and `H5Tset_strpad`, where
   `set_attr_string` writes a variable-length one.
+- `SwmrFileWriter::set_group_attr_array` sets a numeric array attribute
+  on a group, the group form of `set_dataset_attr_array`.
 
 ### Fixed
 

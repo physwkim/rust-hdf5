@@ -6267,3 +6267,49 @@ fn typed_attribute_of_the_wrong_length_is_refused() {
     w.close().unwrap();
     std::fs::remove_file(&path).ok();
 }
+
+/// NDFileHDF5's writeH5attrInt32 / writeH5attrFloat64 store a layout list as
+/// a 1-D NATIVE_INT32 / NATIVE_DOUBLE attribute, on groups too; the SWMR group
+/// array setter writes what libhdf5 reads back as those arrays, refuses a
+/// shape the values do not fill, and is refused after `start_swmr`.
+#[test]
+fn swmr_group_array_attributes_read_back_with_h5py() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::FileLocking;
+
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_group_array");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        w.create_group("/", "entry").unwrap();
+        w.set_group_attr_array::<i32>("/entry", "ints", &[3], &[1, 2, 3])
+            .unwrap();
+        w.set_group_attr_array::<f64>("/entry", "doubles", &[2], &[1.5, -20.0])
+            .unwrap();
+        w.set_group_attr_array::<i32>("/entry", "none", &[0], &[])
+            .unwrap();
+        w.set_group_attr_array::<i32>("/", "root", &[1], &[7])
+            .unwrap();
+        assert!(w
+            .set_group_attr_array::<i32>("/entry", "bad", &[3], &[1, 2])
+            .is_err());
+        let ds = w.create_streaming_dataset::<u8>("frames", &[2]).unwrap();
+        w.start_swmr().unwrap();
+        assert!(w
+            .set_group_attr_array::<i32>("/entry", "late", &[1], &[1])
+            .is_err());
+        w.append_frame(ds, &[1, 2]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "e = f['entry'].attrs\n\
+         assert set(e) == {'ints', 'doubles', 'none'}, set(e)\n\
+         assert e['ints'].dtype == np.dtype('<i4') and e['ints'].tolist() == [1, 2, 3], e['ints']\n\
+         assert e['doubles'].dtype == np.dtype('<f8') and e['doubles'].tolist() == [1.5, -20.0], e['doubles']\n\
+         assert e['none'].dtype == np.dtype('<i4') and e['none'].shape == (0,), e['none']\n\
+         assert f.attrs['root'].shape == (1,) and f.attrs['root'].tolist() == [7], f.attrs['root']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
