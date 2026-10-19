@@ -3888,6 +3888,24 @@ mod tests {
         assert_eq!(decompressed, data);
     }
 
+    /// The fixture is `bzip2 -9` 1.0.8 (C) output for `golden_f64_data`, so
+    /// the pure-Rust backend writes the bytes a C-filter file holds.
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn bzip2_matches_c_libbz2_bytes() {
+        let c_bytes = include_bytes!("../../../tests/fixtures/golden_f64_bzip2_9.bz2");
+        let data = golden_f64_data();
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BZIP2,
+                flags: 0,
+                cd_values: vec![9],
+            }],
+        };
+        assert_eq!(apply_filters(&pipeline, &data).unwrap(), c_bytes);
+        assert_eq!(reverse_filters(&pipeline, c_bytes).unwrap(), data);
+    }
+
     // --- BLOSC roundtrip (LZ4, default) ---
     #[cfg(feature = "blosc")]
     #[test]
