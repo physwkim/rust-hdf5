@@ -890,13 +890,16 @@ fn split_frame_into_tiles(
     elem_size: usize,
 ) -> Vec<Vec<u8>> {
     let k = frame_dims.len();
+    // A scalar frame has no last axis to run along: it is its own one tile.
+    let Some(last) = k.checked_sub(1) else {
+        return vec![frame.to_vec()];
+    };
     let grid: Vec<u64> = (0..k)
         .map(|d| frame_dims[d].div_ceil(tile_dims[d].max(1)))
         .collect();
     let n_tiles: u64 = grid.iter().product();
     let tile_elems: u64 = tile_dims.iter().product();
     // Number of "rows" within a tile: every axis but the last.
-    let last = k - 1;
     let tile_rows: u64 = tile_dims[..last].iter().product();
     let run = tile_dims[last] as usize; // contiguous run length along the last axis
 
@@ -1053,6 +1056,52 @@ mod swmr_hardlink_tests {
         }
         let mut r = Hdf5Reader::open(&path).unwrap();
         assert_eq!(r.read_dataset_raw("frames").unwrap(), frames(6));
+    }
+
+    /// Rank-0 frames, one scalar per append, on the band path (`chunk[0] >
+    /// 1`) and the one-frame-per-chunk path, through a flush with a band
+    /// still filling and a close with another.
+    #[test]
+    fn rank0_frames_append_and_read_back() {
+        let dir = TmpDir::new("rank0");
+        let path = dir.file();
+        let values = [1.5f64, 2.5, 3.5, 4.5, 5.5];
+        let bytes =
+            |n: usize| -> Vec<u8> { values[..n].iter().flat_map(|v| v.to_le_bytes()).collect() };
+        {
+            let mut w = SwmrWriter::create(&path).unwrap();
+            let banded = w
+                .create_streaming_dataset_chunked("banded", DatatypeMessage::f64_type(), &[], &[2])
+                .unwrap();
+            let single = w
+                .create_streaming_dataset_chunked("single", DatatypeMessage::f64_type(), &[], &[1])
+                .unwrap();
+            w.start_swmr().unwrap();
+            for v in &values[..3] {
+                w.append_frame(banded, &v.to_le_bytes()).unwrap();
+                w.append_frame(single, &v.to_le_bytes()).unwrap();
+            }
+            w.flush().unwrap();
+            let mut r = Hdf5Reader::open_swmr_with_locking(
+                &path,
+                crate::io::locking::FileLocking::Disabled,
+            )
+            .unwrap();
+            assert_eq!(r.dataset_shape("banded").unwrap(), vec![3]);
+            assert_eq!(r.read_dataset_raw("banded").unwrap(), bytes(3));
+            assert_eq!(r.read_dataset_raw("single").unwrap(), bytes(3));
+
+            for v in &values[3..] {
+                w.append_frame(banded, &v.to_le_bytes()).unwrap();
+                w.append_frame(single, &v.to_le_bytes()).unwrap();
+            }
+            w.close().unwrap();
+        }
+        let mut r = Hdf5Reader::open(&path).unwrap();
+        for name in ["banded", "single"] {
+            assert_eq!(r.dataset_shape(name).unwrap(), vec![5]);
+            assert_eq!(r.read_dataset_raw(name).unwrap(), bytes(5));
+        }
     }
 
     /// A dataset deleted with frames buffered takes its band buffer with it:
