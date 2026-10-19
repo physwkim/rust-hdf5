@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.6
+
+### Fixed
+
+- A streaming dataset of rank-0 frames (`frame_dims` empty, one scalar
+  per `append_frame`) with more than one frame per chunk panicked on the
+  first band write, and the drop drain then aborted the process. A scalar
+  frame is now written as its own tile, so NDFileHDF5's per-frame
+  NDAttribute datasets can keep libhdf5's chunk depth under SWMR.
+- A rank-0 chunk is refused at dataset creation, as `H5Pset_chunk`
+  refuses it. Such a dataset was written without error and was missing
+  when the file reopened.
+- `SwmrWriter::append_frame` on a contiguous scalar dataset returns an
+  error instead of panicking.
+
 ## 0.7.5
 
 ### Changed
