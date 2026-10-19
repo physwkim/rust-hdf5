@@ -280,6 +280,27 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// [`Self::create_streaming_dataset_chunked`] with a frame axis that holds
+    /// at most `max_frames` frames (`None`: unlimited) and an explicit stored
+    /// datatype, filtered through `pipeline` when one is given: NDFileHDF5's
+    /// maxdims\[0\] = NumCapture. A bounded frame axis is indexed by a fixed
+    /// array, the index libhdf5 picks for it, and an append past
+    /// `max_frames` is refused.
+    pub fn create_streaming_dataset_with_max_frames(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        frame_dims: &[u64],
+        chunk: &[u64],
+        max_frames: Option<u64>,
+        pipeline: Option<crate::format::messages::filter::FilterPipeline>,
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_with_max_frames(
+            name, datatype, frame_dims, chunk, max_frames, pipeline,
+        )?;
+        Ok(idx)
+    }
+
     /// Create a fixed-shape multi-dimensional grid dataset that fills at
     /// explicit positions as frames arrive.
     ///
@@ -290,8 +311,9 @@ impl SwmrFileWriter {
     /// [`write_chunk_at`](Self::write_chunk_at). This mirrors AreaDetector's
     /// "extra dimensions" layout, where a scan of known size (e.g.
     /// `[Na, Nb, H, W]`) is filled in odometer order. `chunk` is the per-chunk
-    /// shape of the same rank (typically `[1, …, 1, H, W]`). Returns the
-    /// dataset index.
+    /// shape of the same rank (typically `[1, …, 1, H, W]`). `dims` is also
+    /// the maximum shape; [`set_extent`](Self::set_extent) moves the extent
+    /// within it. Returns the dataset index.
     pub fn create_grid_dataset<T: H5Type>(
         &mut self,
         name: &str,
@@ -707,8 +729,9 @@ impl SwmrFileWriter {
     /// constructor, is what readers run to decode it. `filter_mask` bit *i*
     /// set means filter *i* was not applied to this frame; pass 0 when the
     /// whole pipeline was. The dataset must store one whole frame per chunk
-    /// ([`create_streaming_dataset_compressed`](Self::create_streaming_dataset_compressed)
-    /// or a `_chunked_compressed` chunk of `[1, frame_dims...]`).
+    /// ([`create_streaming_dataset_compressed`](Self::create_streaming_dataset_compressed),
+    /// or a `_chunked_compressed` or filtered `_with_max_frames` chunk of
+    /// `[1, frame_dims...]`).
     pub fn append_frame_raw(
         &mut self,
         ds_index: usize,
@@ -742,11 +765,12 @@ impl SwmrFileWriter {
     ///
     /// `chunk_coords` are in units of chunks (row-major over the chunk grid)
     /// and `data` must be exactly one full chunk (`product(chunk) *
-    /// element_size` bytes; edge chunks are zero-padded by the caller). The
-    /// logical extent is fixed, so positions may be written in any order and
-    /// unwritten positions read back as fill. As with the streaming path,
-    /// call [`flush`](Self::flush) to make writes visible to SWMR readers and
-    /// set dataset attributes before [`start_swmr`](Self::start_swmr).
+    /// element_size` bytes; edge chunks are zero-padded by the caller).
+    /// Positions may be written in any order, beyond the extent too while
+    /// inside the maximum shape, and unwritten positions read back as fill.
+    /// As with the streaming path, call [`flush`](Self::flush) to make writes
+    /// visible to SWMR readers and set dataset attributes before
+    /// [`start_swmr`](Self::start_swmr).
     pub fn write_chunk_at(
         &mut self,
         ds_index: usize,
@@ -754,6 +778,15 @@ impl SwmrFileWriter {
         data: &[u8],
     ) -> Result<()> {
         self.inner.write_chunk_at(ds_index, chunk_coords, data)?;
+        Ok(())
+    }
+
+    /// Set a dataset's logical extent within its maximum shape, growing or
+    /// shrinking it — libhdf5's `H5Dset_extent`, e.g. a grid's extent
+    /// following the positions written so far. A multi-frame-chunk stream,
+    /// whose extent counts the frames it buffers, is refused.
+    pub fn set_extent(&mut self, ds_index: usize, dims: &[u64]) -> Result<()> {
+        self.inner.set_extent(ds_index, dims)?;
         Ok(())
     }
 

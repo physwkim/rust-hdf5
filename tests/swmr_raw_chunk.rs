@@ -129,6 +129,45 @@ fn write_chunk_raw_at_places_filtered_grid_chunks() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A bounded stream takes already-filtered frames up to its maximum and
+/// keeps that maximum on its frame axis.
+#[test]
+fn append_frame_raw_fills_a_bounded_stream() {
+    use rust_hdf5::H5Type;
+
+    let path = tmp("bounded");
+    let pipeline = FilterPipeline::deflate(4);
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let ds = w
+            .create_streaming_dataset_with_max_frames(
+                "frames",
+                u16::hdf5_type(),
+                &[4, 8],
+                &[1, 4, 8],
+                Some(2),
+                Some(pipeline.clone()),
+            )
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame_raw(ds, &packed_of(0), 0).unwrap();
+        w.append_frame_raw(ds, &frame(1), 1).unwrap();
+        assert!(w.append_frame_raw(ds, &packed_of(2), 0).is_err());
+        w.close().unwrap();
+    }
+    let f = H5File::open(&path).unwrap();
+    let ds = f.dataset("frames").unwrap();
+    assert_eq!(ds.shape(), vec![2, 4, 8]);
+    assert_eq!(ds.max_shape().unwrap(), vec![Some(2), Some(4), Some(8)]);
+    assert_eq!(ds.read_chunk_raw_at(&[0, 0, 0]).unwrap(), (packed_of(0), 0));
+    assert_eq!(ds.read_chunk_raw_at(&[1, 0, 0]).unwrap(), (frame(1), 1));
+    let expect: Vec<u16> = (0..2u16)
+        .flat_map(|s| (0..32u16).map(move |i| i * 3 + s))
+        .collect();
+    assert_eq!(ds.read_raw::<u16>().unwrap(), expect);
+    let _ = std::fs::remove_file(&path);
+}
+
 fn packed_of(seed: u16) -> Vec<u8> {
     apply_filters(&FilterPipeline::deflate(4), &frame(seed)).unwrap()
 }

@@ -721,3 +721,136 @@ fn attribute_changes_during_swmr_are_refused() {
     drop(file);
     cleanup(&path);
 }
+
+fn u16_bytes(v: impl IntoIterator<Item = u16>) -> Vec<u8> {
+    v.into_iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// One [2, 3] u16 frame per seed.
+fn frame6(seed: u16) -> Vec<u8> {
+    u16_bytes((0..6u16).map(|i| 10 * seed + i))
+}
+
+/// A stream bounded at `max_frames` stores that maximum on its frame axis —
+/// NDFileHDF5's maxdims[0] = NumCapture — whether a chunk holds a whole
+/// frame, a tile or a band of frames; an append past it is refused and the
+/// file keeps the frames it held. `None` keeps the unlimited frame axis.
+#[test]
+fn bounded_streaming_dataset_keeps_its_max_frames() {
+    use rust_hdf5::{H5File, H5Type};
+
+    let path = unique_tmp("bounded");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let mut make = |name: &str, chunk: &[u64], max: Option<u64>| {
+            w.create_streaming_dataset_with_max_frames(
+                name,
+                u16::hdf5_type(),
+                &[2, 3],
+                chunk,
+                max,
+                None,
+            )
+        };
+        let whole = make("whole", &[1, 2, 3], Some(3)).unwrap();
+        let tiled = make("tiled", &[1, 1, 3], Some(5)).unwrap();
+        let banded = make("banded", &[2, 2, 3], Some(5)).unwrap();
+        let open = make("open", &[1, 2, 3], None).unwrap();
+        assert!(make("empty", &[1, 2, 3], Some(0)).is_err());
+        w.start_swmr().unwrap();
+        for s in 0..3 {
+            for ds in [whole, tiled, banded, open] {
+                w.append_frame(ds, &frame6(s)).unwrap();
+            }
+        }
+        assert!(w.append_frame(whole, &frame6(9)).is_err());
+        w.append_frame(banded, &frame6(3)).unwrap();
+        w.append_frame(banded, &frame6(4)).unwrap();
+        assert!(w.append_frame(banded, &frame6(9)).is_err());
+        w.close().unwrap();
+    }
+    // A bounded stream resumes after `open_append` up to its maximum.
+    {
+        let mut w = SwmrFileWriter::open_append_with_locking(&path, NO_LOCK).unwrap();
+        let tiled = w.dataset_index("tiled").unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(tiled, &frame6(3)).unwrap();
+        w.append_frame(tiled, &frame6(4)).unwrap();
+        assert!(w.append_frame(tiled, &frame6(9)).is_err());
+        w.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    for (name, n, max) in [
+        ("whole", 3, Some(3)),
+        ("tiled", 5, Some(5)),
+        ("banded", 5, Some(5)),
+        ("open", 3, None),
+    ] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.shape(), vec![n, 2, 3], "{name}");
+        assert_eq!(
+            ds.max_shape().unwrap(),
+            vec![max, Some(2), Some(3)],
+            "{name}"
+        );
+        let expect: Vec<u8> = (0..n as u16).flat_map(frame6).collect();
+        assert_eq!(u16_bytes(ds.read_raw::<u16>().unwrap()), expect, "{name}");
+    }
+    drop(file);
+    cleanup(&path);
+}
+
+/// `set_extent` moves a grid's extent inside its maximum, as `H5Dset_extent`
+/// does for NDFileHDF5's extra dimensions: the file keeps the maximum and
+/// shows the extent last set. Past the maximum it is refused, and on a
+/// multi-frame-chunk stream, whose extent counts the frames its band buffer
+/// holds, it is refused too.
+#[test]
+fn grid_set_extent_moves_within_the_maximum() {
+    use rust_hdf5::H5File;
+
+    let path = unique_tmp("grid_extent");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let grid = w
+            .create_grid_dataset::<u16>("grid", &[3, 2, 2, 3], &[1, 1, 2, 3])
+            .unwrap();
+        let banded = w
+            .create_streaming_dataset_chunked::<u16>("banded", &[2, 3], &[2, 2, 3])
+            .unwrap();
+        w.set_extent(grid, &[1, 1, 2, 3]).unwrap();
+        w.start_swmr().unwrap();
+        // Each frame's position, and the extent that covers every position
+        // written so far.
+        let steps = [
+            ([0, 0], [1, 1]),
+            ([0, 1], [1, 2]),
+            ([1, 0], [2, 2]),
+            ([1, 1], [2, 2]),
+        ];
+        for (s, ([a, b], [na, nb])) in steps.into_iter().enumerate() {
+            w.write_chunk_at(grid, &[a, b, 0, 0], &frame6(s as u16))
+                .unwrap();
+            w.set_extent(grid, &[na, nb, 2, 3]).unwrap();
+            w.flush().unwrap();
+        }
+        assert!(w.set_extent(grid, &[4, 2, 2, 3]).is_err());
+        w.append_frame(banded, &frame6(0)).unwrap();
+        assert!(w.set_extent(banded, &[2, 2, 3]).is_err());
+        w.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    assert_eq!(ds.shape(), vec![2, 2, 2, 3]);
+    assert_eq!(
+        ds.max_shape().unwrap(),
+        vec![Some(3), Some(2), Some(2), Some(3)]
+    );
+    let expect: Vec<u8> = (0..4u16).flat_map(frame6).collect();
+    assert_eq!(u16_bytes(ds.read_raw::<u16>().unwrap()), expect);
+    assert_eq!(file.dataset("banded").unwrap().shape(), vec![1, 2, 3]);
+    drop(file);
+    cleanup(&path);
+}

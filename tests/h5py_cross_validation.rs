@@ -6313,3 +6313,71 @@ fn swmr_group_array_attributes_read_back_with_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// NDFileHDF5's SWMR dataset with maxdims[0] = NumCapture, and its extra-dim
+/// grid grown by `H5Dset_extent`, read in libhdf5 with C's shape and maxshape:
+/// the bounded frame axis takes a fixed-array index, which libhdf5 requires
+/// once no dimension is unlimited.
+#[test]
+fn swmr_bounded_stream_and_grid_extent_read_in_h5py() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::{FileLocking, H5Type};
+
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_bounded");
+    let frame =
+        |s: u16| -> Vec<u8> { (0..6u16).flat_map(|i| (10 * s + i).to_le_bytes()).collect() };
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let mut stream = |name: &str, chunk: &[u64], max: u64| {
+            w.create_streaming_dataset_with_max_frames(
+                name,
+                u16::hdf5_type(),
+                &[2, 3],
+                chunk,
+                Some(max),
+                None,
+            )
+            .unwrap()
+        };
+        let whole = stream("whole", &[1, 2, 3], 3);
+        let tiled = stream("tiled", &[1, 1, 3], 5);
+        let banded = stream("banded", &[2, 2, 3], 5);
+        let grid = w
+            .create_grid_dataset::<u16>("grid", &[3, 2, 2, 3], &[1, 1, 2, 3])
+            .unwrap();
+        w.set_extent(grid, &[1, 1, 2, 3]).unwrap();
+        w.start_swmr().unwrap();
+        for s in 0..3 {
+            for ds in [whole, tiled, banded] {
+                w.append_frame(ds, &frame(s)).unwrap();
+            }
+        }
+        for (s, ([a, b], [na, nb])) in [([0, 0], [1, 1]), ([0, 1], [1, 2]), ([1, 0], [2, 2])]
+            .into_iter()
+            .enumerate()
+        {
+            w.write_chunk_at(grid, &[a, b, 0, 0], &frame(s as u16))
+                .unwrap();
+            w.set_extent(grid, &[na, nb, 2, 3]).unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+frames = np.arange(6, dtype='<u2').reshape(2, 3)
+for name, max_ in (('whole', 3), ('tiled', 5), ('banded', 5)):
+    d = f[name]
+    assert d.shape == (3, 2, 3) and d.maxshape == (max_, 2, 3), (name, d.shape, d.maxshape)
+    assert d[...].tolist() == [(frames + 10 * s).tolist() for s in range(3)], name
+g = f['grid']
+assert g.shape == (2, 2, 2, 3) and g.maxshape == (3, 2, 2, 3), (g.shape, g.maxshape)
+assert g[0, 0].tolist() == frames.tolist() and g[0, 1].tolist() == (frames + 10).tolist()
+assert g[1, 0].tolist() == (frames + 20).tolist() and not g[1, 1].any()
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

@@ -13,6 +13,12 @@
   `set_attr_string` writes a variable-length one.
 - `SwmrFileWriter::set_group_attr_array` sets a numeric array attribute
   on a group, the group form of `set_dataset_attr_array`.
+- `SwmrFileWriter::create_streaming_dataset_with_max_frames` bounds a
+  stream's frame axis, as NDFileHDF5 sets maxdims[0] to NumCapture; a
+  bounded stream takes a fixed-array index, since libhdf5 reads an
+  extensible array only on an unlimited dimension. `SwmrFileWriter::set_extent`
+  moves a dataset's extent within its maximum (`H5Dset_extent`), so a
+  grid can show only the positions written so far.
 
 ### Fixed
 
