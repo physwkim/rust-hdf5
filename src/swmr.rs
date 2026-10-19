@@ -280,6 +280,27 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// [`Self::create_streaming_dataset_chunked`] with a frame axis that holds
+    /// at most `max_frames` frames (`None`: unlimited) and an explicit stored
+    /// datatype, filtered through `pipeline` when one is given: NDFileHDF5's
+    /// maxdims\[0\] = NumCapture. A bounded frame axis is indexed by a fixed
+    /// array, the index libhdf5 picks for it, and an append past
+    /// `max_frames` is refused.
+    pub fn create_streaming_dataset_with_max_frames(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        frame_dims: &[u64],
+        chunk: &[u64],
+        max_frames: Option<u64>,
+        pipeline: Option<crate::format::messages::filter::FilterPipeline>,
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_with_max_frames(
+            name, datatype, frame_dims, chunk, max_frames, pipeline,
+        )?;
+        Ok(idx)
+    }
+
     /// Create a fixed-shape multi-dimensional grid dataset that fills at
     /// explicit positions as frames arrive.
     ///
@@ -290,8 +311,9 @@ impl SwmrFileWriter {
     /// [`write_chunk_at`](Self::write_chunk_at). This mirrors AreaDetector's
     /// "extra dimensions" layout, where a scan of known size (e.g.
     /// `[Na, Nb, H, W]`) is filled in odometer order. `chunk` is the per-chunk
-    /// shape of the same rank (typically `[1, …, 1, H, W]`). Returns the
-    /// dataset index.
+    /// shape of the same rank (typically `[1, …, 1, H, W]`). `dims` is also
+    /// the maximum shape; [`set_extent`](Self::set_extent) moves the extent
+    /// within it. Returns the dataset index.
     pub fn create_grid_dataset<T: H5Type>(
         &mut self,
         name: &str,
@@ -457,6 +479,44 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Set a numeric array attribute on a group, or on the root group when
+    /// `group_path` is `"/"` — the group form of
+    /// [`set_dataset_attr_array`](Self::set_dataset_attr_array), with the
+    /// same shape rule. Refused after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
+    pub fn set_group_attr_array<T: H5Type>(
+        &mut self,
+        group_path: &str,
+        name: &str,
+        dims: &[u64],
+        values: &[T],
+    ) -> Result<()> {
+        let attr = array_attr(name, dims, values)?;
+        self.inner
+            .writer_mut()
+            .set_attribute(group_attr_target(group_path), attr)?;
+        Ok(())
+    }
+
+    /// Set a scalar attribute of a caller-supplied datatype on a group, or on
+    /// the root group when `group_path` is `"/"` — the SWMR form of
+    /// [`H5Group::set_attr_typed`](crate::H5Group::set_attr_typed). Refused
+    /// after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
+    pub fn set_group_attr_typed(
+        &mut self,
+        group_path: &str,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let attr = crate::attribute::typed_scalar_attr(name, datatype, value)?;
+        self.inner
+            .writer_mut()
+            .set_attribute(group_attr_target(group_path), attr)?;
+        Ok(())
+    }
+
     /// Create a fixed-shape (non-streaming) dataset and write all its data in
     /// one call. Returns the dataset index.
     ///
@@ -553,6 +613,25 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Set a scalar attribute of a caller-supplied datatype on a dataset,
+    /// addressed by its index — the SWMR form of
+    /// [`H5Dataset::set_attr_typed`](crate::H5Dataset::set_attr_typed).
+    /// Refused after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
+    pub fn set_dataset_attr_typed(
+        &mut self,
+        ds_index: usize,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let attr = crate::attribute::typed_scalar_attr(name, datatype, value)?;
+        self.inner
+            .writer_mut()
+            .add_dataset_attribute(ds_index, attr)?;
+        Ok(())
+    }
+
     /// Set a numeric array attribute on a dataset, addressed by its index.
     ///
     /// `dims` are the dimension sizes (e.g. `&[3]` for a 1-D array) and the
@@ -573,20 +652,7 @@ impl SwmrFileWriter {
         dims: &[u64],
         values: &[T],
     ) -> Result<()> {
-        // Product of an empty shape is 1 (a scalar holds one element).
-        let expected: u64 = dims.iter().product();
-        if values.len() as u64 != expected {
-            return Err(crate::error::Hdf5Error::InvalidState(format!(
-                "set_dataset_attr_array: {} values but shape {dims:?} needs {expected}",
-                values.len()
-            )));
-        }
-        let attr = AttributeMessage::array_numeric(
-            name,
-            T::hdf5_type(),
-            dims,
-            slice_to_bytes(values).to_vec(),
-        );
+        let attr = array_attr(name, dims, values)?;
         self.inner
             .writer_mut()
             .add_dataset_attribute(ds_index, attr)?;
@@ -663,8 +729,9 @@ impl SwmrFileWriter {
     /// constructor, is what readers run to decode it. `filter_mask` bit *i*
     /// set means filter *i* was not applied to this frame; pass 0 when the
     /// whole pipeline was. The dataset must store one whole frame per chunk
-    /// ([`create_streaming_dataset_compressed`](Self::create_streaming_dataset_compressed)
-    /// or a `_chunked_compressed` chunk of `[1, frame_dims...]`).
+    /// ([`create_streaming_dataset_compressed`](Self::create_streaming_dataset_compressed),
+    /// or a `_chunked_compressed` or filtered `_with_max_frames` chunk of
+    /// `[1, frame_dims...]`).
     pub fn append_frame_raw(
         &mut self,
         ds_index: usize,
@@ -698,11 +765,12 @@ impl SwmrFileWriter {
     ///
     /// `chunk_coords` are in units of chunks (row-major over the chunk grid)
     /// and `data` must be exactly one full chunk (`product(chunk) *
-    /// element_size` bytes; edge chunks are zero-padded by the caller). The
-    /// logical extent is fixed, so positions may be written in any order and
-    /// unwritten positions read back as fill. As with the streaming path,
-    /// call [`flush`](Self::flush) to make writes visible to SWMR readers and
-    /// set dataset attributes before [`start_swmr`](Self::start_swmr).
+    /// element_size` bytes; edge chunks are zero-padded by the caller).
+    /// Positions may be written in any order, beyond the extent too while
+    /// inside the maximum shape, and unwritten positions read back as fill.
+    /// As with the streaming path, call [`flush`](Self::flush) to make writes
+    /// visible to SWMR readers and set dataset attributes before
+    /// [`start_swmr`](Self::start_swmr).
     pub fn write_chunk_at(
         &mut self,
         ds_index: usize,
@@ -710,6 +778,15 @@ impl SwmrFileWriter {
         data: &[u8],
     ) -> Result<()> {
         self.inner.write_chunk_at(ds_index, chunk_coords, data)?;
+        Ok(())
+    }
+
+    /// Set a dataset's logical extent within its maximum shape, growing or
+    /// shrinking it — libhdf5's `H5Dset_extent`, e.g. a grid's extent
+    /// following the positions written so far. A multi-frame-chunk stream,
+    /// whose extent counts the frames it buffers, is refused.
+    pub fn set_extent(&mut self, ds_index: usize, dims: &[u64]) -> Result<()> {
+        self.inner.set_extent(ds_index, dims)?;
         Ok(())
     }
 
@@ -973,6 +1050,24 @@ fn bytes_to_typed<T: H5Type>(mut raw: Vec<u8>, datatype: &DatatypeMessage) -> Re
         result.set_len(count);
     }
     Ok(result)
+}
+
+/// The array attribute message for `values` of shape `dims`, whose product
+/// must be the value count (an empty shape is a scalar, one value).
+fn array_attr<T: H5Type>(name: &str, dims: &[u64], values: &[T]) -> Result<AttributeMessage> {
+    let expected: u64 = dims.iter().product();
+    if values.len() as u64 != expected {
+        return Err(crate::error::Hdf5Error::InvalidState(format!(
+            "attribute '{name}': {} values but shape {dims:?} needs {expected}",
+            values.len()
+        )));
+    }
+    Ok(AttributeMessage::array_numeric(
+        name,
+        T::hdf5_type(),
+        dims,
+        slice_to_bytes(values).to_vec(),
+    ))
 }
 
 /// Raw bytes of one `H5Type` scalar.

@@ -6101,3 +6101,283 @@ assert d[:].tolist() == [[0xabc, 0xabc, 0xabc], [1, 2, 3]], d[:].tolist()
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A NUL-terminated ASCII fixed-length string sized to `s`, as
+/// `H5Tcopy(H5T_C_S1)` + `H5Tset_size(len + 1)` +
+/// `H5Tset_strpad(H5T_STR_NULLTERM)` describes it, with its element image.
+fn c_s1_nullterm(s: &str) -> (DatatypeMessage, Vec<u8>) {
+    let mut value = s.as_bytes().to_vec();
+    value.push(0);
+    let datatype = DatatypeMessage::FixedString {
+        size: value.len() as u32,
+        padding: 0,
+        charset: 0,
+    };
+    (datatype, value)
+}
+
+/// The libhdf5 side of `c_s1_nullterm`: every `(path, name, value)` attribute
+/// must have a type `H5Tequal` to the C_S1 type sized and padded as above, a
+/// scalar dataspace and the value.
+fn assert_c_s1_nullterm_attrs_with_h5py(
+    py: &str,
+    path: &std::path::Path,
+    attrs: &[(&str, &str, &str)],
+) {
+    let list: Vec<String> = attrs
+        .iter()
+        .map(|(obj, name, val)| format!("('{obj}', '{name}', b'{val}')"))
+        .collect();
+    read_back_with_h5py(
+        py,
+        path,
+        &format!(
+            "from h5py import h5t\n\
+             for obj, name, val in ({},):\n\
+             \x20   tid = h5t.C_S1.copy()\n\
+             \x20   tid.set_size(len(val) + 1)\n\
+             \x20   tid.set_strpad(h5t.STR_NULLTERM)\n\
+             \x20   a = f[obj].attrs.get_id(name)\n\
+             \x20   t = a.get_type()\n\
+             \x20   assert t == tid, (obj, name, t.get_size(), t.get_strpad(), t.get_cset())\n\
+             \x20   assert a.shape == (), (obj, name, a.shape)\n\
+             \x20   assert f[obj].attrs[name] == val, (obj, name, f[obj].attrs[name])\n",
+            list.join(", ")
+        ),
+    );
+}
+
+/// NDFileHDF5's writeH5attrStr stores layout strings as a C_S1 sized to the
+/// value plus its terminator; the group and dataset typed setters write a
+/// type libhdf5 holds equal to that one.
+#[test]
+fn typed_fixed_string_attributes_equal_libhdf5_c_s1() {
+    let Some(py) = python() else { return };
+    let path = tmp("typed_c_s1");
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.create_group("entry").unwrap();
+        let (dt, v) = c_s1_nullterm("NXentry");
+        g.set_attr_typed("NX_class", dt, v).unwrap();
+        let ds = g.new_dataset::<i32>().shape([2]).create("data").unwrap();
+        ds.write_raw(&[1i32, 2]).unwrap();
+        let (dt, v) = c_s1_nullterm("counts");
+        ds.set_attr_typed("units", dt, v).unwrap();
+        let (dt, v) = c_s1_nullterm("");
+        ds.set_attr_typed("empty", dt, v).unwrap();
+    }
+    assert_c_s1_nullterm_attrs_with_h5py(
+        py,
+        &path,
+        &[
+            ("entry", "NX_class", "NXentry"),
+            ("entry/data", "units", "counts"),
+            ("entry/data", "empty", ""),
+        ],
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The SWMR typed setters write the same C_S1 attribute before `start_swmr`,
+/// and are refused after it like every other SWMR attribute setter.
+#[test]
+fn swmr_typed_fixed_string_attributes_equal_libhdf5_c_s1() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::FileLocking;
+
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_typed_c_s1");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        w.create_group("/", "entry").unwrap();
+        let (dt, v) = c_s1_nullterm("NXentry");
+        w.set_group_attr_typed("/entry", "NX_class", dt, v).unwrap();
+        let (dt, v) = c_s1_nullterm("root");
+        w.set_group_attr_typed("/", "note", dt, v).unwrap();
+        let ds = w.create_streaming_dataset::<u8>("frames", &[2]).unwrap();
+        let (dt, v) = c_s1_nullterm("counts");
+        w.set_dataset_attr_typed(ds, "units", dt, v).unwrap();
+        w.start_swmr().unwrap();
+        let (dt, v) = c_s1_nullterm("late");
+        assert!(w
+            .set_group_attr_typed("/entry", "late", dt.clone(), v.clone())
+            .is_err());
+        assert!(w.set_dataset_attr_typed(ds, "late", dt, v).is_err());
+        w.append_frame(ds, &[1, 2]).unwrap();
+        w.close().unwrap();
+    }
+    assert_c_s1_nullterm_attrs_with_h5py(
+        py,
+        &path,
+        &[
+            ("entry", "NX_class", "NXentry"),
+            ("/", "note", "root"),
+            ("frames", "units", "counts"),
+        ],
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A typed value that is not exactly one element of its datatype is refused
+/// by every typed setter, before anything is written.
+#[test]
+fn typed_attribute_of_the_wrong_length_is_refused() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::FileLocking;
+
+    let dt = DatatypeMessage::FixedString {
+        size: 4,
+        padding: 0,
+        charset: 0,
+    };
+    let path = tmp("typed_len");
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.create_group("g").unwrap();
+        let ds = file.new_dataset::<u8>().shape([1]).create("d").unwrap();
+        for v in [b"abc".to_vec(), b"abcd\0".to_vec()] {
+            assert!(file.set_attr_typed("a", dt.clone(), v.clone()).is_err());
+            assert!(g.set_attr_typed("a", dt.clone(), v.clone()).is_err());
+            assert!(ds.set_attr_typed("a", dt.clone(), v).is_err());
+        }
+        ds.write_raw(&[0u8]).unwrap();
+    }
+    let file = H5File::open(&path).unwrap();
+    assert!(file.attr_names().unwrap().is_empty());
+    assert!(file
+        .root_group()
+        .group("g")
+        .unwrap()
+        .attr_names()
+        .unwrap()
+        .is_empty());
+    assert!(file.dataset("d").unwrap().attr_names().unwrap().is_empty());
+    drop(file);
+    std::fs::remove_file(&path).ok();
+
+    let path = tmp("swmr_typed_len");
+    let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+    let ds = w.create_streaming_dataset::<u8>("frames", &[2]).unwrap();
+    assert!(w
+        .set_group_attr_typed("/", "a", dt.clone(), b"abc".to_vec())
+        .is_err());
+    assert!(w
+        .set_dataset_attr_typed(ds, "a", dt, b"abc".to_vec())
+        .is_err());
+    w.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// NDFileHDF5's writeH5attrInt32 / writeH5attrFloat64 store a layout list as
+/// a 1-D NATIVE_INT32 / NATIVE_DOUBLE attribute, on groups too; the SWMR group
+/// array setter writes what libhdf5 reads back as those arrays, refuses a
+/// shape the values do not fill, and is refused after `start_swmr`.
+#[test]
+fn swmr_group_array_attributes_read_back_with_h5py() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::FileLocking;
+
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_group_array");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        w.create_group("/", "entry").unwrap();
+        w.set_group_attr_array::<i32>("/entry", "ints", &[3], &[1, 2, 3])
+            .unwrap();
+        w.set_group_attr_array::<f64>("/entry", "doubles", &[2], &[1.5, -20.0])
+            .unwrap();
+        w.set_group_attr_array::<i32>("/entry", "none", &[0], &[])
+            .unwrap();
+        w.set_group_attr_array::<i32>("/", "root", &[1], &[7])
+            .unwrap();
+        assert!(w
+            .set_group_attr_array::<i32>("/entry", "bad", &[3], &[1, 2])
+            .is_err());
+        let ds = w.create_streaming_dataset::<u8>("frames", &[2]).unwrap();
+        w.start_swmr().unwrap();
+        assert!(w
+            .set_group_attr_array::<i32>("/entry", "late", &[1], &[1])
+            .is_err());
+        w.append_frame(ds, &[1, 2]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "e = f['entry'].attrs\n\
+         assert set(e) == {'ints', 'doubles', 'none'}, set(e)\n\
+         assert e['ints'].dtype == np.dtype('<i4') and e['ints'].tolist() == [1, 2, 3], e['ints']\n\
+         assert e['doubles'].dtype == np.dtype('<f8') and e['doubles'].tolist() == [1.5, -20.0], e['doubles']\n\
+         assert e['none'].dtype == np.dtype('<i4') and e['none'].shape == (0,), e['none']\n\
+         assert f.attrs['root'].shape == (1,) and f.attrs['root'].tolist() == [7], f.attrs['root']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// NDFileHDF5's SWMR dataset with maxdims[0] = NumCapture, and its extra-dim
+/// grid grown by `H5Dset_extent`, read in libhdf5 with C's shape and maxshape:
+/// the bounded frame axis takes a fixed-array index, which libhdf5 requires
+/// once no dimension is unlimited.
+#[test]
+fn swmr_bounded_stream_and_grid_extent_read_in_h5py() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::{FileLocking, H5Type};
+
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_bounded");
+    let frame =
+        |s: u16| -> Vec<u8> { (0..6u16).flat_map(|i| (10 * s + i).to_le_bytes()).collect() };
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let mut stream = |name: &str, chunk: &[u64], max: u64| {
+            w.create_streaming_dataset_with_max_frames(
+                name,
+                u16::hdf5_type(),
+                &[2, 3],
+                chunk,
+                Some(max),
+                None,
+            )
+            .unwrap()
+        };
+        let whole = stream("whole", &[1, 2, 3], 3);
+        let tiled = stream("tiled", &[1, 1, 3], 5);
+        let banded = stream("banded", &[2, 2, 3], 5);
+        let grid = w
+            .create_grid_dataset::<u16>("grid", &[3, 2, 2, 3], &[1, 1, 2, 3])
+            .unwrap();
+        w.set_extent(grid, &[1, 1, 2, 3]).unwrap();
+        w.start_swmr().unwrap();
+        for s in 0..3 {
+            for ds in [whole, tiled, banded] {
+                w.append_frame(ds, &frame(s)).unwrap();
+            }
+        }
+        for (s, ([a, b], [na, nb])) in [([0, 0], [1, 1]), ([0, 1], [1, 2]), ([1, 0], [2, 2])]
+            .into_iter()
+            .enumerate()
+        {
+            w.write_chunk_at(grid, &[a, b, 0, 0], &frame(s as u16))
+                .unwrap();
+            w.set_extent(grid, &[na, nb, 2, 3]).unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "\
+frames = np.arange(6, dtype='<u2').reshape(2, 3)
+for name, max_ in (('whole', 3), ('tiled', 5), ('banded', 5)):
+    d = f[name]
+    assert d.shape == (3, 2, 3) and d.maxshape == (max_, 2, 3), (name, d.shape, d.maxshape)
+    assert d[...].tolist() == [(frames + 10 * s).tolist() for s in range(3)], name
+g = f['grid']
+assert g.shape == (2, 2, 2, 3) and g.maxshape == (3, 2, 2, 3), (g.shape, g.maxshape)
+assert g[0, 0].tolist() == frames.tolist() and g[0, 1].tolist() == (frames + 10).tolist()
+assert g[1, 0].tolist() == (frames + 20).tolist() and not g[1, 1].any()
+",
+    );
+    std::fs::remove_file(&path).ok();
+}

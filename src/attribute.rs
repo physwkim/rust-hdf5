@@ -26,6 +26,24 @@ use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::types::VarLenUnicode;
 
+/// The scalar attribute message for a caller-supplied datatype and raw value,
+/// which every `set_attr_typed` / `set_*_attr_typed` setter builds. `value`
+/// must be exactly one element of `datatype`.
+pub(crate) fn typed_scalar_attr(
+    name: &str,
+    datatype: DatatypeMessage,
+    value: Vec<u8>,
+) -> Result<AttributeMessage> {
+    if value.len() as u64 != u64::from(datatype.element_size()) {
+        return Err(Hdf5Error::InvalidState(format!(
+            "attribute '{name}' was given {} bytes for a datatype whose element is {}",
+            value.len(),
+            datatype.element_size()
+        )));
+    }
+    Ok(AttributeMessage::scalar_numeric(name, datatype, value))
+}
+
 /// A handle to an HDF5 attribute.
 ///
 /// After creating an attribute via [`AttrBuilder::create`], use

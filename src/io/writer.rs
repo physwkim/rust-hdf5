@@ -1564,11 +1564,17 @@ fn refill_chunk_beyond_extent(
 }
 
 /// Validate caller-supplied chunk geometry at dataset definition, the rule
-/// libhdf5 applies in `H5D__chunk_construct` (H5Dchunk.c): the chunk rank
-/// must match the dataspace rank, no chunk dimension may be zero, and a
-/// chunk dimension may not exceed a fixed maximum dimension — except in a
-/// dimension whose current size is zero, which libhdf5 exempts.
+/// libhdf5 applies in `H5Pset_chunk` (H5Pdcpl.c) and `H5D__chunk_construct`
+/// (H5Dchunk.c): the chunk rank must be positive and match the dataspace
+/// rank, no chunk dimension may be zero, and a chunk dimension may not
+/// exceed a fixed maximum dimension — except in a dimension whose current
+/// size is zero, which libhdf5 exempts.
 fn validate_chunk_geometry(dims: &[u64], max_dims: &[u64], chunk_dims: &[u64]) -> IoResult<()> {
+    if chunk_dims.is_empty() {
+        return Err(crate::io::IoError::InvalidState(
+            "chunk dimensionality must be positive".into(),
+        ));
+    }
     let ndims = dims.len();
     if chunk_dims.len() != ndims {
         return Err(crate::io::IoError::InvalidState(format!(
@@ -19928,6 +19934,34 @@ mod tests {
             err.to_string().contains("chunk dimension 0 is zero"),
             "unexpected error: {err}"
         );
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A rank-0 chunk is refused on both index paths, as `H5Pset_chunk`
+    /// refuses it: written anyway, the dataset was gone when the file
+    /// reopened.
+    #[test]
+    fn create_refuses_a_rank_0_chunk() {
+        let path = temp_path("rank0_chunk");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let errs = [
+            writer
+                .create_chunked_dataset("ea", DatatypeMessage::f64_type(), &[], &[], &[])
+                .unwrap_err(),
+            writer
+                .create_fixed_array_dataset("fa", DatatypeMessage::f64_type(), &[], &[])
+                .unwrap_err(),
+        ];
+        for err in errs {
+            assert!(
+                err.to_string()
+                    .contains("chunk dimensionality must be positive"),
+                "unexpected error: {err}"
+            );
+        }
 
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();

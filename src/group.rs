@@ -839,6 +839,21 @@ impl H5Group {
         ))
     }
 
+    /// Add (or replace) a scalar attribute on this group whose datatype and
+    /// raw value the caller supplies — the group form of
+    /// [`H5File::set_attr_typed`](crate::H5File::set_attr_typed). A
+    /// fixed-length string sized by `H5Tset_size`, for instance, is
+    /// `DatatypeMessage::FixedString { size, padding, charset }` with the
+    /// `size` bytes of the element as `value`.
+    pub fn set_attr_typed(
+        &self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        self.add_attr(crate::attribute::typed_scalar_attr(name, datatype, value)?)
+    }
+
     /// Add (or replace) a numeric (or bool) **array** attribute on this group.
     ///
     /// The values are written as a 1-D HDF5 array attribute (simple dataspace

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.7.6
+
+### Added
+
+- `H5Group::set_attr_typed`, `H5Dataset::set_attr_typed`,
+  `SwmrFileWriter::set_group_attr_typed` and
+  `SwmrFileWriter::set_dataset_attr_typed` set a scalar attribute of a
+  caller-supplied datatype, as `H5File::set_attr_typed` does on the root
+  group. This writes the NUL-terminated fixed-length string attributes
+  NDFileHDF5 builds with `H5Tset_size` and `H5Tset_strpad`, where
+  `set_attr_string` writes a variable-length one.
+- `SwmrFileWriter::set_group_attr_array` sets a numeric array attribute
+  on a group, the group form of `set_dataset_attr_array`.
+- `SwmrFileWriter::create_streaming_dataset_with_max_frames` bounds a
+  stream's frame axis, as NDFileHDF5 sets maxdims[0] to NumCapture; a
+  bounded stream takes a fixed-array index, since libhdf5 reads an
+  extensible array only on an unlimited dimension. `SwmrFileWriter::set_extent`
+  moves a dataset's extent within its maximum (`H5Dset_extent`), so a
+  grid can show only the positions written so far.
+
+### Fixed
+
+- A streaming dataset of rank-0 frames (`frame_dims` empty, one scalar
+  per `append_frame`) with more than one frame per chunk panicked on the
+  first band write, and the drop drain then aborted the process. A scalar
+  frame is now written as its own tile, so NDFileHDF5's per-frame
+  NDAttribute datasets can keep libhdf5's chunk depth under SWMR.
+- A rank-0 chunk is refused at dataset creation, as `H5Pset_chunk`
+  refuses it. Such a dataset was written without error and was missing
+  when the file reopened.
+- `SwmrWriter::append_frame` on a contiguous scalar dataset returns an
+  error instead of panicking.
+
 ## 0.7.5
 
 ### Changed

@@ -253,7 +253,7 @@ impl SwmrWriter {
         frame_dims: &[u64],
         chunk: &[u64],
     ) -> IoResult<usize> {
-        self.create_streaming_dataset_chunked_inner(name, datatype, frame_dims, chunk, None)
+        self.create_streaming_dataset_chunked_inner(name, datatype, frame_dims, chunk, None, None)
     }
 
     /// Compressed variant of [`create_streaming_dataset_chunked`]; each
@@ -273,7 +273,32 @@ impl SwmrWriter {
             datatype,
             frame_dims,
             chunk,
+            None,
             Some(pipeline),
+        )
+    }
+
+    /// [`create_streaming_dataset_chunked`] with a frame axis that holds at
+    /// most `max_frames` frames (`None`: unlimited), filtered through
+    /// `pipeline` when one is given.
+    ///
+    /// A bounded frame axis leaves no unlimited dimension, so the dataset is
+    /// indexed by a fixed array sized for `max_frames`: the index libhdf5
+    /// picks for that maximum, and the only one it reads without an
+    /// unlimited dimension. An append past the maximum is refused.
+    ///
+    /// [`create_streaming_dataset_chunked`]: Self::create_streaming_dataset_chunked
+    pub fn create_streaming_dataset_with_max_frames(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        frame_dims: &[u64],
+        chunk: &[u64],
+        max_frames: Option<u64>,
+        pipeline: Option<crate::format::messages::filter::FilterPipeline>,
+    ) -> IoResult<usize> {
+        self.create_streaming_dataset_chunked_inner(
+            name, datatype, frame_dims, chunk, max_frames, pipeline,
         )
     }
 
@@ -283,20 +308,29 @@ impl SwmrWriter {
         datatype: DatatypeMessage,
         frame_dims: &[u64],
         chunk: &[u64],
+        max_frames: Option<u64>,
         pipeline: Option<crate::format::messages::filter::FilterPipeline>,
     ) -> IoResult<usize> {
         validate_streaming_chunk(frame_dims, chunk)?;
+        if max_frames == Some(0) {
+            return Err(crate::io::IoError::InvalidState(
+                "max_frames must be at least 1 (None is unlimited)".into(),
+            ));
+        }
         let elem_size = datatype.element_size() as usize;
         let mut dims = vec![0u64];
         dims.extend_from_slice(frame_dims);
-        let mut max_dims = vec![u64::MAX];
+        let mut max_dims = vec![max_frames.unwrap_or(u64::MAX)];
         max_dims.extend_from_slice(frame_dims);
 
-        let idx = match pipeline {
-            Some(p) => self
+        let idx = match (max_frames, pipeline) {
+            (Some(_), p) => self
+                .writer
+                .create_fixed_array_dataset_with_max(name, datatype, &dims, &max_dims, chunk, p)?,
+            (None, Some(p)) => self
                 .writer
                 .create_chunked_dataset_with_pipeline(name, datatype, &dims, &max_dims, chunk, p)?,
-            None => self
+            (None, None) => self
                 .writer
                 .create_chunked_dataset(name, datatype, &dims, &max_dims, chunk)?,
         };
@@ -325,12 +359,13 @@ impl SwmrWriter {
     /// which grows a single unlimited leading axis via `append_frame`, this
     /// creates a dataset of the full bounded shape `dims` (no unlimited axis)
     /// whose chunks are placed at explicit positions with
-    /// [`write_chunk_at`](Self::write_chunk_at). `chunk` is the per-chunk
-    /// shape of the same rank. A fully bounded dataspace uses the fixed-array
-    /// chunk index — the index libhdf5 requires for a dataset with no
-    /// unlimited dimension; an extensible array would make the file
-    /// unreadable ("didn't find unlimited dimension"). Returns the dataset
-    /// index.
+    /// [`write_chunk_at`](Self::write_chunk_at). `dims` is also the maximum
+    /// shape; [`set_extent`](Self::set_extent) moves the extent within it.
+    /// `chunk` is the per-chunk shape of the same rank. A fully bounded
+    /// dataspace uses the fixed-array chunk index — the index libhdf5
+    /// requires for a dataset with no unlimited dimension; an extensible
+    /// array would make the file unreadable ("didn't find unlimited
+    /// dimension"). Returns the dataset index.
     pub fn create_grid_dataset(
         &mut self,
         name: &str,
@@ -414,8 +449,8 @@ impl SwmrWriter {
 
     /// Append a frame of data to a streaming dataset.
     ///
-    /// This writes the chunk data, updates the extensible array index,
-    /// and extends the dataset dimensions. For a tiled streaming dataset
+    /// This writes the chunk data, updates the chunk index, and extends the
+    /// dataset dimensions. For a tiled streaming dataset
     /// (created via [`create_streaming_dataset_tiled`]) the frame buffer is
     /// split into its chunk tiles, each written as a separate chunk; for a
     /// one-chunk-per-frame dataset the frame is written as a single chunk.
@@ -431,10 +466,8 @@ impl SwmrWriter {
             return self.append_frame_banded(ds_index, data);
         }
 
-        // Current frame count (dim 0).
-        let frame_idx = self.writer.ds(ds_index).lock().dataspace.dims[0];
-
-        let dims = self.writer.dataset_dims(ds_index).to_vec();
+        // A chunked dataset has a frame axis (`validate_chunk_geometry`); a
+        // contiguous one may be scalar, so it is refused before dim 0 is read.
         let chunk_dims = self
             .writer
             .dataset_chunk_dims(ds_index)
@@ -442,6 +475,9 @@ impl SwmrWriter {
                 crate::io::IoError::InvalidState("append_frame requires a chunked dataset".into())
             })?
             .to_vec();
+        let dims = self.writer.dataset_dims(ds_index);
+        // Current frame count (dim 0).
+        let frame_idx = dims[0];
 
         // A multi-frame chunk (`chunk[0] > 1`) not tracked in `band_buffers`
         // can only be a dataset reopened via `open_append`: its final partial
@@ -474,7 +510,7 @@ impl SwmrWriter {
         // including the case of a chunk larger than the frame, which still
         // produces one zero-padded tile of the full chunk size.
         if chunk_dims[1..] == dims[1..] {
-            self.writer.write_chunk(ds_index, frame_idx, data)?;
+            Self::write_stream_chunk(&self.writer, ds_index, frame_idx, data, None)?;
         } else {
             // Sub-frame tiling: split the row-major frame buffer into its
             // chunk tiles and write each as a separate chunk. The linear
@@ -487,7 +523,7 @@ impl SwmrWriter {
             let tiles = split_frame_into_tiles(data, &dims[1..], &chunk_dims[1..], elem_size);
             let base = frame_idx * tiles_per_frame;
             for (i, tile) in tiles.iter().enumerate() {
-                self.writer.write_chunk(ds_index, base + i as u64, tile)?;
+                Self::write_stream_chunk(&self.writer, ds_index, base + i as u64, tile, None)?;
             }
         }
 
@@ -512,36 +548,17 @@ impl SwmrWriter {
         data: &[u8],
         filter_mask: u32,
     ) -> IoResult<()> {
-        let (frame_idx, whole_frame) = {
-            let ds = self.writer.ds(ds_index);
-            let g = ds.lock();
-            let chunk_dims = &g
-                .chunked
-                .as_ref()
-                .ok_or_else(|| {
-                    crate::io::IoError::InvalidState(
-                        "append_frame_raw requires a chunked dataset".into(),
-                    )
-                })?
-                .chunk_dims;
-            let dims = &g.dataspace.dims;
-            (
-                dims[0],
-                chunk_dims[0] == 1 && chunk_dims[1..] == dims[1..] && g.fixed_array.is_none(),
-            )
-        };
-        if !whole_frame {
+        let chunk_dims = self.writer.dataset_chunk_dims(ds_index).ok_or_else(|| {
+            crate::io::IoError::InvalidState("append_frame_raw requires a chunked dataset".into())
+        })?;
+        let dims = self.writer.dataset_dims(ds_index);
+        let frame_idx = dims[0];
+        if chunk_dims[0] != 1 || chunk_dims[1..] != dims[1..] {
             return Err(crate::io::IoError::InvalidState(format!(
-                "append_frame_raw: dataset {ds_index} does not store one whole frame per \
-                 chunk on an unlimited frame axis"
+                "append_frame_raw: dataset {ds_index} does not store one whole frame per chunk"
             )));
         }
-        {
-            let ds = self.writer.ds(ds_index);
-            let _op = ds.op.lock();
-            self.writer
-                .write_compressed_chunk_inner(ds_index, frame_idx, data, filter_mask)?;
-        }
+        Self::write_stream_chunk(&self.writer, ds_index, frame_idx, data, Some(filter_mask))?;
         let mut new_dims = self.writer.ds(ds_index).lock().dataspace.dims.clone();
         new_dims[0] = frame_idx + 1;
         self.writer.extend_dataset(ds_index, &new_dims)
@@ -577,9 +594,10 @@ impl SwmrWriter {
     ///
     /// `chunk_coords` are in units of chunks; `data` must be exactly one full
     /// chunk (`product(chunk) * element_size` bytes — edge chunks are
-    /// zero-padded by the caller). The logical extent is fixed, so positions
-    /// may be written in any order and unwritten positions read back as fill.
-    /// Make writes visible to SWMR readers with [`flush`](Self::flush).
+    /// zero-padded by the caller). Positions may be written in any order,
+    /// beyond the extent too while inside the maximum shape, and unwritten
+    /// positions read back as fill. Make writes visible to SWMR readers with
+    /// [`flush`](Self::flush).
     pub fn write_chunk_at(
         &mut self,
         ds_index: usize,
@@ -593,6 +611,71 @@ impl SwmrWriter {
         }
         self.writer
             .write_chunk_fixed_array(ds_index, chunk_coords, data)
+    }
+
+    /// Set a dataset's logical extent, growing or shrinking it within its
+    /// maximum shape: libhdf5's `H5Dset_extent`, as
+    /// [`Hdf5Writer::set_dataset_extent`] does it.
+    ///
+    /// A multi-frame-chunk stream is refused: its extent counts the frames
+    /// its band buffer holds, and the buffered band's position is read back
+    /// from that extent.
+    pub fn set_extent(&mut self, ds_index: usize, dims: &[u64]) -> IoResult<()> {
+        if self.band_buffers.contains_key(&ds_index) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "set_extent: dataset {ds_index} buffers multi-frame chunk bands, \
+                 whose position its extent fixes"
+            )));
+        }
+        self.writer.set_dataset_extent(ds_index, dims)
+    }
+
+    /// Record one chunk of a streaming dataset at its row-major position
+    /// `linear` in the chunk grid, through whichever index the dataset has:
+    /// the extensible array of an unlimited frame axis, or the fixed array
+    /// of a bounded one. Both number chunks row-major with the frame axis
+    /// slowest, so one position addresses either. `raw_mask` stores `data`
+    /// verbatim as already filtered under that mask; `None` runs the
+    /// dataset's pipeline.
+    fn write_stream_chunk(
+        writer: &Hdf5Writer,
+        ds_index: usize,
+        linear: u64,
+        data: &[u8],
+        raw_mask: Option<u32>,
+    ) -> IoResult<()> {
+        let ds = writer.ds(ds_index);
+        let _op = ds.op.lock();
+        let fixed_grid = {
+            let m = ds.lock();
+            match m.fixed_array.as_ref() {
+                Some(fa) => Some(crate::io::chunk_grid::index_grid(
+                    &m.dataspace.dims,
+                    m.dataspace.max_dims.as_deref(),
+                    &fa.chunk_dims,
+                )?),
+                None => None,
+            }
+        };
+        let Some(grid) = fixed_grid else {
+            return match raw_mask {
+                None => writer.write_chunk_inner(ds_index, linear, data),
+                Some(mask) => writer.write_compressed_chunk_inner(ds_index, linear, data, mask),
+            };
+        };
+        let mut coords = vec![0u64; grid.len()];
+        let mut rest = linear;
+        for d in (1..grid.len()).rev() {
+            coords[d] = rest % grid[d];
+            rest /= grid[d];
+        }
+        coords[0] = rest;
+        match raw_mask {
+            None => writer.write_chunk_fixed_array_inner(ds_index, &coords, data),
+            Some(mask) => {
+                writer.write_compressed_chunk_fixed_array_inner(ds_index, &coords, data, mask)
+            }
+        }
     }
 
     /// `append_frame` for a dataset whose chunk spans `chunk[0] > 1` frames:
@@ -688,7 +771,7 @@ impl SwmrWriter {
                     chunk[s * tile_bytes..(s + 1) * tile_bytes].copy_from_slice(&frame_tiles[cell]);
                 }
                 let linear = band * cells as u64 + cell as u64;
-                self.writer.write_chunk(ds_index, linear, &chunk)?;
+                Self::write_stream_chunk(&self.writer, ds_index, linear, &chunk, None)?;
             }
         }
         bb.frames.drain(..complete * n);
@@ -890,13 +973,16 @@ fn split_frame_into_tiles(
     elem_size: usize,
 ) -> Vec<Vec<u8>> {
     let k = frame_dims.len();
+    // A scalar frame has no last axis to run along: it is its own one tile.
+    let Some(last) = k.checked_sub(1) else {
+        return vec![frame.to_vec()];
+    };
     let grid: Vec<u64> = (0..k)
         .map(|d| frame_dims[d].div_ceil(tile_dims[d].max(1)))
         .collect();
     let n_tiles: u64 = grid.iter().product();
     let tile_elems: u64 = tile_dims.iter().product();
     // Number of "rows" within a tile: every axis but the last.
-    let last = k - 1;
     let tile_rows: u64 = tile_dims[..last].iter().product();
     let run = tile_dims[last] as usize; // contiguous run length along the last axis
 
@@ -1053,6 +1139,71 @@ mod swmr_hardlink_tests {
         }
         let mut r = Hdf5Reader::open(&path).unwrap();
         assert_eq!(r.read_dataset_raw("frames").unwrap(), frames(6));
+    }
+
+    /// Rank-0 frames, one scalar per append, on the band path (`chunk[0] >
+    /// 1`) and the one-frame-per-chunk path, through a flush with a band
+    /// still filling and a close with another.
+    #[test]
+    fn rank0_frames_append_and_read_back() {
+        let dir = TmpDir::new("rank0");
+        let path = dir.file();
+        let values = [1.5f64, 2.5, 3.5, 4.5, 5.5];
+        let bytes =
+            |n: usize| -> Vec<u8> { values[..n].iter().flat_map(|v| v.to_le_bytes()).collect() };
+        {
+            let mut w = SwmrWriter::create(&path).unwrap();
+            let banded = w
+                .create_streaming_dataset_chunked("banded", DatatypeMessage::f64_type(), &[], &[2])
+                .unwrap();
+            let single = w
+                .create_streaming_dataset_chunked("single", DatatypeMessage::f64_type(), &[], &[1])
+                .unwrap();
+            w.start_swmr().unwrap();
+            for v in &values[..3] {
+                w.append_frame(banded, &v.to_le_bytes()).unwrap();
+                w.append_frame(single, &v.to_le_bytes()).unwrap();
+            }
+            w.flush().unwrap();
+            let mut r = Hdf5Reader::open_swmr_with_locking(
+                &path,
+                crate::io::locking::FileLocking::Disabled,
+            )
+            .unwrap();
+            assert_eq!(r.dataset_shape("banded").unwrap(), vec![3]);
+            assert_eq!(r.read_dataset_raw("banded").unwrap(), bytes(3));
+            assert_eq!(r.read_dataset_raw("single").unwrap(), bytes(3));
+
+            for v in &values[3..] {
+                w.append_frame(banded, &v.to_le_bytes()).unwrap();
+                w.append_frame(single, &v.to_le_bytes()).unwrap();
+            }
+            w.close().unwrap();
+        }
+        let mut r = Hdf5Reader::open(&path).unwrap();
+        for name in ["banded", "single"] {
+            assert_eq!(r.dataset_shape(name).unwrap(), vec![5]);
+            assert_eq!(r.read_dataset_raw(name).unwrap(), bytes(5));
+        }
+    }
+
+    /// `append_frame` on a contiguous scalar dataset is refused, not a
+    /// panic on its missing frame axis.
+    #[test]
+    fn append_frame_refuses_a_contiguous_scalar_dataset() {
+        let dir = TmpDir::new("scalar");
+        let mut w = SwmrWriter::create(&dir.file()).unwrap();
+        let idx = w
+            .writer_mut()
+            .create_dataset("s", DatatypeMessage::u8_type(), &[])
+            .unwrap();
+        let err = w.append_frame(idx, &[1u8]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("append_frame requires a chunked dataset"),
+            "unexpected error: {err}"
+        );
+        w.close().unwrap();
     }
 
     /// A dataset deleted with frames buffered takes its band buffer with it:

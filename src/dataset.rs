@@ -2660,6 +2660,35 @@ impl H5Dataset {
         AttrBuilder::new(&self.file_inner, ds_index)
     }
 
+    /// Add a scalar attribute to this dataset whose datatype and raw value the
+    /// caller supplies — the dataset form of
+    /// [`H5File::set_attr_typed`](crate::H5File::set_attr_typed), for a type
+    /// [`new_attr`](Self::new_attr) has no Rust carrier for, such as a
+    /// fixed-length string sized by `H5Tset_size`.
+    pub fn set_attr_typed(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let attr = crate::attribute::typed_scalar_attr(name, datatype, value)?;
+        let DatasetInfo::Writer { index, .. } = &self.info else {
+            return Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            ));
+        };
+        match &*borrow_inner(&self.file_inner) {
+            H5FileInner::Writer(writer) => {
+                writer.add_dataset_attribute(*index, attr)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Write a typed slice holding the dataset's whole image.
     ///
     /// The slice length must match the total number of elements declared by

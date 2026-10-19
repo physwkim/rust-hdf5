@@ -480,15 +480,7 @@ impl H5File {
         datatype: DatatypeMessage,
         value: Vec<u8>,
     ) -> Result<()> {
-        use crate::format::messages::attribute::AttributeMessage;
-        if value.len() as u64 != u64::from(datatype.element_size()) {
-            return Err(Hdf5Error::InvalidState(format!(
-                "attribute '{name}' was given {} bytes for a datatype whose element is {}",
-                value.len(),
-                datatype.element_size()
-            )));
-        }
-        let attr = AttributeMessage::scalar_numeric(name, datatype, value);
+        let attr = crate::attribute::typed_scalar_attr(name, datatype, value)?;
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
