@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.5
+
+### Changed
+
+- The `bzip2` filter uses `bzip2` 0.6, whose default backend is the
+  pure-Rust `libbz2-rs-sys`, so no feature set compiles C any more.
+  Compressed bytes are unchanged: they match C libbz2 1.0.8 at every
+  level.
+
 ## 0.7.4
 
 ### Added
