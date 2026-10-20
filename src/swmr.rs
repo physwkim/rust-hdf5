@@ -860,6 +860,22 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Write a hyperslab (`starts`, `counts`, in elements) of a grid dataset
+    /// inside its extent. A chunk the selection covers only in part keeps
+    /// its other elements, or their fill if it was never written, so frames
+    /// sharing a chunk may arrive in any order. `data` is `product(counts) *
+    /// element_size` bytes. Call [`flush`](Self::flush) to make it visible.
+    pub fn write_slice(
+        &mut self,
+        ds_index: usize,
+        starts: &[u64],
+        counts: &[u64],
+        data: &[u8],
+    ) -> Result<()> {
+        self.inner.write_slice(ds_index, starts, counts, data)?;
+        Ok(())
+    }
+
     /// Set a dataset's logical extent within its maximum shape, growing or
     /// shrinking it — libhdf5's `H5Dset_extent`, e.g. a grid's extent
     /// following the positions written so far. A multi-frame-chunk stream,

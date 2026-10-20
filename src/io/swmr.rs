@@ -630,6 +630,25 @@ impl SwmrWriter {
             .write_chunk_at_coords_inner(ds_index, chunk_coords, bytes)
     }
 
+    /// Write a hyperslab of a chunked dataset inside its extent, patching
+    /// the chunks it shares with earlier writes, as libhdf5's `H5Dwrite` of
+    /// a hyperslab does under SWMR. A multi-frame-chunk stream is refused:
+    /// its band buffer owns the chunks of its frame axis.
+    pub fn write_slice(
+        &mut self,
+        ds_index: usize,
+        starts: &[u64],
+        counts: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
+        if self.band_buffers.contains_key(&ds_index) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset {ds_index} buffers multi-frame chunk bands, which own its chunks"
+            )));
+        }
+        self.writer.write_slice(ds_index, starts, counts, data)
+    }
+
     /// Set a dataset's logical extent, growing or shrinking it within its
     /// maximum shape: libhdf5's `H5Dset_extent`, as
     /// [`Hdf5Writer::set_dataset_extent`] does it.

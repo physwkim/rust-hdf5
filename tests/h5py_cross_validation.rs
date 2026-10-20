@@ -6158,6 +6158,73 @@ assert mask == 1 and len(raw) == 12, (mask, len(raw))
     std::fs::remove_file(&path).ok();
 }
 
+/// `SwmrFileWriter::write_slice` patches a selection into the chunks it
+/// shares with earlier writes, in any order and across flushes, on a fixed
+/// array, an extensible array, a v2 B-tree and a compressed grid
+/// (libhdf5's `H5Dwrite` of a hyperslab under SWMR).
+#[test]
+#[cfg(feature = "deflate")]
+fn swmr_write_slice_patches_shared_chunks_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_write_slice");
+    let u16t = DatatypeMessage::FixedPoint {
+        size: 2,
+        byte_order: ByteOrder::LittleEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 16,
+    };
+    let row = |s: u16| -> Vec<u8> { (0..3u16).flat_map(|i| (i + s).to_le_bytes()).collect() };
+    let expect = "[[0, 1, 2], [0, 0, 0], [20, 21, 22], [10, 11, 12]]";
+    let check = format!(
+        "\
+for n in ('fa', 'ea', 'bt2', 'z'):
+    d = f[n]
+    assert d.chunks == (2, 3), (n, d.chunks)
+    assert d[:].tolist() == {expect}, (n, d[:])
+assert f['fa'].maxshape == (4, 3) and f['ea'].maxshape == (None, 3), (f['fa'].maxshape, f['ea'].maxshape)
+assert f['bt2'].maxshape == (None, None) and f['z'].compression == 'gzip'
+"
+    );
+    let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+    let mut grid = |name: &str, max: &[Option<u64>], pipeline| {
+        w.create_grid_dataset_with_max(name, u16t.clone(), &[1, 3], max, &[2, 3], pipeline)
+            .unwrap()
+    };
+    let fa = grid("fa", &[Some(4), Some(3)], None);
+    let ea = grid("ea", &[None, Some(3)], None);
+    let bt2 = grid("bt2", &[None, None], None);
+    let z = grid(
+        "z",
+        &[None, None],
+        Some(rust_hdf5::FilterPipeline::deflate(4)),
+    );
+    w.start_swmr().unwrap();
+    let all = [fa, ea, bt2, z];
+    for ds in all {
+        w.set_extent(ds, &[4, 3]).unwrap();
+        w.write_slice(ds, &[3, 0], &[1, 3], &row(10)).unwrap();
+        w.write_slice(ds, &[0, 0], &[1, 3], &row(0)).unwrap();
+    }
+    w.flush().unwrap();
+    for ds in all {
+        w.write_slice(ds, &[2, 0], &[1, 3], &row(20)).unwrap();
+    }
+    w.flush().unwrap();
+    let live = std::process::Command::new(py)
+        .arg("-c")
+        .arg(format!(
+            "import h5py\nf = h5py.File(r'{}', 'r', swmr=True)\n{check}",
+            path.display()
+        ))
+        .status()
+        .expect("failed to spawn python");
+    assert!(live.success(), "live SWMR read failed");
+    w.close().unwrap();
+    read_back_with_h5py(py, &path, &check);
+    std::fs::remove_file(&path).ok();
+}
+
 /// A contiguous dataset created before `start_swmr` takes its bytes after
 /// it, as libhdf5's `H5Dwrite` does under SWMR (NDFileHDF5's rank-0
 /// attribute dataset in a Single file); one never written reads its fill.
