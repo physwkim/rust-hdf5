@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.8
+
+### Added
+
+- `SwmrFileWriter::create_grid_dataset_with_max` makes a grid with
+  unlimited axes, indexed by an extensible array (one unlimited axis) or
+  a v2 B-tree (more) as libhdf5 picks them; `write_chunk_at`,
+  `write_chunk_raw_at` and `set_extent` work on it as on a fixed grid.
+- `SwmrFileWriter::create_dataset_typed` and `write_dataset_raw` create
+  a contiguous dataset before `start_swmr` and write its bytes later.
+
 ## 0.7.7
 
 ### Added
