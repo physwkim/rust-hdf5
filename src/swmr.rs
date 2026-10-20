@@ -379,6 +379,28 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// [`Self::create_grid_dataset_with_datatype`] at extent `dims` within
+    /// `max_dims` (`None`: unlimited), filtered through `pipeline` when one
+    /// is given. One unlimited dimension takes an extensible-array chunk
+    /// index and more take a v2 B-tree, as libhdf5 picks them; positions are
+    /// written with [`write_chunk_at`](Self::write_chunk_at) as on a fixed
+    /// grid, and [`set_extent`](Self::set_extent) moves the extent.
+    pub fn create_grid_dataset_with_max(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        dims: &[u64],
+        max_dims: &[Option<u64>],
+        chunk: &[u64],
+        pipeline: Option<crate::format::messages::filter::FilterPipeline>,
+    ) -> Result<usize> {
+        let max: Vec<u64> = max_dims.iter().map(|m| m.unwrap_or(u64::MAX)).collect();
+        let idx = self
+            .inner
+            .create_grid_dataset_with_max(name, datatype, dims, &max, chunk, pipeline)?;
+        Ok(idx)
+    }
+
     /// Create a hard link: an additional name for a dataset or group that
     /// already exists in the file.
     ///
@@ -771,8 +793,9 @@ impl SwmrFileWriter {
     }
 
     /// Write one already-filtered chunk verbatim at an explicit chunk
-    /// position of a grid dataset made by
+    /// position of a filtered grid dataset made by
     /// [`create_grid_dataset_compressed`](Self::create_grid_dataset_compressed)
+    /// or [`create_grid_dataset_with_max`](Self::create_grid_dataset_with_max)
     /// — HDF5's direct chunk write (`H5Dwrite_chunk`) at a chunk offset.
     /// `filter_mask` bit *i* set means filter *i* was not applied to this
     /// chunk; pass 0 when the whole pipeline was.
@@ -789,7 +812,8 @@ impl SwmrFileWriter {
     }
 
     /// Write one frame at an explicit chunk position of a grid dataset
-    /// created with [`create_grid_dataset`](Self::create_grid_dataset).
+    /// created with [`create_grid_dataset`](Self::create_grid_dataset) or
+    /// [`create_grid_dataset_with_max`](Self::create_grid_dataset_with_max).
     ///
     /// `chunk_coords` are in units of chunks (row-major over the chunk grid)
     /// and `data` must be exactly one full chunk (`product(chunk) *

@@ -1204,6 +1204,20 @@ pub enum AttrTarget<'a> {
     Dataset(usize),
 }
 
+/// One chunk's bytes on the way to the file, and who filtered them.
+///
+/// This is what separates a normal chunk write from a direct one; everything
+/// else about placing a chunk is identical, so the two share a single dispatch.
+#[derive(Clone, Copy)]
+pub(crate) enum ChunkBytes<'a> {
+    /// The chunk's raw bytes; the dataset's filter pipeline runs before they
+    /// are stored.
+    Unfiltered(&'a [u8]),
+    /// Bytes already in their stored form, with `filter_mask` naming the
+    /// filters that were skipped.
+    Prefiltered { data: &'a [u8], filter_mask: u32 },
+}
+
 /// Which chunk index a dataset uses.
 ///
 /// The five above the line are what `H5D__layout_set_latest_indexing`
@@ -14374,6 +14388,88 @@ impl Hdf5Writer {
         })
     }
 
+    /// Record one chunk at chunk-grid `coords` through whichever index the
+    /// dataset has. The extent is the caller's to move; the caller holds the
+    /// dataset's op lock or the writer exclusively.
+    pub(crate) fn write_chunk_at_coords_inner(
+        &self,
+        index: usize,
+        coords: &[u64],
+        bytes: ChunkBytes<'_>,
+    ) -> IoResult<()> {
+        let chunk_rank = self
+            .dataset_chunk_dims(index)
+            .ok_or_else(|| crate::io::IoError::InvalidState("dataset is not chunked".into()))?
+            .len();
+        let (kind, rank) = {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            (m.chunk_index_kind(), m.dataspace.dims.len())
+        };
+        let kind = kind.expect("a dataset with chunk dims has a chunk index");
+        if coords.len() != rank {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk_coords has {} entries but the dataset has {rank} dimensions",
+                coords.len()
+            )));
+        }
+        if chunk_rank != rank {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset chunk shape has {chunk_rank} dimensions but the dataspace has {rank}"
+            )));
+        }
+        use ChunkBytes::{Prefiltered, Unfiltered};
+        match (kind, bytes) {
+            (ChunkIndexKind::FixedArray, Unfiltered(data)) => {
+                self.write_chunk_fixed_array_inner(index, coords, data)
+            }
+            (ChunkIndexKind::FixedArray, Prefiltered { data, filter_mask }) => {
+                self.write_compressed_chunk_fixed_array_inner(index, coords, data, filter_mask)
+            }
+            (ChunkIndexKind::Implicit, Unfiltered(data)) => {
+                self.write_chunk_implicit_inner(index, coords, data)
+            }
+            (ChunkIndexKind::Implicit, Prefiltered { .. }) => {
+                Err(crate::io::IoError::InvalidState(
+                    "this dataset uses the implicit chunk index, which stores \
+                     every chunk at its full unfiltered size and has nowhere \
+                     to record a stored size or a filter mask"
+                        .into(),
+                ))
+            }
+            (ChunkIndexKind::SingleChunk, Unfiltered(data)) => {
+                self.write_chunk_single_chunk_inner(index, coords, data)
+            }
+            (ChunkIndexKind::SingleChunk, Prefiltered { data, filter_mask }) => {
+                self.write_compressed_chunk_single_chunk_inner(index, coords, data, filter_mask)
+            }
+            (ChunkIndexKind::BtreeV2, Unfiltered(data)) => {
+                self.write_chunk_btree_v2_inner(index, coords, data)
+            }
+            (ChunkIndexKind::BtreeV2, Prefiltered { data, filter_mask }) => {
+                self.write_compressed_chunk_btree_v2_inner(index, coords, data, filter_mask)
+            }
+            (ChunkIndexKind::BtreeV1, Unfiltered(data)) => {
+                self.write_chunk_btree_v1_inner(index, coords, data)
+            }
+            (ChunkIndexKind::BtreeV1, Prefiltered { data, filter_mask }) => {
+                self.write_compressed_chunk_btree_v1_inner(index, coords, data, filter_mask)
+            }
+            // Extensible array: the chunk's index-grid slot (row-major
+            // against the maximum extent).
+            (ChunkIndexKind::ExtensibleArray, Unfiltered(data)) => {
+                self.write_chunk_inner(index, self.chunk_slot(index, coords)?, data)
+            }
+            (ChunkIndexKind::ExtensibleArray, Prefiltered { data, filter_mask }) => self
+                .write_compressed_chunk_inner(
+                    index,
+                    self.chunk_slot(index, coords)?,
+                    data,
+                    filter_mask,
+                ),
+        }
+    }
+
     /// Index-grid slot of the chunk at grid `coords` (see
     /// [`crate::io::chunk_grid`]).
     pub(crate) fn chunk_slot(&self, ds_index: usize, coords: &[u64]) -> IoResult<u64> {
@@ -14398,7 +14494,9 @@ impl Hdf5Writer {
 
     /// Define a chunked dataset indexed by a fixed array, fixed at its
     /// current shape (`max_dims == dims`). `chunk_dims` defines the chunk
-    /// shape. Returns the dataset index.
+    /// shape. Returns the dataset index. A white-box test entry point; the
+    /// SWMR writer goes through [`Self::create_fixed_array_dataset_with_max`].
+    #[cfg(test)]
     pub fn create_fixed_array_dataset(
         &self,
         name: &str,
@@ -15228,7 +15326,10 @@ impl Hdf5Writer {
     ///
     /// `chunk_coords` is the multidimensional chunk index (e.g., [row_chunk, col_chunk]).
     /// The uncompressed `data` must be exactly one chunk wide; the filter
-    /// pipeline (if any) runs here before the bytes reach the index.
+    /// pipeline (if any) runs here before the bytes reach the index. A
+    /// white-box test entry point; production writes go through
+    /// [`Self::write_chunk_at_coords_inner`].
+    #[cfg(test)]
     pub fn write_chunk_fixed_array(
         &self,
         index: usize,

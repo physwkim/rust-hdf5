@@ -20,7 +20,7 @@ use crate::format::selection::Selection;
 use crate::format::storage_kind::AttributeStorage;
 use crate::io::file_handle::ReadDst;
 use crate::io::reader::{read_image_into_new, ExternalFileSegment};
-use crate::io::writer::ChunkIndexKind;
+use crate::io::writer::{ChunkBytes, ChunkIndexKind};
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -1454,20 +1454,6 @@ impl Drop for H5Dataset {
             reader.release_closed_virtual_sources();
         }
     }
-}
-
-/// One chunk's bytes on the way to the file, and who filtered them.
-///
-/// This is what separates a normal chunk write from a direct one; everything
-/// else about placing a chunk is identical, so the two share a single dispatch.
-#[derive(Clone, Copy)]
-enum ChunkBytes<'a> {
-    /// The chunk's raw bytes; the dataset's filter pipeline runs before they
-    /// are stored.
-    Unfiltered(&'a [u8]),
-    /// Bytes already in their stored form, with `filter_mask` naming the
-    /// filters that were skipped.
-    Prefiltered { data: &'a [u8], filter_mask: u32 },
 }
 
 /// The byte order this build reads and writes natively.
@@ -3367,11 +3353,11 @@ impl H5Dataset {
         )
     }
 
-    /// The single owner of coordinate-addressed chunk writes: validates the
-    /// coordinates, grows the dataspace to cover them, and routes the bytes to
-    /// whichever chunk index the dataset uses. Whether the filter pipeline runs
-    /// here or already ran upstream is carried by `bytes`, not by a second copy
-    /// of this dispatch.
+    /// Coordinate-addressed chunk write: grows the dataspace to cover the
+    /// chunk and hands the bytes to `Hdf5Writer::write_chunk_at_coords_inner`,
+    /// the one dispatch over chunk indexes that the SWMR writer shares.
+    /// Whether the filter pipeline runs there or already ran upstream is
+    /// carried by `bytes`.
     fn write_chunk_at_inner(
         &self,
         chunk_coords: &[usize],
@@ -3402,151 +3388,49 @@ impl H5Dataset {
                 // same-dataset operation.
                 let cell = writer.ds(*index);
                 let _op = cell.op.lock();
-                let chunk_dims = writer
-                    .dataset_chunk_dims(*index)
-                    .ok_or_else(|| Hdf5Error::InvalidState("dataset has no chunk info".into()))?
-                    .to_vec();
                 let dims = writer.dataset_dims(*index).to_vec();
-                if coords.len() != dims.len() {
-                    return Err(Hdf5Error::InvalidState(format!(
-                        "chunk_coords has {} entries but the dataset has {} dimensions",
-                        coords.len(),
-                        dims.len()
-                    )));
-                }
-                if chunk_dims.len() != dims.len() {
-                    return Err(Hdf5Error::InvalidState(format!(
-                        "dataset chunk shape has {} dimensions but the dataspace has {}",
-                        chunk_dims.len(),
-                        dims.len()
-                    )));
-                }
-
-                if kind == ChunkIndexKind::FixedArray {
-                    // Fixed-array (fixed-shape) dataset: no dimension growth.
-                    match bytes {
-                        ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_fixed_array_inner(*index, &coords, data)?
-                        }
-                        ChunkBytes::Prefiltered { data, filter_mask } => writer
-                            .write_compressed_chunk_fixed_array_inner(
-                                *index,
-                                &coords,
-                                data,
-                                filter_mask,
-                            )?,
-                    }
-                    return Ok(());
-                }
-
-                if kind == ChunkIndexKind::Implicit {
-                    // Implicit index: fixed shape, so no dimension growth
-                    // either, and no slot to record a stored size in.
-                    match bytes {
-                        ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_implicit_inner(*index, &coords, data)?
-                        }
-                        ChunkBytes::Prefiltered { .. } => {
-                            return Err(Hdf5Error::InvalidState(
-                                "this dataset uses the implicit chunk index, which stores \
-                                 every chunk at its full unfiltered size and has nowhere \
-                                 to record a stored size or a filter mask"
-                                    .into(),
-                            ))
-                        }
-                    }
-                    return Ok(());
-                }
-
-                if kind == ChunkIndexKind::SingleChunk {
-                    // Single-chunk index: fixed shape covered by exactly one
-                    // chunk, so no dimension growth either.
-                    match bytes {
-                        ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_single_chunk_inner(*index, &coords, data)?
-                        }
-                        ChunkBytes::Prefiltered { data, filter_mask } => writer
-                            .write_compressed_chunk_single_chunk_inner(
-                                *index,
-                                &coords,
-                                data,
-                                filter_mask,
-                            )?,
-                    }
-                    return Ok(());
-                }
-
-                // The remaining indexes (v2 B-tree, v1 B-tree, extensible
-                // array) can all grow: validate the coordinates and compute
-                // the grown dimensions up-front, before any chunk is
-                // written, so an overflowing coordinate cannot leave an
-                // orphaned chunk in the file.
+                // Only the indexes that can grow (v2 B-tree, v1 B-tree,
+                // extensible array) move the extent with the chunk: compute
+                // the grown dimensions up-front, before any chunk is written,
+                // so an overflowing coordinate cannot leave an orphaned chunk
+                // in the file. The writer refuses a coordinate list of the
+                // wrong rank before it writes anything.
                 //
                 // The last chunk of a dimension usually hangs past the extent
                 // — a length of 10 in chunks of 4 ends at 12 — so the growth
                 // is capped at the declared maximum, which is what the chunk
                 // still covers. Without the cap a legal edge chunk would be
                 // written and then rejected by the extend below.
-                let max_dims = writer.dataset_max_dims(*index);
                 let mut new_dims = dims.clone();
-                for d in 0..dims.len() {
-                    let needed = coords[d]
-                        .checked_add(1)
-                        .and_then(|c| c.checked_mul(chunk_dims[d]))
-                        .ok_or_else(|| {
-                            Hdf5Error::InvalidState(format!(
-                                "chunk coordinate {} in dimension {} is too large",
-                                coords[d], d
-                            ))
-                        })?;
-                    let needed = needed.min(max_dims[d]);
-                    if needed > new_dims[d] {
-                        new_dims[d] = needed;
+                if !matches!(
+                    kind,
+                    ChunkIndexKind::FixedArray
+                        | ChunkIndexKind::Implicit
+                        | ChunkIndexKind::SingleChunk
+                ) {
+                    let chunk_dims = writer.dataset_chunk_dims(*index).ok_or_else(|| {
+                        Hdf5Error::InvalidState("dataset has no chunk info".into())
+                    })?;
+                    let max_dims = writer.dataset_max_dims(*index);
+                    for (d, new) in new_dims.iter_mut().enumerate() {
+                        let (Some(&c), Some(&cd), Some(&max)) =
+                            (coords.get(d), chunk_dims.get(d), max_dims.get(d))
+                        else {
+                            break;
+                        };
+                        let needed = c
+                            .checked_add(1)
+                            .and_then(|c| c.checked_mul(cd))
+                            .ok_or_else(|| {
+                                Hdf5Error::InvalidState(format!(
+                                    "chunk coordinate {c} in dimension {d} is too large"
+                                ))
+                            })?
+                            .min(max);
+                        *new = (*new).max(needed);
                     }
                 }
-
-                if kind == ChunkIndexKind::BtreeV2 {
-                    match bytes {
-                        ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_btree_v2_inner(*index, &coords, data)?
-                        }
-                        ChunkBytes::Prefiltered { data, filter_mask } => writer
-                            .write_compressed_chunk_btree_v2_inner(
-                                *index,
-                                &coords,
-                                data,
-                                filter_mask,
-                            )?,
-                    }
-                } else if kind == ChunkIndexKind::BtreeV1 {
-                    // The classic index takes any shape, fixed or unlimited,
-                    // so it grows the dataspace with the chunk the way the v2
-                    // B-tree does — bounded below by the maximum extent.
-                    match bytes {
-                        ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_btree_v1_inner(*index, &coords, data)?
-                        }
-                        ChunkBytes::Prefiltered { data, filter_mask } => writer
-                            .write_compressed_chunk_btree_v1_inner(
-                                *index,
-                                &coords,
-                                data,
-                                filter_mask,
-                            )?,
-                    }
-                } else {
-                    // Extensible array: the chunk's index-grid slot (row-major
-                    // against the maximum extent).
-                    let linear = writer.chunk_slot(*index, &coords)?;
-                    match bytes {
-                        ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_inner(*index, linear, data)?
-                        }
-                        ChunkBytes::Prefiltered { data, filter_mask } => writer
-                            .write_compressed_chunk_inner(*index, linear, data, filter_mask)?,
-                    }
-                }
-
+                writer.write_chunk_at_coords_inner(*index, &coords, bytes)?;
                 if new_dims != dims {
                     writer.extend_dataset_inner(*index, &new_dims)?;
                 }

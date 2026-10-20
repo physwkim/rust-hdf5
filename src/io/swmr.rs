@@ -12,7 +12,7 @@ use std::path::Path;
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::superblock::{FLAG_SWMR_WRITE, FLAG_WRITE_ACCESS};
 
-use crate::io::writer::Hdf5Writer;
+use crate::io::writer::{ChunkBytes, Hdf5Writer};
 use crate::io::IoResult;
 
 /// Per-dataset accumulation state for a streaming dataset whose chunks span
@@ -373,7 +373,7 @@ impl SwmrWriter {
         dims: &[u64],
         chunk: &[u64],
     ) -> IoResult<usize> {
-        self.create_grid_dataset_inner(name, datatype, dims, chunk, None)
+        self.create_grid_dataset_with_max(name, datatype, dims, dims, chunk, None)
     }
 
     /// Compressed variant of [`create_grid_dataset`](Self::create_grid_dataset);
@@ -386,14 +386,21 @@ impl SwmrWriter {
         chunk: &[u64],
         pipeline: crate::format::messages::filter::FilterPipeline,
     ) -> IoResult<usize> {
-        self.create_grid_dataset_inner(name, datatype, dims, chunk, Some(pipeline))
+        self.create_grid_dataset_with_max(name, datatype, dims, dims, chunk, Some(pipeline))
     }
 
-    fn create_grid_dataset_inner(
+    /// [`create_grid_dataset`](Self::create_grid_dataset) at extent `dims`
+    /// within `max_dims` (`u64::MAX`: unlimited), filtered through
+    /// `pipeline` when one is given. The chunk index is the one libhdf5
+    /// picks for that maximum (`H5D__layout_set_latest_indexing`): a fixed
+    /// array when nothing is unlimited, an extensible array for one
+    /// unlimited dimension, a v2 B-tree for more.
+    pub fn create_grid_dataset_with_max(
         &mut self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
+        max_dims: &[u64],
         chunk: &[u64],
         pipeline: Option<crate::format::messages::filter::FilterPipeline>,
     ) -> IoResult<usize> {
@@ -402,24 +409,28 @@ impl SwmrWriter {
                 "create_grid_dataset requires at least one dimension".into(),
             ));
         }
-        if dims.contains(&0) {
+        if max_dims.len() != dims.len() || max_dims.contains(&0) {
             return Err(crate::io::IoError::InvalidState(
-                "grid dataset dims must be non-zero".into(),
+                "grid dataset max dims must be non-zero, one per dimension".into(),
             ));
         }
-        // Fixed array index (rank/chunk validation happens inside).
-        match pipeline {
-            Some(p) => self.writer.create_fixed_array_dataset_with_max(
-                name,
-                datatype,
-                dims,
-                dims,
-                chunk,
-                Some(p),
-            ),
-            None => self
-                .writer
-                .create_fixed_array_dataset(name, datatype, dims, chunk),
+        // Rank, chunk and dims-within-max validation happen inside.
+        let w = &self.writer;
+        match (
+            max_dims.iter().filter(|&&m| m == u64::MAX).count(),
+            pipeline,
+        ) {
+            (0, p) => {
+                w.create_fixed_array_dataset_with_max(name, datatype, dims, max_dims, chunk, p)
+            }
+            (1, Some(p)) => {
+                w.create_chunked_dataset_with_pipeline(name, datatype, dims, max_dims, chunk, p)
+            }
+            (1, None) => w.create_chunked_dataset(name, datatype, dims, max_dims, chunk),
+            (_, Some(p)) => {
+                w.create_btree_v2_dataset_with_pipeline(name, datatype, dims, max_dims, chunk, p)
+            }
+            (_, None) => w.create_btree_v2_dataset(name, datatype, dims, max_dims, chunk),
         }
     }
 
@@ -574,43 +585,49 @@ impl SwmrWriter {
         data: &[u8],
         filter_mask: u32,
     ) -> IoResult<()> {
-        let ds = self.writer.ds(ds_index);
-        let _op = ds.op.lock();
-        if ds.lock().fixed_array.is_none() {
-            return Err(crate::io::IoError::InvalidState(
-                "write_chunk_raw_at requires a fixed grid dataset (create_grid_dataset)".into(),
-            ));
-        }
-        self.writer.write_compressed_chunk_fixed_array_inner(
+        self.write_chunk_at_coords(
             ds_index,
             chunk_coords,
-            data,
-            filter_mask,
+            ChunkBytes::Prefiltered { data, filter_mask },
         )
     }
 
-    /// Write one chunk at explicit chunk-grid coordinates of a fixed grid
-    /// dataset (see [`create_grid_dataset`](Self::create_grid_dataset)).
+    /// Write one chunk at explicit chunk-grid coordinates of a grid dataset
+    /// (see [`create_grid_dataset_with_max`](Self::create_grid_dataset_with_max)).
     ///
     /// `chunk_coords` are in units of chunks; `data` must be exactly one full
     /// chunk (`product(chunk) * element_size` bytes — edge chunks are
     /// zero-padded by the caller). Positions may be written in any order,
     /// beyond the extent too while inside the maximum shape, and unwritten
-    /// positions read back as fill. Make writes visible to SWMR readers with
-    /// [`flush`](Self::flush).
+    /// positions read back as fill; the extent moves only with
+    /// [`set_extent`](Self::set_extent). Make writes visible to SWMR readers
+    /// with [`flush`](Self::flush).
     pub fn write_chunk_at(
         &mut self,
         ds_index: usize,
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
-        if self.writer.ds(ds_index).lock().fixed_array.is_none() {
-            return Err(crate::io::IoError::InvalidState(
-                "write_chunk_at requires a fixed grid dataset (create_grid_dataset)".into(),
-            ));
+        self.write_chunk_at_coords(ds_index, chunk_coords, ChunkBytes::Unfiltered(data))
+    }
+
+    /// A multi-frame-chunk stream is refused: its band buffer owns the
+    /// chunks of its frame axis.
+    fn write_chunk_at_coords(
+        &mut self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        bytes: ChunkBytes<'_>,
+    ) -> IoResult<()> {
+        if self.band_buffers.contains_key(&ds_index) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset {ds_index} buffers multi-frame chunk bands, which own its chunks"
+            )));
         }
+        let ds = self.writer.ds(ds_index);
+        let _op = ds.op.lock();
         self.writer
-            .write_chunk_fixed_array(ds_index, chunk_coords, data)
+            .write_chunk_at_coords_inner(ds_index, chunk_coords, bytes)
     }
 
     /// Set a dataset's logical extent, growing or shrinking it within its
