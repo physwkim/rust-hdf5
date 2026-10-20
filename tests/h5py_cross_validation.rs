@@ -6220,6 +6220,45 @@ fn swmr_typed_fixed_string_attributes_equal_libhdf5_c_s1() {
     std::fs::remove_file(&path).ok();
 }
 
+/// `write_dataset_typed` writes NDFileHDF5's writeH5dsetStr constant under
+/// SWMR: a C_S1 sized to the value plus its terminator, NULLTERM, in a 1-D
+/// space of one. A byte count that is not the shape's is refused.
+#[test]
+fn swmr_typed_dataset_writes_a_c_s1_constant() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::FileLocking;
+
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_typed_dset");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        w.create_group("/", "entry").unwrap();
+        let (dt, v) = c_s1_nullterm("MyBeamline");
+        w.write_dataset_typed("entry/name", dt.clone(), &[1], &v)
+            .unwrap();
+        assert!(w.write_dataset_typed("entry/bad", dt, &[2], &v).is_err());
+        let ds = w
+            .create_streaming_dataset::<u8>("entry/frames", &[2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(ds, &[1, 2]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "from h5py import h5t\n\
+         tid = h5t.C_S1.copy()\n\
+         tid.set_size(11)\n\
+         tid.set_strpad(h5t.STR_NULLTERM)\n\
+         d = f['entry/name']\n\
+         assert d.id.get_type() == tid\n\
+         assert d.shape == (1,) and d[0] == b'MyBeamline', d[:]\n\
+         assert 'bad' not in f['entry']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A typed value that is not exactly one element of its datatype is refused
 /// by every typed setter, before anything is written.
 #[test]

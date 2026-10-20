@@ -552,6 +552,34 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// [`write_dataset`](Self::write_dataset) with a caller-supplied datatype
+    /// and the raw element bytes, `dims` product times the type's size — for
+    /// NDFileHDF5's NUL-terminated fixed-length string constants, where
+    /// [`write_string_dataset`](Self::write_string_dataset) writes a
+    /// variable-length one. A byte count that does not match is refused
+    /// before the dataset is created.
+    pub fn write_dataset_typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        data: &[u8],
+    ) -> Result<usize> {
+        let expected = dims.iter().product::<u64>() * datatype.element_size() as u64;
+        if data.len() as u64 != expected {
+            return Err(Hdf5Error::InvalidState(format!(
+                "write_dataset_typed: data has {} bytes but shape {dims:?} needs {expected}",
+                data.len()
+            )));
+        }
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_dataset(name, datatype, dims)?;
+        self.inner.writer_mut().write_dataset_raw(idx, data)?;
+        Ok(idx)
+    }
+
     /// Create a variable-length string dataset (one element per string).
     /// Returns the dataset index. Useful for NeXus metadata such as
     /// `/entry/start_time` or per-frame timestamp arrays.
