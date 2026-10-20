@@ -602,6 +602,33 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Create a contiguous dataset of `datatype` and shape `dims` (`&[]`:
+    /// scalar) whose bytes [`write_dataset_raw`](Self::write_dataset_raw)
+    /// supplies later, after [`start_swmr`](Self::start_swmr) too, as
+    /// libhdf5's `H5Dwrite` does under SWMR; until then it reads its fill
+    /// value. Create it before `start_swmr`.
+    pub fn create_dataset_typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+    ) -> Result<usize> {
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_dataset(name, datatype, dims)?;
+        Ok(idx)
+    }
+
+    /// Overwrite every byte of a contiguous dataset made by
+    /// [`create_dataset_typed`](Self::create_dataset_typed), before or after
+    /// [`start_swmr`](Self::start_swmr): raw data only, so SWMR readers see
+    /// it after the next [`flush`](Self::flush).
+    pub fn write_dataset_raw(&mut self, ds_index: usize, data: &[u8]) -> Result<()> {
+        self.inner.writer_mut().write_dataset_raw(ds_index, data)?;
+        Ok(())
+    }
+
     /// Create a variable-length string dataset (one element per string).
     /// Returns the dataset index. Useful for NeXus metadata such as
     /// `/entry/start_time` or per-frame timestamp arrays.

@@ -6158,6 +6158,41 @@ assert mask == 1 and len(raw) == 12, (mask, len(raw))
     std::fs::remove_file(&path).ok();
 }
 
+/// A contiguous dataset created before `start_swmr` takes its bytes after
+/// it, as libhdf5's `H5Dwrite` does under SWMR (NDFileHDF5's rank-0
+/// attribute dataset in a Single file); one never written reads its fill.
+#[test]
+fn swmr_contiguous_dataset_written_after_start_reads_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_contiguous_after_start");
+    let f64t = DatatypeMessage::f64_type();
+    let check = "\
+v, u = f['v'], f['u']
+assert v.shape == () and v.chunks is None, (v.shape, v.chunks)
+assert v[()] == 2.5 and u[()] == 7.0, (v[()], u[()])
+";
+    let mut w = rust_hdf5::swmr::SwmrFileWriter::create(&path).unwrap();
+    let v = w.create_dataset_typed("v", f64t.clone(), &[]).unwrap();
+    let u = w.create_dataset_typed("u", f64t, &[]).unwrap();
+    w.set_dataset_fill_value(v, &-1.5f64).unwrap();
+    w.set_dataset_fill_value(u, &7.0f64).unwrap();
+    w.start_swmr().unwrap();
+    w.write_dataset_raw(v, &2.5f64.to_le_bytes()).unwrap();
+    w.flush().unwrap();
+    let live = std::process::Command::new(py)
+        .arg("-c")
+        .arg(format!(
+            "import h5py\nf = h5py.File(r'{}', 'r', swmr=True)\n{check}",
+            path.display()
+        ))
+        .status()
+        .expect("failed to spawn python");
+    assert!(live.success(), "live SWMR read failed");
+    w.close().unwrap();
+    read_back_with_h5py(py, &path, check);
+    std::fs::remove_file(&path).ok();
+}
+
 /// `SwmrFileWriter::set_dataset_fill_value_bytes` on a big-endian 12-bit N-bit
 /// grid is the fill libhdf5 reports and reads at unwritten positions.
 #[test]
