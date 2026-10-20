@@ -379,6 +379,28 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// [`Self::create_grid_dataset_with_datatype`] at extent `dims` within
+    /// `max_dims` (`None`: unlimited), filtered through `pipeline` when one
+    /// is given. One unlimited dimension takes an extensible-array chunk
+    /// index and more take a v2 B-tree, as libhdf5 picks them; positions are
+    /// written with [`write_chunk_at`](Self::write_chunk_at) as on a fixed
+    /// grid, and [`set_extent`](Self::set_extent) moves the extent.
+    pub fn create_grid_dataset_with_max(
+        &mut self,
+        name: &str,
+        datatype: crate::DatatypeMessage,
+        dims: &[u64],
+        max_dims: &[Option<u64>],
+        chunk: &[u64],
+        pipeline: Option<crate::format::messages::filter::FilterPipeline>,
+    ) -> Result<usize> {
+        let max: Vec<u64> = max_dims.iter().map(|m| m.unwrap_or(u64::MAX)).collect();
+        let idx = self
+            .inner
+            .create_grid_dataset_with_max(name, datatype, dims, &max, chunk, pipeline)?;
+        Ok(idx)
+    }
+
     /// Create a hard link: an additional name for a dataset or group that
     /// already exists in the file.
     ///
@@ -580,6 +602,33 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Create a contiguous dataset of `datatype` and shape `dims` (`&[]`:
+    /// scalar) whose bytes [`write_dataset_raw`](Self::write_dataset_raw)
+    /// supplies later, after [`start_swmr`](Self::start_swmr) too, as
+    /// libhdf5's `H5Dwrite` does under SWMR; until then it reads its fill
+    /// value. Create it before `start_swmr`.
+    pub fn create_dataset_typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+    ) -> Result<usize> {
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_dataset(name, datatype, dims)?;
+        Ok(idx)
+    }
+
+    /// Overwrite every byte of a contiguous dataset made by
+    /// [`create_dataset_typed`](Self::create_dataset_typed), before or after
+    /// [`start_swmr`](Self::start_swmr): raw data only, so SWMR readers see
+    /// it after the next [`flush`](Self::flush).
+    pub fn write_dataset_raw(&mut self, ds_index: usize, data: &[u8]) -> Result<()> {
+        self.inner.writer_mut().write_dataset_raw(ds_index, data)?;
+        Ok(())
+    }
+
     /// Create a variable-length string dataset (one element per string).
     /// Returns the dataset index. Useful for NeXus metadata such as
     /// `/entry/start_time` or per-frame timestamp arrays.
@@ -771,8 +820,9 @@ impl SwmrFileWriter {
     }
 
     /// Write one already-filtered chunk verbatim at an explicit chunk
-    /// position of a grid dataset made by
+    /// position of a filtered grid dataset made by
     /// [`create_grid_dataset_compressed`](Self::create_grid_dataset_compressed)
+    /// or [`create_grid_dataset_with_max`](Self::create_grid_dataset_with_max)
     /// — HDF5's direct chunk write (`H5Dwrite_chunk`) at a chunk offset.
     /// `filter_mask` bit *i* set means filter *i* was not applied to this
     /// chunk; pass 0 when the whole pipeline was.
@@ -789,7 +839,8 @@ impl SwmrFileWriter {
     }
 
     /// Write one frame at an explicit chunk position of a grid dataset
-    /// created with [`create_grid_dataset`](Self::create_grid_dataset).
+    /// created with [`create_grid_dataset`](Self::create_grid_dataset) or
+    /// [`create_grid_dataset_with_max`](Self::create_grid_dataset_with_max).
     ///
     /// `chunk_coords` are in units of chunks (row-major over the chunk grid)
     /// and `data` must be exactly one full chunk (`product(chunk) *
@@ -806,6 +857,22 @@ impl SwmrFileWriter {
         data: &[u8],
     ) -> Result<()> {
         self.inner.write_chunk_at(ds_index, chunk_coords, data)?;
+        Ok(())
+    }
+
+    /// Write a hyperslab (`starts`, `counts`, in elements) of a grid dataset
+    /// inside its extent. A chunk the selection covers only in part keeps
+    /// its other elements, or their fill if it was never written, so frames
+    /// sharing a chunk may arrive in any order. `data` is `product(counts) *
+    /// element_size` bytes. Call [`flush`](Self::flush) to make it visible.
+    pub fn write_slice(
+        &mut self,
+        ds_index: usize,
+        starts: &[u64],
+        counts: &[u64],
+        data: &[u8],
+    ) -> Result<()> {
+        self.inner.write_slice(ds_index, starts, counts, data)?;
         Ok(())
     }
 
