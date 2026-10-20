@@ -671,16 +671,12 @@ fn typed_reads_reject_a_mismatched_element_width() {
     cleanup(&path);
 }
 
-/// Every attribute mutation after `start_swmr` is refused, libhdf5's rule
-/// for SWMR writes. Object headers are frozen once streaming starts, so a
-/// change only reached the file when its header happened to be rebuilt at
-/// close (group attrs always, dataset attrs only alongside chunk writes)
-/// and was silently dropped otherwise — and replacing a vlen value
-/// stranded its old 4096-byte collection forever, since a streaming
-/// reader may still hold the references.
+/// An attribute set or replaced after `start_swmr` is committed at close,
+/// as libhdf5 1.14 commits `H5Acreate2`/`H5Awrite` under SWMR: on groups and
+/// on datasets, with or without chunk writes, vlen or numeric.
 #[test]
-fn attribute_changes_during_swmr_are_refused() {
-    let path = unique_tmp("swmr_attr_freeze");
+fn attribute_changes_during_swmr_are_committed_at_close() {
+    let path = unique_tmp("swmr_attr_commit");
     {
         let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
         w.create_group("/", "entry").unwrap();
@@ -689,35 +685,92 @@ fn attribute_changes_during_swmr_are_refused() {
         let ds = w.create_streaming_dataset::<i32>("frames", &[4]).unwrap();
         w.set_dataset_attr_string(ds, "units", "mm").unwrap();
         w.set_dataset_attr_numeric(ds, "scale", &2i32).unwrap();
+        let quiet = w.create_streaming_dataset::<i32>("quiet", &[4]).unwrap();
         w.start_swmr().unwrap();
+        w.append_frame(ds, &[0u8; 16]).unwrap();
 
-        let err = w
-            .set_group_attr_string("/entry", "NX_class", "NXdata")
-            .expect_err("vlen replace under SWMR must be refused");
-        assert!(format!("{err}").contains("SWMR"), "got: {err}");
-        w.set_dataset_attr_string(ds, "units", "cm")
-            .expect_err("vlen replace under SWMR must be refused");
+        w.set_group_attr_string("/entry", "NX_class", "NXdata")
+            .unwrap();
+        w.set_group_attr_numeric("/entry", "count", &5i64).unwrap();
+        w.set_dataset_attr_string(ds, "units", "cm").unwrap();
         w.set_dataset_attr_string(ds, "long_name", "detector x")
-            .expect_err("a new vlen attribute under SWMR must be refused");
-        w.set_dataset_attr_numeric(ds, "scale", &3i32)
-            .expect_err("a numeric replace under SWMR must be refused");
+            .unwrap();
+        w.set_dataset_attr_numeric(ds, "scale", &3i32).unwrap();
+        w.set_dataset_attr_numeric(quiet, "gain", &7i32).unwrap();
+        // A flush publishes the new extent with the header as published.
+        w.flush().unwrap();
+        let mut mid = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        assert_eq!(mid.dataset_attr_names("frames").unwrap().len(), 2);
+        drop(mid);
+        w.append_frame(ds, &[1u8; 16]).unwrap();
+        w.flush().unwrap();
         w.close().unwrap();
     }
 
-    // No stranded collection: the refused post-start calls must not have
-    // written a heap block. The two pre-start vlen attrs pack into one
-    // shared collection, so exactly one "GCOL" may appear.
-    let bytes = std::fs::read(&path).unwrap();
-    let gcols = bytes.windows(4).filter(|w| *w == b"GCOL").count();
-    assert_eq!(gcols, 1, "only the shared pre-start collection may exist");
-
-    // The pre-start values are what the file holds.
     let file = rust_hdf5::H5File::open(&path).unwrap();
+    assert_eq!(file.dataset("frames").unwrap().shape(), vec![2, 4]);
     let entry = file.root_group().group("entry").unwrap();
-    assert_eq!(entry.attr_string("NX_class").unwrap(), "NXentry");
+    assert_eq!(entry.attr_string("NX_class").unwrap(), "NXdata");
+    assert!(entry.attr_names().unwrap().contains(&"count".to_string()));
     let ds = file.dataset("frames").unwrap();
-    assert_eq!(ds.attr("units").unwrap().read_string().unwrap(), "mm");
-    assert_eq!(ds.attr("scale").unwrap().read_numeric::<i32>().unwrap(), 2);
+    assert_eq!(ds.attr("units").unwrap().read_string().unwrap(), "cm");
+    assert_eq!(
+        ds.attr("long_name").unwrap().read_string().unwrap(),
+        "detector x"
+    );
+    assert_eq!(ds.attr("scale").unwrap().read_numeric::<i32>().unwrap(), 3);
+    let quiet = file.dataset("quiet").unwrap();
+    assert_eq!(
+        quiet.attr("gain").unwrap().read_numeric::<i32>().unwrap(),
+        7
+    );
+    drop(file);
+    cleanup(&path);
+}
+
+/// A late attribute reaches a dataset whose attributes were already dense at
+/// `start_swmr`, and one it pushes from compact to dense; a flush between
+/// keeps publishing the header readers were given.
+#[test]
+fn late_attributes_reach_dense_storage() {
+    let path = unique_tmp("swmr_attr_dense");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let dense = w.create_streaming_dataset::<i32>("dense", &[2]).unwrap();
+        let edge = w.create_streaming_dataset::<i32>("edge", &[2]).unwrap();
+        for i in 0..10i32 {
+            w.set_dataset_attr_numeric(dense, &format!("a{i}"), &i)
+                .unwrap();
+        }
+        for i in 0..8i32 {
+            w.set_dataset_attr_numeric(edge, &format!("a{i}"), &i)
+                .unwrap();
+        }
+        w.start_swmr().unwrap();
+        w.append_frame(dense, &[0u8; 8]).unwrap();
+        w.set_dataset_attr_numeric(dense, "late", &42i32).unwrap();
+        w.set_dataset_attr_numeric(dense, "a3", &33i32).unwrap();
+        for i in 8..10i32 {
+            w.set_dataset_attr_numeric(edge, &format!("a{i}"), &i)
+                .unwrap();
+        }
+        w.flush().unwrap();
+        w.append_frame(dense, &[0u8; 8]).unwrap();
+        w.close().unwrap();
+    }
+
+    let file = rust_hdf5::H5File::open(&path).unwrap();
+    let dense = file.dataset("dense").unwrap();
+    assert_eq!(dense.attr_names().unwrap().len(), 11);
+    assert_eq!(
+        dense.attr("late").unwrap().read_numeric::<i32>().unwrap(),
+        42
+    );
+    assert_eq!(dense.attr("a3").unwrap().read_numeric::<i32>().unwrap(), 33);
+    assert_eq!(dense.attr("a9").unwrap().read_numeric::<i32>().unwrap(), 9);
+    let edge = file.dataset("edge").unwrap();
+    assert_eq!(edge.attr_names().unwrap().len(), 10);
+    assert_eq!(edge.attr("a9").unwrap().read_numeric::<i32>().unwrap(), 9);
     drop(file);
     cleanup(&path);
 }

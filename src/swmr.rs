@@ -444,10 +444,10 @@ impl SwmrFileWriter {
     /// `set_group_attr_string("/entry", "NX_class", "NXentry")`. An existing
     /// attribute of the same name is replaced.
     ///
-    /// Attributes must be set before [`start_swmr`](Self::start_swmr):
-    /// object headers are frozen while readers stream, so every attribute
-    /// setter is refused once SWMR is active — libhdf5's rule for SWMR
-    /// writes too.
+    /// After [`start_swmr`](Self::start_swmr) a set or replace is committed
+    /// at close, as libhdf5 1.14 commits it under SWMR; until then readers
+    /// see the attributes as published. This holds for every attribute
+    /// setter.
     pub fn set_group_attr_string(
         &mut self,
         group_path: &str,
@@ -464,8 +464,8 @@ impl SwmrFileWriter {
 
     /// Set a numeric scalar attribute on a group, or on the root group when
     /// `group_path` is `"/"`. An existing attribute of the same name is
-    /// replaced. Refused after [`start_swmr`](Self::start_swmr) — see
-    /// [`set_group_attr_string`](Self::set_group_attr_string).
+    /// replaced. After [`start_swmr`](Self::start_swmr) it is committed at
+    /// close — see [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_group_attr_numeric<T: H5Type>(
         &mut self,
         group_path: &str,
@@ -482,7 +482,8 @@ impl SwmrFileWriter {
     /// Set a numeric array attribute on a group, or on the root group when
     /// `group_path` is `"/"` — the group form of
     /// [`set_dataset_attr_array`](Self::set_dataset_attr_array), with the
-    /// same shape rule. Refused after [`start_swmr`](Self::start_swmr) — see
+    /// same shape rule. After [`start_swmr`](Self::start_swmr) it is
+    /// committed at close — see
     /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_group_attr_array<T: H5Type>(
         &mut self,
@@ -500,8 +501,8 @@ impl SwmrFileWriter {
 
     /// Set a scalar attribute of a caller-supplied datatype on a group, or on
     /// the root group when `group_path` is `"/"` — the SWMR form of
-    /// [`H5Group::set_attr_typed`](crate::H5Group::set_attr_typed). Refused
-    /// after [`start_swmr`](Self::start_swmr) — see
+    /// [`H5Group::set_attr_typed`](crate::H5Group::set_attr_typed). After
+    /// [`start_swmr`](Self::start_swmr) it is committed at close — see
     /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_group_attr_typed(
         &mut self,
@@ -579,8 +580,8 @@ impl SwmrFileWriter {
 
     /// Set a string attribute on a dataset, addressed by its index. The
     /// NeXus way to record `units`, `long_name`, `signal`, etc. An existing
-    /// attribute of the same name is replaced. Refused after
-    /// [`start_swmr`](Self::start_swmr) — see
+    /// attribute of the same name is replaced. After
+    /// [`start_swmr`](Self::start_swmr) it is committed at close — see
     /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_dataset_attr_string(
         &mut self,
@@ -597,8 +598,8 @@ impl SwmrFileWriter {
     }
 
     /// Set a numeric scalar attribute on a dataset, addressed by its index.
-    /// An existing attribute of the same name is replaced. Refused after
-    /// [`start_swmr`](Self::start_swmr) — see
+    /// An existing attribute of the same name is replaced. After
+    /// [`start_swmr`](Self::start_swmr) it is committed at close — see
     /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_dataset_attr_numeric<T: H5Type>(
         &mut self,
@@ -616,7 +617,7 @@ impl SwmrFileWriter {
     /// Set a scalar attribute of a caller-supplied datatype on a dataset,
     /// addressed by its index — the SWMR form of
     /// [`H5Dataset::set_attr_typed`](crate::H5Dataset::set_attr_typed).
-    /// Refused after [`start_swmr`](Self::start_swmr) — see
+    /// After [`start_swmr`](Self::start_swmr) it is committed at close — see
     /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_dataset_attr_typed(
         &mut self,
@@ -641,10 +642,9 @@ impl SwmrFileWriter {
     /// (`NDArrayDimOffset`, `NDArrayDimBinning`, `NDArrayDimReverse`). An
     /// existing attribute of the same name is replaced.
     ///
-    /// In SWMR mode, attributes can only be added before
-    /// [`start_swmr`](Self::start_swmr); HDF5 forbids adding dataset
-    /// attributes once the file is in SWMR write mode. Resolve a dataset path
-    /// to its index with [`dataset_index`](Self::dataset_index).
+    /// After [`start_swmr`](Self::start_swmr) it is committed at close — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string). Resolve a
+    /// dataset path to its index with [`dataset_index`](Self::dataset_index).
     pub fn set_dataset_attr_array<T: H5Type>(
         &mut self,
         ds_index: usize,

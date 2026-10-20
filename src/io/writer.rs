@@ -1259,18 +1259,6 @@ impl ChunkGeometry {
     }
 }
 
-/// The refusal every attribute mutation gets while SWMR streaming is
-/// active, from the two owners of attribute-list change
-/// ([`Hdf5Writer::set_attribute`] and `evict_attr`).
-fn swmr_attr_error(name: &str) -> crate::io::IoError {
-    crate::io::IoError::InvalidState(format!(
-        "cannot add or modify attribute '{name}' during SWMR streaming: object \
-         headers are frozen while readers stream, and a superseded variable-length \
-         value's heap storage could never be reclaimed; set attributes before \
-         start_swmr (libhdf5 forbids attribute changes during SWMR writes too)"
-    ))
-}
-
 /// Where an attribute arriving at [`Hdf5Writer::insert_attribute`] came from.
 ///
 /// The variable-length setters have to evict before they allocate — the
@@ -3798,6 +3786,12 @@ pub struct Hdf5Writer {
     /// that allocated would allocate twice and leave the sized-for blocks
     /// stranded.
     dense_attributes: Slot<HashMap<AttrScope, AttributeInfoMessage>>,
+    /// Each object's attribute set as `finalize_for_swmr` published it,
+    /// references resolved. A change after `start_swmr` is committed at
+    /// close, so until then a header rewrite carries this set, not the
+    /// current one, and the dense storage built for it is the storage that
+    /// header names.
+    swmr_published_attrs: Slot<HashMap<AttrScope, Vec<AttributeEntry>>>,
     /// Groups whose links this finalize spilled to dense storage, and the
     /// `Link Info` message naming what was written for each.
     ///
@@ -4840,6 +4834,7 @@ impl Hdf5Writer {
             // newer one.
             superblock_version,
             dense_attributes: Slot::new(HashMap::new()),
+            swmr_published_attrs: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(None),
             track_order: TrackOrder::uniform(track_order),
@@ -6221,6 +6216,7 @@ impl Hdf5Writer {
             root_track_order,
             root_times,
             dense_attributes: Slot::new(HashMap::new()),
+            swmr_published_attrs: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(superseded),
             track_order: root_track_order,
@@ -9614,14 +9610,17 @@ impl Hdf5Writer {
             // lands in the blocks it just gave back instead of growing the
             // file on every open/close cycle.
             self.release_superseded_dense_attrs(scope)?;
-            // `close` after `start_swmr` finalizes a second time over the same
-            // attribute sets — SWMR refuses every attribute mutation — so
-            // rebuilding here would allocate a whole second heap and strand
-            // the one the published headers already name.
-            if self.dense_attributes.lock().contains_key(&scope) {
+            let attributes = self.object_attributes(scope)?;
+            // `close` after `start_swmr` finalizes a second time: a set
+            // unchanged since it was published keeps the heap its header
+            // names, and a changed one gets a new heap, the published one
+            // left to the readers that may hold it.
+            if self.dense_attributes.lock().contains_key(&scope)
+                && self.swmr_published_attrs.lock().get(&scope) == Some(&attributes)
+            {
                 continue;
             }
-            let attributes = self.object_attributes(scope)?;
+            self.dense_attributes.lock().remove(&scope);
             if !self.attributes_need_dense(&attributes, self.attr_scope_format(scope)) {
                 continue;
             }
@@ -11603,13 +11602,11 @@ impl Hdf5Writer {
     /// no replacement — vlen over vlen, numeric over vlen — can strand heap
     /// space (the attribute counterpart of issue #10's dataset fix).
     ///
-    /// Under SWMR every attribute mutation is refused, matching libhdf5's
-    /// rule for SWMR writes. Object headers are frozen once streaming
-    /// starts — a change was committed at close only when the header
-    /// happened to be rebuilt (group attrs always, dataset attrs only if
-    /// the dataset also got chunk writes) and silently dropped otherwise —
-    /// and a replacement's superseded vlen value could never be reclaimed,
-    /// since a streaming reader may hold its heap references.
+    /// Under SWMR the change is committed at close, when the closing
+    /// finalize rewrites the header (a continuation chunk taking what no
+    /// longer fits its published block), as libhdf5 1.14 commits
+    /// `H5Acreate2`/`H5Awrite` under SWMR; a superseded vlen value keeps its
+    /// heap objects, since a streaming reader may hold their references.
     pub fn set_attribute(&self, target: AttrTarget<'_>, attr: AttributeMessage) -> IoResult<()> {
         self.insert_attribute(target, attr, Created)
     }
@@ -11622,9 +11619,6 @@ impl Hdf5Writer {
         attr: AttributeMessage,
         origin: AttrOrigin,
     ) -> IoResult<()> {
-        if self.swmr_active {
-            return Err(swmr_attr_error(&attr.name));
-        }
         // Whatever this name meant before, it means the incoming message now.
         self.forget_attribute_reference(self.attr_scope(target)?, &attr.name);
         // No size gate: an attribute whose message is too large for the
@@ -12319,16 +12313,12 @@ impl Hdf5Writer {
     }
 
     /// Take the attribute `name` off `target`'s list, releasing its heap
-    /// objects. No-op when absent. Refused under SWMR — see
-    /// [`set_attribute`](Self::set_attribute).
+    /// objects. No-op when absent.
     ///
     /// What it answers is what the insert that follows it must be told: an
     /// attribute that was there is being rewritten and keeps its creation
     /// index, and one that was not is created.
     fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<AttrOrigin> {
-        if self.swmr_active {
-            return Err(swmr_attr_error(name));
-        }
         self.forget_attribute_reference(self.attr_scope(target)?, name);
         let old = self.with_attr_list(target, |attrs| {
             attrs
@@ -12353,9 +12343,13 @@ impl Hdf5Writer {
     /// deleted, the storage cost the foreign writer accepted. Every other
     /// class stores its value inline in the message. Per-object removal
     /// keeps collections shared with other refs (libhdf5-written files)
-    /// intact.
+    /// intact. Under SWMR nothing is released: a streaming reader may hold
+    /// the references (the same rule `swmr_active` sets for chunks).
     fn release_attr_vlen(&self, old: &AttributeEntry) -> IoResult<()> {
         use crate::format::messages::datatype::DatatypeMessage;
+        if self.swmr_active {
+            return Ok(());
+        }
         // An attribute whose message this crate could not decode keeps
         // whatever heap space it references: releasing objects named by bytes
         // we cannot interpret would free storage that is still live.
@@ -16899,8 +16893,9 @@ impl Hdf5Writer {
     /// The header must have been written by `finalize_for_swmr`, and goes
     /// back over the same blocks: chunk 0 held to its block and the
     /// continuation chunk, when it has one, to its own. Only the dataspace
-    /// dimensions are meant to change; a header that no longer fits is
-    /// refused rather than moved, since a reader holds its address.
+    /// dimensions are meant to change — attributes are the published set —
+    /// and a header that no longer fits is refused rather than moved, since
+    /// a reader holds its address.
     pub fn write_dataset_header_inplace(&mut self, index: usize) -> IoResult<()> {
         // Scope the slot guard: `build_dataset_header` re-locks the same slot.
         let placement = {
@@ -16911,7 +16906,15 @@ impl Hdf5Writer {
             })?
         };
 
-        let header = self.build_dataset_header(index)?;
+        let published = self
+            .swmr_published_attrs
+            .lock()
+            .get(&AttrScope::Dataset(index))
+            .cloned()
+            .ok_or_else(|| {
+                crate::io::IoError::InvalidState("dataset header not yet published".into())
+            })?;
+        let header = self.build_dataset_header_with(index, published)?;
         let nlink = self.object_link_count(HardLinkTarget::Dataset(index));
         let format = self.dataset_header_format(index);
         let images = self.encode_header_in(&header, nlink, format, &placement)?;
@@ -16973,6 +16976,10 @@ impl Hdf5Writer {
         self.prepare_dense_attributes(&live)?;
         self.prepare_link_storage()?;
         self.write_reference_values()?;
+        for (scope, _) in self.attribute_scopes(&live) {
+            let attributes = self.object_attributes(scope)?;
+            self.swmr_published_attrs.lock().insert(scope, attributes);
+        }
 
         // 3. Write every object header.
         self.write_object_headers(&layout)?;
@@ -17319,6 +17326,19 @@ impl Hdf5Writer {
     }
 
     fn build_dataset_header(&self, index: usize) -> IoResult<ObjectHeader> {
+        // Resolving references locks other objects' slots, so before the
+        // slot guard below.
+        let attributes = self.object_attributes(AttrScope::Dataset(index))?;
+        self.build_dataset_header_with(index, attributes)
+    }
+
+    /// [`build_dataset_header`](Self::build_dataset_header) carrying
+    /// `attributes` instead of the dataset's current set.
+    fn build_dataset_header_with(
+        &self,
+        index: usize,
+        attributes: Vec<AttributeEntry>,
+    ) -> IoResult<ObjectHeader> {
         // Compute the link count first: object_link_count re-locks dataset and
         // group slots (including this one), so it must run before we take this
         // dataset's slot guard — otherwise it would deadlock on the same slot.
@@ -17331,9 +17351,6 @@ impl Hdf5Writer {
             CommittedTypeRef::Session(ci) => self.committed_datatypes.lock()[ci].obj_header_addr,
             CommittedTypeRef::Preserved(addr) => addr,
         });
-        // And again: an attribute holding an object reference is said in the
-        // target's header address, which is read off that object's slot.
-        let attributes = self.object_attributes(AttrScope::Dataset(index))?;
 
         // Hold one slot guard for the whole header build.
         let ds = self.ds(index);

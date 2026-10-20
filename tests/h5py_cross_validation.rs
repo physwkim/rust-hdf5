@@ -6178,8 +6178,9 @@ fn typed_fixed_string_attributes_equal_libhdf5_c_s1() {
     std::fs::remove_file(&path).ok();
 }
 
-/// The SWMR typed setters write the same C_S1 attribute before `start_swmr`,
-/// and are refused after it like every other SWMR attribute setter.
+/// The SWMR typed setters write the same C_S1 attribute before `start_swmr`
+/// and after it, the late ones committed at close (NDFileHDF5's OnFileClose
+/// attributes).
 #[test]
 fn swmr_typed_fixed_string_attributes_equal_libhdf5_c_s1() {
     use rust_hdf5::swmr::SwmrFileWriter;
@@ -6199,10 +6200,9 @@ fn swmr_typed_fixed_string_attributes_equal_libhdf5_c_s1() {
         w.set_dataset_attr_typed(ds, "units", dt, v).unwrap();
         w.start_swmr().unwrap();
         let (dt, v) = c_s1_nullterm("late");
-        assert!(w
-            .set_group_attr_typed("/entry", "late", dt.clone(), v.clone())
-            .is_err());
-        assert!(w.set_dataset_attr_typed(ds, "late", dt, v).is_err());
+        w.set_group_attr_typed("/entry", "late", dt.clone(), v.clone())
+            .unwrap();
+        w.set_dataset_attr_typed(ds, "late", dt, v).unwrap();
         w.append_frame(ds, &[1, 2]).unwrap();
         w.close().unwrap();
     }
@@ -6213,6 +6213,8 @@ fn swmr_typed_fixed_string_attributes_equal_libhdf5_c_s1() {
             ("entry", "NX_class", "NXentry"),
             ("/", "note", "root"),
             ("frames", "units", "counts"),
+            ("entry", "late", "late"),
+            ("frames", "late", "late"),
         ],
     );
     std::fs::remove_file(&path).ok();
@@ -6295,9 +6297,8 @@ fn swmr_group_array_attributes_read_back_with_h5py() {
             .is_err());
         let ds = w.create_streaming_dataset::<u8>("frames", &[2]).unwrap();
         w.start_swmr().unwrap();
-        assert!(w
-            .set_group_attr_array::<i32>("/entry", "late", &[1], &[1])
-            .is_err());
+        w.set_group_attr_array::<i32>("/entry", "late", &[1], &[1])
+            .unwrap();
         w.append_frame(ds, &[1, 2]).unwrap();
         w.close().unwrap();
     }
@@ -6305,7 +6306,7 @@ fn swmr_group_array_attributes_read_back_with_h5py() {
         py,
         &path,
         "e = f['entry'].attrs\n\
-         assert set(e) == {'ints', 'doubles', 'none'}, set(e)\n\
+         assert set(e) == {'ints', 'doubles', 'none', 'late'}, set(e)\n\
          assert e['ints'].dtype == np.dtype('<i4') and e['ints'].tolist() == [1, 2, 3], e['ints']\n\
          assert e['doubles'].dtype == np.dtype('<f8') and e['doubles'].tolist() == [1.5, -20.0], e['doubles']\n\
          assert e['none'].dtype == np.dtype('<i4') and e['none'].shape == (0,), e['none']\n\
@@ -6378,6 +6379,72 @@ assert g.shape == (2, 2, 2, 3) and g.maxshape == (3, 2, 2, 3), (g.shape, g.maxsh
 assert g[0, 0].tolist() == frames.tolist() and g[0, 1].tolist() == (frames + 10).tolist()
 assert g[1, 0].tolist() == (frames + 20).tolist() and not g[1, 1].any()
 ",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Attributes set after `start_swmr` reach libhdf5 at close, as libhdf5 1.14
+/// writes them under SWMR, including one too large for the header's published
+/// block, which takes a new header chunk (libhdf5 1.10.1 fails that one on a
+/// dataset and leaves the file unreadable).
+#[test]
+fn swmr_attributes_after_start_swmr_read_back_with_h5py() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+    use rust_hdf5::FileLocking;
+
+    let Some(py) = python() else { return };
+    let path = tmp("swmr_late_attrs");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        w.create_group("/", "entry").unwrap();
+        w.set_group_attr_string("/entry", "NX_class", "NXentry")
+            .unwrap();
+        let ds = w
+            .create_streaming_dataset::<u8>("entry/frames", &[2])
+            .unwrap();
+        w.set_dataset_attr_numeric(ds, "pre", &1i32).unwrap();
+        let quiet = w
+            .create_streaming_dataset::<u8>("entry/quiet", &[2])
+            .unwrap();
+        let dense = w
+            .create_streaming_dataset::<u8>("entry/dense", &[2])
+            .unwrap();
+        for i in 0..10i32 {
+            w.set_dataset_attr_numeric(dense, &format!("a{i}"), &i)
+                .unwrap();
+        }
+        w.start_swmr().unwrap();
+        w.append_frame(ds, &[1, 2]).unwrap();
+
+        w.set_dataset_attr_numeric(dense, "late", &42i32).unwrap();
+        let big: Vec<f64> = (0..400).map(f64::from).collect();
+        w.set_group_attr_string("/entry", "NX_class", "NXdata")
+            .unwrap();
+        w.set_group_attr_array::<f64>("/entry", "big", &[400], &big)
+            .unwrap();
+        w.set_group_attr_numeric("/", "root", &9i32).unwrap();
+        w.set_dataset_attr_array::<f64>(ds, "big", &[400], &big)
+            .unwrap();
+        w.set_dataset_attr_string(ds, "units", "mm").unwrap();
+        w.set_dataset_attr_numeric(quiet, "gain", &7i32).unwrap();
+        w.append_frame(ds, &[3, 4]).unwrap();
+        w.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "e = f['entry']\n\
+         assert e.attrs['NX_class'] == 'NXdata', e.attrs['NX_class']\n\
+         assert e.attrs['big'].tolist() == list(map(float, range(400)))\n\
+         assert f.attrs['root'] == 9\n\
+         d = e['frames']\n\
+         assert d.shape == (2, 2) and d[:].tolist() == [[1, 2], [3, 4]], d[:]\n\
+         assert set(d.attrs) == {'pre', 'big', 'units'}, set(d.attrs)\n\
+         assert d.attrs['pre'] == 1 and d.attrs['units'] == 'mm'\n\
+         assert d.attrs['big'].tolist() == list(map(float, range(400)))\n\
+         assert e['quiet'].attrs['gain'] == 7\n\
+         a = e['dense'].attrs\n\
+         assert len(a) == 11 and a['late'] == 42 and a['a9'] == 9, dict(a)\n",
     );
     std::fs::remove_file(&path).ok();
 }
