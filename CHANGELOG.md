@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.7
+
+### Added
+
+- `SwmrFileWriter::write_dataset_typed` writes a dataset of a
+  caller-supplied datatype from its raw bytes, so NDFileHDF5's
+  NUL-terminated fixed-length string constants can be written under
+  SWMR, where `write_string_dataset` writes a variable-length one.
+
+### Changed
+
+- Attributes set or replaced after `start_swmr` are committed at close,
+  as libhdf5 1.14 commits `H5Acreate2`/`H5Awrite` under SWMR, instead of
+  being refused; until then readers see the set published at
+  `start_swmr`. One that outgrows the published header takes a
+  continuation chunk, and superseded variable-length and dense storage
+  is kept for readers that may hold it.
+
 ## 0.7.6
 
 ### Added
