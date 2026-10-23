@@ -4,12 +4,12 @@
 //! bound still decodes.
 //!
 //! The bombs are 64 MiB against a 64 KiB image. The peak the allocator sees
-//! across all threads during the decode is the check; the tests serialise on
-//! one lock so no other test's allocations count.
+//! across all threads during the decode is the check, so each test holds one
+//! lock for its whole run: a bomb built on another thread would count.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use rust_hdf5::format::messages::filter::{
     apply_filters, reverse_filters_masked_bounded, reverse_filters_masked_into, Filter,
@@ -68,9 +68,13 @@ static ALLOC: Counting = Counting;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// This test's hold on the allocator's counts.
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `f`'s result and the most bytes live during it beyond those live before.
-fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+fn peak_during<T>(_serial: &MutexGuard<'static, ()>, f: impl FnOnce() -> T) -> (T, usize) {
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
     let r = f();
@@ -97,10 +101,14 @@ fn pipeline(filters: &[(u16, &[u32])]) -> FilterPipeline {
 }
 
 /// Both reverse paths refuse `stored` for a 64 KiB image under the cap.
-fn assert_refused(what: &str, p: &FilterPipeline, stored: &[u8]) {
-    let (vec, vec_peak) = peak_during(|| reverse_filters_masked_bounded(p, stored, 0, IMAGE));
+fn assert_refused(serial: &MutexGuard<'static, ()>, what: &str, p: &FilterPipeline, stored: &[u8]) {
+    let (vec, vec_peak) = peak_during(serial, || {
+        reverse_filters_masked_bounded(p, stored, 0, IMAGE)
+    });
     let mut out = vec![0u8; IMAGE];
-    let (into, into_peak) = peak_during(|| reverse_filters_masked_into(p, stored, 0, &mut out));
+    let (into, into_peak) = peak_during(serial, || {
+        reverse_filters_masked_into(p, stored, 0, &mut out)
+    });
     assert!(
         vec.is_err() && vec_peak < PEAK_CAP && into.is_err() && into_peak < PEAK_CAP,
         "{what}: bounded decode gave {:?} at a peak of {vec_peak} bytes, \
@@ -128,14 +136,16 @@ fn zstd_rle_bomb(n: usize) -> Vec<u8> {
 #[test]
 #[cfg(feature = "zstd")]
 fn zstd_bomb_is_refused() {
+    let serial = serial();
     let stored = zstd_rle_bomb(BOMB);
     assert!(stored.len() < 4096);
-    assert_refused("zstd", &pipeline(&[(FILTER_ZSTD, &[])]), &stored);
+    assert_refused(&serial, "zstd", &pipeline(&[(FILTER_ZSTD, &[])]), &stored);
 }
 
 #[test]
 #[cfg(all(feature = "blosc", feature = "zstd"))]
 fn blosc_zstd_stream_bomb_is_refused() {
+    let serial = serial();
     // One 64 KiB block, unsplit, whose zstd stream expands to the bomb.
     let z = zstd_rle_bomb(BOMB);
     let mut f = vec![2, 1, 0x10 | (4 << 5), 1];
@@ -144,37 +154,51 @@ fn blosc_zstd_stream_bomb_is_refused() {
     }
     f.extend_from_slice(&(z.len() as u32).to_le_bytes());
     f.extend_from_slice(&z);
-    assert_refused("blosc zstd", &pipeline(&[(FILTER_BLOSC, &[])]), &f);
+    assert_refused(&serial, "blosc zstd", &pipeline(&[(FILTER_BLOSC, &[])]), &f);
 }
 
 #[test]
 #[cfg(feature = "blosc")]
 fn blosc_nbytes_bomb_is_refused() {
+    let serial = serial();
     // A shuffled blosclz frame whose header claims one 64 MiB block.
     let mut f = vec![2, 1, 0x01, 4];
     for word in [BOMB, BOMB, 28, 20, 4] {
         f.extend_from_slice(&(word as u32).to_le_bytes());
     }
     f.extend_from_slice(&[0; 4]);
-    assert_refused("blosc nbytes", &pipeline(&[(FILTER_BLOSC, &[])]), &f);
+    assert_refused(
+        &serial,
+        "blosc nbytes",
+        &pipeline(&[(FILTER_BLOSC, &[])]),
+        &f,
+    );
 }
 
 #[test]
 #[cfg(feature = "bzip2")]
 fn bzip2_bomb_is_refused() {
+    let serial = serial();
     let p = pipeline(&[(FILTER_BZIP2, &[1])]);
     let stored = apply_filters(&p, &vec![0u8; BOMB]).unwrap();
     assert!(stored.len() < IMAGE);
-    assert_refused("bzip2", &p, &stored);
+    assert_refused(&serial, "bzip2", &p, &stored);
 }
 
 #[test]
 #[cfg(feature = "deflate")]
 fn deflate_bomb_is_refused() {
+    let serial = serial();
     let stored = apply_filters(&pipeline(&[(FILTER_DEFLATE, &[9])]), &vec![0u8; BOMB]).unwrap();
-    assert_refused("deflate", &pipeline(&[(FILTER_DEFLATE, &[])]), &stored);
+    assert_refused(
+        &serial,
+        "deflate",
+        &pipeline(&[(FILTER_DEFLATE, &[])]),
+        &stored,
+    );
     // The stage above a shuffle is bounded by what the shuffle reverses to.
     assert_refused(
+        &serial,
         "shuffle+deflate",
         &pipeline(&[(FILTER_SHUFFLE, &[2]), (FILTER_DEFLATE, &[])]),
         &stored,
@@ -186,6 +210,7 @@ fn deflate_bomb_is_refused() {
 #[test]
 #[cfg(feature = "deflate")]
 fn read_modify_write_of_a_bomb_chunk_is_refused() {
+    let serial = serial();
     let stored = apply_filters(&pipeline(&[(FILTER_DEFLATE, &[9])]), &vec![0u8; BOMB]).unwrap();
     let path = std::env::temp_dir().join(format!("rust_hdf5_rmw_bomb_{}.h5", std::process::id()));
     let file = rust_hdf5::H5File::create(&path).unwrap();
@@ -201,8 +226,10 @@ fn read_modify_write_of_a_bomb_chunk_is_refused() {
         ds.write_chunk_raw(0, &stored, 0).unwrap();
         ds
     };
-    let (written, write_peak) = peak_during(|| dataset("w").write_slice(&[0], &[16], &[1u8; 16]));
-    let (shrunk, shrink_peak) = peak_during(|| dataset("s").set_extent(&[IMAGE / 2]));
+    let (written, write_peak) = peak_during(&serial, || {
+        dataset("w").write_slice(&[0], &[16], &[1u8; 16])
+    });
+    let (shrunk, shrink_peak) = peak_during(&serial, || dataset("s").set_extent(&[IMAGE / 2]));
     drop(file);
     std::fs::remove_file(&path).ok();
     assert!(
@@ -215,19 +242,22 @@ fn read_modify_write_of_a_bomb_chunk_is_refused() {
 #[test]
 #[cfg(feature = "lz4")]
 fn lz4_header_bomb_is_refused() {
+    let serial = serial();
     // orig_size and block_size 64 MiB, one stored 1-byte block.
     let mut stored = (BOMB as u64).to_be_bytes().to_vec();
     stored.extend_from_slice(&(BOMB as u32).to_be_bytes());
     stored.extend_from_slice(&1u32.to_be_bytes());
     stored.push(0);
-    assert_refused("lz4", &pipeline(&[(FILTER_LZ4, &[])]), &stored);
+    assert_refused(&serial, "lz4", &pipeline(&[(FILTER_LZ4, &[])]), &stored);
 }
 
 #[test]
 fn szip_header_bomb_is_refused() {
+    let serial = serial();
     let mut stored = (BOMB as u32).to_le_bytes().to_vec();
     stored.extend_from_slice(&[0; 16]);
     assert_refused(
+        &serial,
         "szip",
         &pipeline(&[(FILTER_SZIP, &[0, 32, 8, 256])]),
         &stored,
@@ -236,13 +266,15 @@ fn szip_header_bomb_is_refused() {
 
 #[test]
 fn nbit_parameter_bomb_is_refused() {
+    let serial = serial();
     // 16 Mi 4-byte elements of 8 bits each, from 16 bytes.
     let cd = [8, 0, (BOMB / 4) as u32, 1, 4, 0, 8, 0];
-    assert_refused("nbit", &pipeline(&[(FILTER_NBIT, &cd)]), &[0; 16]);
+    assert_refused(&serial, "nbit", &pipeline(&[(FILTER_NBIT, &cd)]), &[0; 16]);
 }
 
 #[test]
 fn scaleoffset_parameter_bomb_is_refused() {
+    let serial = serial();
     // Integer, minbits 0: every one of 16 Mi elements is the minimum, and
     // the 21-byte header is all the chunk stores.
     let mut cd = [0u32; 20];
@@ -252,6 +284,7 @@ fn scaleoffset_parameter_bomb_is_refused() {
     let mut stored = vec![0u8; 21];
     stored[4] = 4;
     assert_refused(
+        &serial,
         "scaleoffset",
         &pipeline(&[(FILTER_SCALEOFFSET, &cd)]),
         &stored,
@@ -261,10 +294,12 @@ fn scaleoffset_parameter_bomb_is_refused() {
 #[test]
 #[cfg(feature = "lz4")]
 fn bshuf_block_bomb_is_refused() {
+    let serial = serial();
     // A 64 KiB chunk whose header claims 64 MiB blocks.
     let mut stored = (IMAGE as u64).to_be_bytes().to_vec();
     stored.extend_from_slice(&(BOMB as u32).to_be_bytes());
     assert_refused(
+        &serial,
         "bshuf",
         &pipeline(&[(FILTER_BSHUF, &[0, 0, 1, 0, 2])]),
         &stored,
@@ -273,12 +308,18 @@ fn bshuf_block_bomb_is_refused() {
 
 #[test]
 fn lzf_bomb_is_refused() {
+    let serial = serial();
     // One literal, then 264-byte back-references of 3 bytes each.
     let mut stored = vec![0x00, 0x00];
     for _ in 0..BOMB / 264 + 1 {
         stored.extend_from_slice(&[0xE0, 0xFF, 0x00]);
     }
-    assert_refused("lzf", &pipeline(&[(FILTER_LZF, &[4, 0, 0])]), &stored);
+    assert_refused(
+        &serial,
+        "lzf",
+        &pipeline(&[(FILTER_LZF, &[4, 0, 0])]),
+        &stored,
+    );
 }
 
 /// The image every boundary case filters: 4-byte integers under 2^16.
@@ -399,6 +440,7 @@ fn stored(p: &FilterPipeline, mask: u32) -> Vec<u8> {
 
 #[test]
 fn image_of_exactly_the_bound_decodes() {
+    let _serial = serial();
     let want = image();
     for (what, p, mask) in boundary_pipelines() {
         let s = stored(&p, mask);
@@ -417,6 +459,7 @@ fn image_of_exactly_the_bound_decodes() {
 
 #[test]
 fn image_one_byte_past_the_bound_fails() {
+    let _serial = serial();
     let n = image().len();
     let mut decoded = Vec::new();
     for (what, p, mask) in boundary_pipelines() {
