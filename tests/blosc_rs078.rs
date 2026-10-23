@@ -40,6 +40,26 @@ fn reads_the_blosc_chunks_rust_hdf5_0_7_8_wrote() {
     }
 }
 
+/// 0.7.8 shuffled by `cd_values[2]` and wrote its low byte as the header's
+/// typesize: 0 for 256, 44 for 300.
+#[test]
+fn reads_a_0_7_8_chunk_shuffled_by_a_typesize_past_255() {
+    let want: Vec<u8> = (0..4096)
+        .map(|i: usize| (i % 251) as u8 ^ (i / 256) as u8)
+        .collect();
+    let file = H5File::open(FIXTURE).unwrap();
+    for (name, header) in [("ts256", 0), ("ts300", 44)] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.read_chunk_raw_at(&[1]).unwrap().0[3], header, "{name}");
+        assert!(ds.read_raw::<u8>().unwrap() == want, "{name}");
+        assert_eq!(
+            ds.read_slice::<u8>(&[2040], &[16]).unwrap(),
+            want[2040..2056],
+            "{name} across the chunks"
+        );
+    }
+}
+
 /// An LZ4 frame ends before a c-blosc frame's bstarts table would.
 #[test]
 fn reads_a_0_7_8_frame_shorter_than_a_bstarts_table() {

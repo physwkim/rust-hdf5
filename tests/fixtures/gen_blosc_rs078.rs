@@ -9,12 +9,18 @@
 //! (`[2, 2, 2, 0, 5, shuffle, codec]`); `default_codec` gives no codec, so
 //! 0.7.8 compressed it with LZ4. `one_byte` is an LZ4 frame shorter than
 //! the bstarts table would end; `lost` holds 8 bytes 0.7.8 stored as a
-//! frame without a payload.
+//! frame without a payload. `ts256` and `ts300` hold `byte(i)` for i in
+//! 0..4096 as u8, shuffled by a typesize 0.7.8 kept only the low byte of
+//! in the header.
 use rust_hdf5::format::messages::filter::FILTER_BLOSC;
 use rust_hdf5::{Filter, FilterPipeline, H5File};
 
 fn value(i: usize) -> u16 {
     ((i / 4) * 3 + i % 3) as u16
+}
+
+fn byte(i: usize) -> u8 {
+    (i % 251) as u8 ^ (i / 256) as u8
 }
 
 fn blosc(cd_values: Vec<u32>) -> FilterPipeline {
@@ -65,5 +71,16 @@ fn main() {
         .unwrap()
         .write_raw(&[1u8, 2, 3, 4, 5, 6, 7, 8])
         .unwrap();
+    let bytes: Vec<u8> = (0..4096).map(byte).collect();
+    for typesize in [256, 300] {
+        file.new_dataset::<u8>()
+            .shape([bytes.len()])
+            .chunk(&[bytes.len() / 2])
+            .filter_pipeline(blosc(vec![2, 2, typesize, 0, 5, 1, 1]))
+            .create(format!("ts{typesize}").as_str())
+            .unwrap()
+            .write_raw(&bytes)
+            .unwrap();
+    }
     file.close().unwrap();
 }

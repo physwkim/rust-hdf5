@@ -3155,22 +3155,23 @@ enum BloscStored {
     /// and no flag but DOSHUFFLE, then one stream over the whole input,
     /// byte-shuffled under that flag, of the codec in `cd_values[6]` (LZ4
     /// when absent) — no bstarts. It is read, never written.
-    Legacy078(BloscFrame),
+    Legacy078 { frame: BloscFrame, compformat: u8 },
 }
 
 #[cfg(feature = "blosc")]
 impl BloscStored {
     fn frame(&self) -> &BloscFrame {
         match self {
-            BloscStored::Frame(frame) | BloscStored::Legacy078(frame) => frame,
+            BloscStored::Frame(frame) | BloscStored::Legacy078 { frame, .. } => frame,
         }
     }
 }
 
 /// The header of the frame `src` (`blosc_cbuffer_sizes`), checked against
-/// the bytes it claims: a MEMCPYED body, or the bstarts table.
+/// the bytes it claims: a MEMCPYED body, or the bstarts table. `cd_values`
+/// complete the header of a frame rust-hdf5 0.7.8 wrote.
 #[cfg(feature = "blosc")]
-fn blosc_frame(src: &[u8]) -> FormatResult<BloscStored> {
+fn blosc_frame(src: &[u8], cd_values: &[u32]) -> FormatResult<BloscStored> {
     let bad = |what: &str| FormatError::InvalidData(format!("blosc: {what}"));
     if src.len() < BLOSC_MAX_OVERHEAD {
         return Err(bad("header too short"));
@@ -3194,9 +3195,12 @@ fn blosc_frame(src: &[u8]) -> FormatResult<BloscStored> {
         && word(12) == src.len()
         && (src.len() < BLOSC_MAX_OVERHEAD + 4 || word(16) != BLOSC_MAX_OVERHEAD + 4);
     if legacy {
-        return Ok(BloscStored::Legacy078(BloscFrame::new(
-            flags, typesize, nbytes, blocksize,
-        )));
+        // 0.7.8 shuffled by cd_values[2] and kept only its low byte here.
+        let typesize = cd_values.get(2).map_or(typesize, |&t| t as usize);
+        return Ok(BloscStored::Legacy078 {
+            frame: BloscFrame::new(flags, typesize, nbytes, blocksize),
+            compformat: blosc_compformat(cd_values.get(6).copied().unwrap_or(BLOSC_LZ4))?,
+        });
     }
     if flags & BLOSC_MEMCPYED != 0 || nbytes == 0 {
         if flags & BLOSC_MEMCPYED != 0 && src.len() < BLOSC_MAX_OVERHEAD + nbytes {
@@ -3223,21 +3227,19 @@ fn blosc_frame(src: &[u8]) -> FormatResult<BloscStored> {
 
 /// `blosc_decompress` straight into `out`, returning the frame's
 /// uncompressed length; a frame whose nbytes `out` cannot hold fails, as
-/// `blosc_decompress_ctx` refuses a short `destsize`. `cd_values` name the
-/// codec of a frame rust-hdf5 0.7.8 wrote.
+/// `blosc_decompress_ctx` refuses a short `destsize`.
 #[cfg(feature = "blosc")]
 fn blosc_decompress_into(src: &[u8], cd_values: &[u32], out: &mut [u8]) -> FormatResult<usize> {
-    let stored = blosc_frame(src)?;
+    let stored = blosc_frame(src, cd_values)?;
     let frame = stored.frame();
     if frame.nbytes > out.len() {
         return Err(past_limit("blosc", out.len()));
     }
     let out = &mut out[..frame.nbytes];
-    if let BloscStored::Legacy078(frame) = &stored {
-        let compformat = blosc_compformat(cd_values.get(6).copied().unwrap_or(BLOSC_LZ4))?;
+    if let BloscStored::Legacy078 { frame, compformat } = &stored {
         let stream = &src[BLOSC_MAX_OVERHEAD..];
         with_blosc_scratch(frame.nbytes, |s| {
-            s.decompress_078(frame, compformat, stream, out)
+            s.decompress_078(frame, *compformat, stream, out)
         })?;
         return Ok(frame.nbytes);
     }
@@ -3284,7 +3286,7 @@ fn blosc_decompress_pooled(frame: &BloscFrame, src: &[u8], out: &mut [u8]) -> Fo
 /// may be at most `limit`.
 #[cfg(feature = "blosc")]
 fn blosc_decompress(data: &[u8], cd_values: &[u32], limit: usize) -> FormatResult<Vec<u8>> {
-    let nbytes = blosc_frame(data)?.frame().nbytes;
+    let nbytes = blosc_frame(data, cd_values)?.frame().nbytes;
     if nbytes > limit {
         return Err(past_limit("blosc", limit));
     }
@@ -5254,7 +5256,7 @@ mod tests {
             }
             for f in [frame, &ours[..]] {
                 assert!(
-                    matches!(blosc_frame(f), Ok(BloscStored::Frame(_))),
+                    matches!(blosc_frame(f, &cd), Ok(BloscStored::Frame(_))),
                     "{ctx} read as 0.7.8's"
                 );
             }
