@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.9
+
+### Changed
+
+- A stored chunk whose filters decode to more or fewer bytes than its
+  image is refused by every read and by the read-back of a partial write
+  or a shrink. `reverse_filters_masked_into` fails such a chunk where it
+  returned the shorter length or dropped the surplus, so its `Ok` is
+  always `out.len()`; with every filter masked off, the stored bytes
+  must be the image's length. libhdf5 instead drops a long chunk's
+  surplus and keeps what a short one decoded; 0.7.8 read a short chunk
+  as the fill value, or as what it decoded where a read took only part
+  of it.
+
 ## 0.7.8
 
 ### Added

@@ -720,9 +720,13 @@ pub fn reverse_filters_masked_bounded(
             stage_limit(pipeline, filter_mask, i, image_limit),
         )?);
     }
-    // Reached only when every filter was masked off (or the pipeline is
-    // empty): the stored bytes are already the chunk's data.
-    Ok(buf.unwrap_or_else(|| data.to_vec()))
+    match buf {
+        Some(image) => Ok(image),
+        // Every filter was masked off (or the pipeline is empty): the stored
+        // bytes are already the chunk's data.
+        None if data.len() > image_limit => Err(past_limit("stored chunk", image_limit)),
+        None => Ok(data.to_vec()),
+    }
 }
 
 /// Reverse filter pipeline to decompress raw chunk data (the full pipeline,
@@ -731,8 +735,9 @@ pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<V
     reverse_filters_masked(pipeline, data, 0)
 }
 
-/// Reverse the filter pipeline straight into `out`, returning the length of
-/// the image it produced.
+/// Reverse the filter pipeline straight into `out`, which is the chunk's
+/// image: a stored chunk that decodes to any other length than `out.len()`
+/// is an error, and `Ok` carries `out.len()`.
 ///
 /// A chunk's decoded image is frequently one contiguous stretch of the read's
 /// output — for a whole chunk of a full read it always is — and then the image
@@ -742,14 +747,11 @@ pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<V
 /// destination the caller can name.
 ///
 /// The stages decode under the bounds of [`reverse_filters_masked_bounded`]
-/// with `out.len()` as the image's, so a decoded image longer than `out` is an
-/// error. With every filter masked off the stored bytes are the image and are
-/// copied as they are; the returned length is then theirs, and a surplus is
-/// discarded. A length below `out.len()` means the stored chunk decoded short
-/// of its image; `out` past that length is then left **unspecified**, because
-/// the inflate writes its output in blocks and the last one can run past the
-/// byte the stream ends on. A caller whose destination may outlast the image
-/// owns every byte of it, not just the tail past the image.
+/// with `out.len()` as the image's, so a stage that decodes past it fails
+/// there, and a chunk that decodes short fails once its last stage ends.
+/// With every filter masked off the stored bytes are the image, and must be
+/// its length. libhdf5 instead drops a long chunk's surplus and keeps what a
+/// short one decoded. After an error `out` holds whatever the stages wrote.
 pub fn reverse_filters_masked_into(
     pipeline: &FilterPipeline,
     data: &[u8],
@@ -758,23 +760,36 @@ pub fn reverse_filters_masked_into(
 ) -> FormatResult<usize> {
     // The last stage to run is the lowest-numbered filter still in play; it is
     // the one whose output is the image, so it is the one that writes to `out`.
-    let Some(last) = (0..pipeline.filters.len()).find(|i| !is_masked(filter_mask, *i)) else {
+    let produced = match (0..pipeline.filters.len()).find(|i| !is_masked(filter_mask, *i)) {
         // Every filter masked off (or an empty pipeline): the stored bytes are
         // already the chunk's image.
-        return Ok(copy_image_into(data, out));
-    };
-    let mut buf: Option<Vec<u8>> = None;
-    for (i, filter) in pipeline.filters.iter().enumerate().rev() {
-        if is_masked(filter_mask, i) || i == last {
-            continue;
+        None => copy_image_into(data, out),
+        Some(last) => {
+            let mut buf: Option<Vec<u8>> = None;
+            for (i, filter) in pipeline.filters.iter().enumerate().rev() {
+                if is_masked(filter_mask, i) || i == last {
+                    continue;
+                }
+                buf = Some(reverse_single_filter(
+                    filter,
+                    buf.as_deref().unwrap_or(data),
+                    stage_limit(pipeline, filter_mask, i, out.len()),
+                )?);
+            }
+            reverse_single_filter_into(
+                &pipeline.filters[last],
+                buf.as_deref().unwrap_or(data),
+                out,
+            )?
         }
-        buf = Some(reverse_single_filter(
-            filter,
-            buf.as_deref().unwrap_or(data),
-            stage_limit(pipeline, filter_mask, i, out.len()),
-        )?);
+    };
+    if produced != out.len() {
+        return Err(FormatError::InvalidData(format!(
+            "chunk decodes to {produced} bytes, its image is {}",
+            out.len()
+        )));
     }
-    reverse_single_filter_into(&pipeline.filters[last], buf.as_deref().unwrap_or(data), out)
+    Ok(produced)
 }
 
 /// Whether bit `i` of a chunk's filter mask skips filter `i`.
@@ -3921,29 +3936,23 @@ mod tests {
         }
     }
 
-    /// The returned length is the image the pipeline produced, not the
-    /// destination's: a longer destination is written only as far as the
-    /// image goes. A shorter one bounds the decode and fails it.
+    /// The destination is the image: a stored chunk decoding to less than
+    /// it fails as one decoding to more does, filtered or masked off.
     #[cfg(feature = "deflate")]
     #[test]
-    fn reverse_into_reports_the_image_length_not_the_destination() {
+    fn reverse_into_refuses_an_image_of_another_length() {
         let pipeline = FilterPipeline::deflate(6);
         let original: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
         let compressed = apply_filters(&pipeline, &original).unwrap();
-
-        let mut short = vec![0u8; 1000];
-        assert!(reverse_filters_masked_into(&pipeline, &compressed, 0, &mut short).is_err());
-
-        // A destination outlasting the image keeps the image; what the slack
-        // past it holds is unspecified (the inflate's last output block can
-        // reach past the byte the stream ends on), which is why a caller that
-        // sees a short image owns the whole destination, not just that tail.
-        let mut long = vec![0xCDu8; original.len() + 4096];
-        assert_eq!(
-            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut long).unwrap(),
-            original.len()
-        );
-        assert_eq!(&long[..original.len()], &original[..]);
+        for (stored, mask) in [(&compressed, 0), (&original, 1)] {
+            for len in [original.len() - 1, original.len() + 1] {
+                let mut out = vec![0u8; len];
+                assert!(
+                    reverse_filters_masked_into(&pipeline, stored, mask, &mut out).is_err(),
+                    "mask {mask}, {len} bytes"
+                );
+            }
+        }
     }
 
     /// A stream that is malformed past the destination still fails: the

@@ -2410,11 +2410,9 @@ fn place_chunk_jobs(
                         None => copy_chunk_runs(&data, output, &place, at(i), &mut skipped),
                     }
                 }
-                // A chunk that decoded short of its image placed no usable run
-                // — the same verdict `copy_chunk_runs` passes on a run reaching
-                // past a short image — so the whole stretch reverts to fill,
-                // not just the part past the image: a decode writes its output
-                // in blocks and may have reached past the byte it stopped on.
+                // An unfiltered chunk the file ends inside placed no usable
+                // run — the verdict `copy_chunk_runs` passes on a run reaching
+                // past a short image — so the whole stretch reverts to fill.
                 ChunkDecoded::InPlace { dst, len, bytes } if bytes < len => {
                     fill_tiled_into(&mut output[dst..dst + len], fill_value)
                 }
@@ -2448,8 +2446,9 @@ enum ChunkDecoded {
     /// The image is here and still has to be placed run by run.
     Image(Vec<u8>),
     /// The image went straight into `output[dst..dst + len]`. `bytes` is the
-    /// length the pipeline produced there: short of `len` only for a stored
-    /// chunk that decoded to less than its image.
+    /// length that landed there: short of `len` only for an unfiltered chunk
+    /// the file ends inside, since a filtered one decodes to its whole image
+    /// or fails.
     InPlace {
         dst: usize,
         len: usize,
@@ -2542,11 +2541,9 @@ fn carve_sinks<'a>(
 /// straight into `out`, returning the length of the image it produced.
 ///
 /// The counterpart of [`decompress_chunk`] for a chunk whose image is already
-/// the output's own bytes. A length below `out.len()` means the stored chunk
-/// decoded short. A filter whose output would outrun `out` fails; a length
-/// above it comes only from stored bytes no filter ran over, and means the
-/// surplus was discarded, which is what copying `out.len()` bytes out of them
-/// does too.
+/// the output's own bytes. A filtered chunk that decodes to any other length
+/// than `out.len()` fails; a length below it comes only from an unfiltered
+/// chunk read short at the end of the file.
 fn decompress_chunk_into(
     pipeline: Option<&FilterPipeline>,
     raw: &[u8],
@@ -2569,11 +2566,8 @@ fn decompress_chunk_into(
 /// `image_bytes` is what the layout says the chunk decodes to
 /// ([`ChunkOutputGeometry::image_bytes`]), so the image is allocated once at
 /// its real size instead of being grown to it — a filter that has to discover
-/// the size re-enters its decoder once per doubling. Bytes past what the
-/// pipeline produced are cut off, so a chunk that decoded short is as short
-/// here as the growing spelling left it and [`copy_chunk_runs`] passes the
-/// same verdict on the runs reaching past it. Bytes past `image_bytes` are cut
-/// off too: no run of a chunk reaches past its own image.
+/// the size re-enters its decoder once per doubling. A chunk that decodes to
+/// any other length fails.
 fn decompress_chunk(
     pipeline: Option<&FilterPipeline>,
     raw: Vec<u8>,
@@ -2590,8 +2584,7 @@ fn decompress_chunk(
         .into());
     };
     let mut image = vec![0u8; image_bytes];
-    let produced = filter::reverse_filters_masked_into(pl, &raw, mask, &mut image)?;
-    image.truncate(produced.min(image_bytes));
+    filter::reverse_filters_masked_into(pl, &raw, mask, &mut image)?;
     Ok(image)
 }
 

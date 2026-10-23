@@ -13975,7 +13975,7 @@ impl Hdf5Writer {
     /// a chunk written by a direct chunk write with a skipped filter is
     /// reversed correctly. `Ok(None)` means the chunk has no block yet — the
     /// single place that judgement is made, shared by every chunk index.
-    /// `image_bytes`, the chunk's shape, bounds what the filters decode to.
+    /// `image_bytes`, the chunk's shape, is what the filters must decode to.
     fn read_chunk_block(
         &self,
         pipeline: Option<&FilterPipeline>,
@@ -13990,10 +13990,14 @@ impl Hdf5Writer {
         let raw = self.handle.read_at(addr, nbytes as usize)?;
         match pipeline {
             Some(pl) => {
-                let limit = usize::try_from(image_bytes).unwrap_or(usize::MAX);
-                Ok(Some(filter::reverse_filters_masked_bounded(
-                    pl, &raw, mask, limit,
-                )?))
+                let image = usize::try_from(image_bytes).map_err(|_| {
+                    crate::format::FormatError::InvalidData(
+                        "chunk image size is not addressable".into(),
+                    )
+                })?;
+                let mut out = vec![0u8; image];
+                filter::reverse_filters_masked_into(pl, &raw, mask, &mut out)?;
+                Ok(Some(out))
             }
             None => Ok(Some(raw)),
         }
