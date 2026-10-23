@@ -114,3 +114,43 @@ fn a_c_frame_padded_after_its_bstarts_is_refused() {
     padded.extend_from_slice(&frame[20..]);
     assert!(reverse_filters(&pipeline, &padded).is_err());
 }
+
+/// A 0.7.8 chunk with other version bytes or a shorter length in its
+/// header is no frame 0.7.8 wrote, nor a c-blosc frame.
+#[test]
+fn a_0_7_8_chunk_under_another_header_is_refused() {
+    let file = H5File::open(FIXTURE).unwrap();
+    let ds = file.dataset("default_codec").unwrap();
+    let pipeline = FilterPipeline {
+        filters: ds.filters().unwrap(),
+    };
+    let (raw, _) = ds.read_chunk_raw_at(&[0]).unwrap();
+    assert!(reverse_filters(&pipeline, &raw).is_ok());
+    let cbytes = (raw.len() as u32 - 1).to_le_bytes();
+    for (what, at, bytes) in [
+        ("version", 0, &[3][..]),
+        ("versionlz", 1, &[2][..]),
+        ("cbytes", 12, &cbytes[..]),
+    ] {
+        let mut changed = raw.clone();
+        changed[at..at + bytes.len()].copy_from_slice(bytes);
+        assert!(reverse_filters(&pipeline, &changed).is_err(), "{what}");
+    }
+}
+
+/// A frame of no bytes reads as none whatever follows its header, where
+/// c-blosc 1.12 divides by its zero blocksize.
+#[test]
+fn a_frame_of_no_bytes_reads_as_none() {
+    let pipeline = FilterPipeline {
+        filters: vec![Filter {
+            id: FILTER_BLOSC,
+            flags: 0,
+            cd_values: vec![2, 2, 2, 0, 5, 0],
+        }],
+    };
+    let frame = [
+        2u8, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0xAB, 0xCD, 0xEF, 0x01,
+    ];
+    assert!(reverse_filters(&pipeline, &frame).unwrap().is_empty());
+}
