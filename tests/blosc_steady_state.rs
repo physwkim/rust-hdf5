@@ -168,3 +168,37 @@ fn a_zstd_frame_decodes_after_one_cut_short() {
     );
     assert!(back == data);
 }
+
+/// A thread keeps the buffers of a block up to the largest blosc_blocksize
+/// makes, 1 MiB, and none of a larger block only a foreign frame names.
+#[test]
+fn a_block_past_the_largest_blosc_makes_is_not_kept() {
+    let _serial = serial();
+    let mut kept = Vec::new();
+    for blocksize in [1024 * 1024, 1024 * 1024 + 2] {
+        // One block, shuffled and stored as it is, in one split.
+        let mut frame = vec![2u8, 1, 0x11, 2];
+        for word in [blocksize, blocksize, 24 + blocksize, 20, blocksize] {
+            frame.extend((word as u32).to_le_bytes());
+        }
+        frame.extend(image(blocksize));
+        let p = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 2, blocksize as u32, 5, 1, 0],
+            }],
+        };
+        let mut back = vec![0u8; blocksize];
+        let mut least = usize::MAX;
+        for round in 0..3 {
+            let (read, n) = allocs(|| reverse_filters_masked_into(&p, &frame, 0, &mut back));
+            assert_eq!(read.unwrap(), blocksize);
+            if round > 0 {
+                least = least.min(n);
+            }
+        }
+        kept.push(least == 0);
+    }
+    assert_eq!(kept, [true, false]);
+}
