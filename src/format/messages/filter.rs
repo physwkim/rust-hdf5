@@ -634,6 +634,47 @@ pub fn apply_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec
     Ok(buf.unwrap_or_else(|| data.to_vec()))
 }
 
+/// Apply the filter pipeline straight into `out`, returning the length
+/// written — [`apply_filters`] with the last stage writing where the caller
+/// wants the chunk. Output that does not fit `out` is
+/// [`FormatError::BufferTooShort`], as `blosc_compress_ctx` refuses a short
+/// `destsize`; a blosc frame always fits `data.len()` + 16 bytes.
+pub fn apply_filters_into(
+    pipeline: &FilterPipeline,
+    data: &[u8],
+    out: &mut [u8],
+) -> FormatResult<usize> {
+    let Some((last, rest)) = pipeline.filters.split_last() else {
+        return copy_output_into(data, out);
+    };
+    let mut buf: Option<Vec<u8>> = None;
+    for filter in rest {
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            true,
+        )?);
+    }
+    let data = buf.as_deref().unwrap_or(data);
+    #[cfg(feature = "blosc")]
+    if last.id == FILTER_BLOSC {
+        return blosc_compress_into(data, last, out);
+    }
+    copy_output_into(&apply_single_filter(last, data, true)?, out)
+}
+
+/// Copy a stage's whole output into `out`, which must hold it.
+fn copy_output_into(output: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    let available = out.len();
+    out.get_mut(..output.len())
+        .ok_or(FormatError::BufferTooShort {
+            needed: output.len(),
+            available,
+        })?
+        .copy_from_slice(output);
+    Ok(output.len())
+}
+
 /// Reverse the filter pipeline, skipping any filter whose bit is set in
 /// `filter_mask`.
 ///
@@ -2491,6 +2532,17 @@ fn blosc_codec_decompress(compformat: u8, src: &[u8], dst: &mut [u8]) -> FormatR
 /// this crate's writers have no optional-filter skip to fall back on.
 #[cfg(feature = "blosc")]
 fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
+    let mut out = vec![0u8; data.len() + BLOSC_MAX_OVERHEAD];
+    let n = blosc_compress_into(data, filter, &mut out)?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// `blosc_compress_ctx` into `out` (its `destsize` is `out.len()`),
+/// returning the frame's length. Where C returns 0 — the frame, compressed
+/// or MEMCPYED, does not fit — this is an error; `nbytes` + 16 always fits.
+#[cfg(feature = "blosc")]
+fn blosc_compress_into(data: &[u8], filter: &Filter, out: &mut [u8]) -> FormatResult<usize> {
     let cd = &filter.cd_values;
     // Slot 2 is the type size; clevel, shuffle and compressor are optional.
     let typesize = cd.get(2).copied().unwrap_or(1) as usize;
@@ -2533,17 +2585,27 @@ fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
     }
     let frame = BloscFrame::new(flags, typesize, nbytes, blocksize);
 
-    let mut out = vec![0u8; nbytes + BLOSC_MAX_OVERHEAD];
+    let too_short = FormatError::BufferTooShort {
+        needed: nbytes + BLOSC_MAX_OVERHEAD,
+        available: out.len(),
+    };
+    // C writes the header unchecked; a destination short of it is refused.
+    if out.len() < BLOSC_MAX_OVERHEAD {
+        return Err(too_short);
+    }
     let mut ntbytes = 0;
     if flags & BLOSC_MEMCPYED == 0 {
-        ntbytes = blosc_compress_blocks(frame, clevel, compcode, data, &mut out)?;
+        ntbytes = blosc_compress_blocks(frame, clevel, compcode, data, out)?;
         if ntbytes == 0 {
             flags |= BLOSC_MEMCPYED;
         }
     }
     if flags & BLOSC_MEMCPYED != 0 {
-        out[BLOSC_MAX_OVERHEAD..].copy_from_slice(data);
-        ntbytes = out.len();
+        let body = out
+            .get_mut(BLOSC_MAX_OVERHEAD..BLOSC_MAX_OVERHEAD + nbytes)
+            .ok_or(too_short)?;
+        body.copy_from_slice(data);
+        ntbytes = BLOSC_MAX_OVERHEAD + nbytes;
     }
     out[0] = BLOSC_VERSION_FORMAT;
     out[1] = BLOSC_CODEC_VERSION_FORMAT;
@@ -2552,8 +2614,7 @@ fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
     out[4..8].copy_from_slice(&(nbytes as u32).to_le_bytes());
     out[8..12].copy_from_slice(&(blocksize as u32).to_le_bytes());
     out[12..16].copy_from_slice(&(ntbytes as u32).to_le_bytes());
-    out.truncate(ntbytes);
-    Ok(out)
+    Ok(ntbytes)
 }
 
 /// `serial_blosc` compressing: bstarts and every block into `out`,
@@ -4702,6 +4763,74 @@ mod tests {
         assert_eq!(decoded[4], 36);
         #[cfg(feature = "zstd")]
         assert_eq!(decoded[5], 36);
+    }
+
+    /// `apply_filters_into` writes what `apply_filters` returns and refuses a
+    /// destination one byte short of it, blosc last or not.
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn apply_filters_into_matches_apply_filters() {
+        let blob = include_bytes!("../../../tests/fixtures/blosc_c1120.bin");
+        let shuffle = Filter {
+            id: FILTER_SHUFFLE,
+            flags: 0,
+            cd_values: vec![4],
+        };
+        for (cd, kind, nbytes, _) in blosc_fixture_records(blob) {
+            if blosc_compformat(cd[6]).is_err() {
+                continue;
+            }
+            let input = blosc_fixture_input(kind, nbytes, cd[2] as usize);
+            let blosc = Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: cd.clone(),
+            };
+            for filters in [vec![blosc.clone()], vec![shuffle.clone(), blosc.clone()]] {
+                let pipeline = FilterPipeline { filters };
+                let want = apply_filters(&pipeline, &input).unwrap();
+                let mut out = vec![0u8; nbytes + 16];
+                let n = apply_filters_into(&pipeline, &input, &mut out).unwrap();
+                assert_eq!(&out[..n], &want[..], "cd {cd:?}");
+                let mut short = vec![0u8; want.len() - 1];
+                assert!(
+                    matches!(
+                        apply_filters_into(&pipeline, &input, &mut short),
+                        Err(FormatError::BufferTooShort { .. })
+                    ),
+                    "cd {cd:?}"
+                );
+            }
+        }
+        // Not even the header fits.
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 4, 0, 5, 1, BLOSC_BLOSCLZ],
+            }],
+        };
+        assert!(apply_filters_into(&pipeline, &[], &mut [0u8; 15]).is_err());
+        assert_eq!(
+            apply_filters_into(&pipeline, &[], &mut [0u8; 16]).unwrap(),
+            16
+        );
+
+        // A last stage without its own encoder-into is copied in whole.
+        let pipeline = FilterPipeline {
+            filters: vec![shuffle],
+        };
+        let data = golden_f32_data();
+        let mut out = vec![0u8; data.len()];
+        let n = apply_filters_into(&pipeline, &data, &mut out).unwrap();
+        assert_eq!(out[..n], apply_filters(&pipeline, &data).unwrap()[..]);
+        assert!(apply_filters_into(&pipeline, &data, &mut out[1..]).is_err());
+        let empty = FilterPipeline { filters: vec![] };
+        assert_eq!(
+            apply_filters_into(&empty, &data, &mut out).unwrap(),
+            data.len()
+        );
+        assert_eq!(out, data);
     }
 
     /// Corrupt frames fail without a panic.
