@@ -2,6 +2,17 @@
 
 ## 0.7.9
 
+### Added
+
+- `apply_filters_into` runs a filter pipeline straight into the caller's
+  buffer and returns the length written; output that does not fit is
+  `FormatError::BufferTooShort`, and a blosc frame always fits the
+  input's length plus 16 bytes.
+- `reverse_filters_masked_bounded` is `reverse_filters_masked` for an
+  image of at most a given length: every stage decodes under the bound
+  that length sets for it, and a stream decoding past its bound fails
+  before more than about the bound is allocated.
+
 ### Changed
 
 - The blosc filter writes and reads c-blosc 1.x frames, laid out as
