@@ -2,7 +2,7 @@
 //! frames: `fixtures/blosc_rs078.h5`, from `fixtures/gen_blosc_rs078.rs`.
 #![cfg(feature = "blosc")]
 
-use rust_hdf5::format::messages::filter::{reverse_filters, FILTER_BLOSC};
+use rust_hdf5::format::messages::filter::{apply_filters, reverse_filters, FILTER_BLOSC};
 use rust_hdf5::{Filter, FilterPipeline, H5File};
 
 const FIXTURE: &str = "tests/fixtures/blosc_rs078.h5";
@@ -77,6 +77,50 @@ fn a_0_7_8_chunk_written_without_its_payload_is_refused() {
     assert_eq!(ds.read_chunk_raw_at(&[0]).unwrap().0.len(), 16);
     assert!(ds.read_raw::<u8>().is_err());
     assert!(ds.read_slice::<u8>(&[2], &[3]).is_err());
+}
+
+/// A one-block c-blosc frame with 8 bytes between its bstarts entry and its
+/// stream, which c-blosc reads as its input, is also a 0.7.8 BloscLZ frame,
+/// and is read as 0.7.8 reads it.
+#[test]
+fn a_frame_valid_in_both_layouts_is_read_as_0_7_8s() {
+    let mut x = 40u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let input: Vec<u8> = (0..128)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(8) {
+                (x >> 32) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
+    let pipeline = FilterPipeline {
+        filters: vec![Filter {
+            id: FILTER_BLOSC,
+            flags: 0,
+            cd_values: vec![2, 2, 1, 128, 9, 0, 0],
+        }],
+    };
+    let frame = apply_filters(&pipeline, &input).unwrap();
+    assert_eq!(frame[16..20], 20u32.to_le_bytes());
+    assert_eq!(reverse_filters(&pipeline, &frame).unwrap(), input);
+    let mut padded = frame[..20].to_vec();
+    padded[12..16].copy_from_slice(&(frame.len() as u32 + 8).to_le_bytes());
+    padded[16..20].copy_from_slice(&28u32.to_le_bytes());
+    padded.extend([0; 8]);
+    padded.extend_from_slice(&frame[20..]);
+    // What rust-hdf5 0.7.8 reads it as.
+    let read_by_0_7_8: [u8; 128] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 79, 0, 0, 0, 34, 0, 98, 0, 224, 1, 0, 3, 218, 0, 0, 3,
+        224, 2, 2, 121, 0, 229, 32, 13, 0, 89, 32, 3, 64, 0, 1, 138, 127, 32, 3, 64, 0, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 51, 1, 1, 1, 1, 1, 1, 140, 1, 1, 1, 1, 1, 1, 40, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 8, 1, 1, 1, 1, 213, 1, 1, 1, 1, 1, 1, 1, 1, 1, 126, 1, 1, 1, 1, 1, 1, 0, 199,
+        0, 93, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 254, 0, 0, 0, 0,
+    ];
+    assert_eq!(reverse_filters(&pipeline, &padded).unwrap(), read_by_0_7_8);
 }
 
 /// A 0.7.8 chunk with other version bytes or a shorter length in its
