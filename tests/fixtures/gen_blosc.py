@@ -79,6 +79,11 @@ def records():
     for clevel in range(1, 10):
         yield 0, 1, 4, clevel, SMOOTH, 34000
     yield 0, 1, 4, 9, SMOOTH, 70000          # one block past 64 KiB
+    # past BLOSC_POOL_MIN_DECODE: the `parallel` feature's block pool
+    for c in range(6):
+        yield c, 1, 4, 3 if c in HCR else 5, SMOOTH, 1050000
+    yield 0, 2, 4, 5, SMOOTH, 1050000
+    yield 0, 1, 4, 5, MIXED, 1050000
 
 
 def load(path):

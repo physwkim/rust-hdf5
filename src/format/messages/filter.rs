@@ -2129,6 +2129,13 @@ const BLOSC_MAX_SPLITS: usize = 16;
 #[cfg(feature = "blosc")]
 const BLOSC_L1: usize = 32 * 1024;
 
+/// The smallest frames whose blocks go to the pool: below these, entering it
+/// cost more than it saved (blosclz/lz4/zstd, 4 and 24 threads).
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+const BLOSC_POOL_MIN_ENCODE: usize = 512 * 1024;
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+const BLOSC_POOL_MIN_DECODE: usize = 1024 * 1024;
+
 #[cfg(feature = "blosc")]
 const BLOSC_DOSHUFFLE: u8 = 0x1;
 #[cfg(feature = "blosc")]
@@ -2228,6 +2235,19 @@ impl BloscFrame {
         j + 1 == self.nblocks && !self.nbytes.is_multiple_of(self.blocksize)
     }
 
+    /// The most block `j` can take compressed with `compcode`; in a room this
+    /// large no stream's maxout is trimmed.
+    #[cfg(feature = "parallel")]
+    fn worst_case(&self, compcode: u32, j: usize) -> usize {
+        let nsplits = self.nsplits(j);
+        nsplits * (4 + blosc_maxout(compcode, self.block_len(j) / nsplits))
+    }
+
+    /// Block `j` of the frame's input `data`.
+    fn block_of<'a>(&self, data: &'a [u8], j: usize) -> &'a [u8] {
+        &data[j * self.blocksize..][..self.block_len(j)]
+    }
+
     fn block_len(&self, j: usize) -> usize {
         if self.is_leftover(j) {
             self.nbytes % self.blocksize
@@ -2299,6 +2319,17 @@ fn blosc_bitshuffle_block(
         bitshuffle_block_into(&src[..whole], scratch, dst, typesize);
     }
     dst[whole..].copy_from_slice(&src[whole..]);
+}
+
+/// The room a stream of `neblock` bytes may take before the frame's room
+/// left trims it.
+#[cfg(feature = "blosc")]
+fn blosc_maxout(compcode: u32, neblock: usize) -> usize {
+    if compcode == BLOSC_SNAPPY {
+        snap::raw::max_compress_len(neblock)
+    } else {
+        neblock
+    }
 }
 
 /// The per-frame state of `blosc_c`: the shuffled block and each codec's
@@ -2373,11 +2404,7 @@ impl BloscCompressor {
         let mut pos = 0usize;
         for split in src.chunks_exact(neblock).take(nsplits) {
             pos += 4;
-            let mut maxout = if self.compcode == BLOSC_SNAPPY {
-                snap::raw::max_compress_len(neblock)
-            } else {
-                neblock
-            };
+            let mut maxout = blosc_maxout(self.compcode, neblock);
             if pos + maxout > dest.len() {
                 if pos >= dest.len() {
                     return Ok(0);
@@ -2631,18 +2658,64 @@ fn blosc_compress_blocks(
     if ntbytes > out.len() {
         return Ok(0);
     }
+    #[cfg(feature = "parallel")]
+    let first = blosc_compress_pooled(frame, clevel, compcode, data, out, &mut ntbytes)?;
+    #[cfg(not(feature = "parallel"))]
+    let first = 0;
     let mut compressor = BloscCompressor::new(frame, clevel, compcode);
-    for j in 0..frame.nblocks {
+    for j in first..frame.nblocks {
         let at = BLOSC_MAX_OVERHEAD + 4 * j;
         out[at..at + 4].copy_from_slice(&(ntbytes as u32).to_le_bytes());
-        let src = &data[j * frame.blocksize..][..frame.block_len(j)];
-        let cbytes = compressor.block(j, src, &mut out[ntbytes..])?;
+        let cbytes = compressor.block(j, frame.block_of(data, j), &mut out[ntbytes..])?;
         if cbytes == 0 {
             return Ok(0);
         }
         ntbytes += cbytes;
     }
     Ok(ntbytes)
+}
+
+/// The pool's share of [`blosc_compress_blocks`]: every block compressed
+/// into room for its worst case, then copied to `out` at `*ntbytes` while the
+/// room left there holds that worst case — up to there the serial loop gives
+/// the same bytes. Returns the first block left to the serial loop.
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+fn blosc_compress_pooled(
+    frame: BloscFrame,
+    clevel: u32,
+    compcode: u32,
+    data: &[u8],
+    out: &mut [u8],
+    ntbytes: &mut usize,
+) -> FormatResult<usize> {
+    use rayon::prelude::*;
+    let pool = match crate::parallel::io_pool() {
+        Some(pool) if frame.nblocks > 1 && frame.nbytes >= BLOSC_POOL_MIN_ENCODE => pool,
+        _ => return Ok(0),
+    };
+    let blocks = pool.install(|| {
+        (0..frame.nblocks)
+            .into_par_iter()
+            .map_init(
+                || BloscCompressor::new(frame, clevel, compcode),
+                |c, j| {
+                    let mut block = vec![0u8; frame.worst_case(compcode, j)];
+                    let n = c.block(j, frame.block_of(data, j), &mut block)?;
+                    block.truncate(n);
+                    Ok(block)
+                },
+            )
+            .collect::<FormatResult<Vec<_>>>()
+    })?;
+    let mut j = 0;
+    while j < frame.nblocks && *ntbytes + frame.worst_case(compcode, j) <= out.len() {
+        let at = BLOSC_MAX_OVERHEAD + 4 * j;
+        out[at..at + 4].copy_from_slice(&(*ntbytes as u32).to_le_bytes());
+        out[*ntbytes..*ntbytes + blocks[j].len()].copy_from_slice(&blocks[j]);
+        *ntbytes += blocks[j].len();
+        j += 1;
+    }
+    Ok(j)
 }
 
 /// The per-frame state of `blosc_d`: where a shuffled block decodes before
@@ -2770,9 +2843,13 @@ fn blosc_decompress_into(src: &[u8], out: &mut [u8]) -> FormatResult<usize> {
         let body = &src[BLOSC_MAX_OVERHEAD..BLOSC_MAX_OVERHEAD + frame.nbytes];
         return Ok(copy_image_into(body, out));
     }
+    #[cfg(feature = "parallel")]
+    let first = blosc_decompress_pooled(&frame, src, out)?;
+    #[cfg(not(feature = "parallel"))]
+    let first = 0;
     let mut decompressor = BloscDecompressor::new(&frame);
     let mut spill = Vec::new();
-    for j in 0..frame.nblocks {
+    for j in first..frame.nblocks {
         let lo = j * frame.blocksize;
         let len = frame.block_len(j);
         if lo + len <= out.len() {
@@ -2787,6 +2864,34 @@ fn blosc_decompress_into(src: &[u8], out: &mut [u8]) -> FormatResult<usize> {
         }
     }
     Ok(frame.nbytes)
+}
+
+/// The pool's share of [`blosc_decompress_into`]: the blocks wholly inside
+/// `out`, decoded in place. Returns the first block left to the serial loop.
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+fn blosc_decompress_pooled(frame: &BloscFrame, src: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    use rayon::prelude::*;
+    let inside = if out.len() >= frame.nbytes {
+        frame.nblocks
+    } else {
+        out.len() / frame.blocksize
+    };
+    let pool = match crate::parallel::io_pool() {
+        Some(pool) if inside > 1 && frame.nbytes >= BLOSC_POOL_MIN_DECODE => pool,
+        _ => return Ok(0),
+    };
+    let end = frame.nbytes.min(out.len());
+    pool.install(|| {
+        out[..end]
+            .par_chunks_mut(frame.blocksize)
+            .take(inside)
+            .enumerate()
+            .try_for_each_init(
+                || BloscDecompressor::new(frame),
+                |d, (j, dest)| d.block(frame, j, src, dest),
+            )
+    })?;
+    Ok(inside)
 }
 
 /// `blosc_decompress` into a buffer of the length the header records.
@@ -4758,11 +4863,11 @@ mod tests {
             decoded[compcode as usize] += 1;
         }
         // blosclz, lz4 and lz4hc, snappy; zlib and zstd with their features
-        assert_eq!(decoded[..4], [46, 36, 36, 36]);
+        assert_eq!(decoded[..4], [49, 37, 37, 37]);
         #[cfg(feature = "deflate")]
-        assert_eq!(decoded[4], 36);
+        assert_eq!(decoded[4], 37);
         #[cfg(feature = "zstd")]
-        assert_eq!(decoded[5], 36);
+        assert_eq!(decoded[5], 37);
     }
 
     /// `apply_filters_into` writes what `apply_filters` returns and refuses a
@@ -4849,6 +4954,9 @@ mod tests {
                     blosc_decompress_into(&frame[..cut], &mut out).is_err(),
                     "cut {cut}"
                 );
+            }
+            if nbytes > 100_000 {
+                continue; // the flips below are slow on the 1 MB frames
             }
             let mut bad = frame.to_vec();
             for at in 16..bad.len().min(16 + 4 * 8 + 32) {
