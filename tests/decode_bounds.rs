@@ -181,6 +181,37 @@ fn deflate_bomb_is_refused() {
     );
 }
 
+/// A chunk a write or a shrink only partly replaces is read back first, and
+/// that read decodes under the chunk's image too.
+#[test]
+#[cfg(feature = "deflate")]
+fn read_modify_write_of_a_bomb_chunk_is_refused() {
+    let stored = apply_filters(&pipeline(&[(FILTER_DEFLATE, &[9])]), &vec![0u8; BOMB]).unwrap();
+    let path = std::env::temp_dir().join(format!("rust_hdf5_rmw_bomb_{}.h5", std::process::id()));
+    let file = rust_hdf5::H5File::create(&path).unwrap();
+    let dataset = |name| {
+        let ds = file
+            .new_dataset::<u8>()
+            .shape([2 * IMAGE])
+            .chunk(&[IMAGE])
+            .max_shape(&[None])
+            .deflate(6)
+            .create(name)
+            .unwrap();
+        ds.write_chunk_raw(0, &stored, 0).unwrap();
+        ds
+    };
+    let (written, write_peak) = peak_during(|| dataset("w").write_slice(&[0], &[16], &[1u8; 16]));
+    let (shrunk, shrink_peak) = peak_during(|| dataset("s").set_extent(&[IMAGE / 2]));
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    assert!(
+        written.is_err() && write_peak < PEAK_CAP && shrunk.is_err() && shrink_peak < PEAK_CAP,
+        "write_slice gave {written:?} at a peak of {write_peak} bytes, \
+         set_extent {shrunk:?} at {shrink_peak}"
+    );
+}
+
 #[test]
 #[cfg(feature = "lz4")]
 fn lz4_header_bomb_is_refused() {
