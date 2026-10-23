@@ -860,7 +860,7 @@ fn reverse_single_filter_into(filter: &Filter, data: &[u8], out: &mut [u8]) -> F
     }
     #[cfg(feature = "blosc")]
     if filter.id == FILTER_BLOSC {
-        return blosc_decompress_into(data, out);
+        return blosc_decompress_into(data, &filter.cd_values, out);
     }
     Ok(copy_image_into(
         &reverse_single_filter(filter, data, out.len())?,
@@ -1460,7 +1460,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], pass: Pass) -> FormatResult
         #[cfg(feature = "blosc")]
         FILTER_BLOSC => match pass {
             Pass::Forward => blosc_compress(data, filter),
-            Pass::Reverse { limit } => blosc_decompress(data, limit),
+            Pass::Reverse { limit } => blosc_decompress(data, &filter.cd_values, limit),
         },
         #[cfg(not(feature = "blosc"))]
         FILTER_BLOSC => Err(FormatError::UnsupportedFeature(
@@ -2767,6 +2767,28 @@ impl BloscScratch {
         }
         Ok(())
     }
+
+    /// Decode the one stream of a frame rust-hdf5 0.7.8 wrote into `dest`,
+    /// its nbytes long, unshuffling it as 0.7.8's `unshuffle` did.
+    fn decompress_078(
+        &mut self,
+        frame: &BloscFrame,
+        compformat: u8,
+        stream: &[u8],
+        dest: &mut [u8],
+    ) -> FormatResult<()> {
+        let BloscScratch { tmp, codecs, .. } = self;
+        if !frame.byte_shuffled() {
+            return codecs.decompress(compformat, stream, dest);
+        }
+        let n = dest.len();
+        if tmp.len() < n {
+            tmp.resize(n, 0);
+        }
+        codecs.decompress(compformat, stream, &mut tmp[..n])?;
+        blosc_shuffle_block(frame.typesize, &tmp[..n], dest, true);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "blosc")]
@@ -3124,10 +3146,31 @@ fn blosc_compress_pooled(
     })
 }
 
+/// A stored blosc chunk, as [`blosc_frame`] reads its header.
+#[cfg(feature = "blosc")]
+enum BloscStored {
+    /// A c-blosc 1.x frame.
+    Frame(BloscFrame),
+    /// What rust-hdf5 0.7.8 wrote: the header, with `blocksize` == `nbytes`
+    /// and no flag but DOSHUFFLE, then one stream over the whole input,
+    /// byte-shuffled under that flag, of the codec in `cd_values[6]` (LZ4
+    /// when absent) — no bstarts. It is read, never written.
+    Legacy078(BloscFrame),
+}
+
+#[cfg(feature = "blosc")]
+impl BloscStored {
+    fn frame(&self) -> &BloscFrame {
+        match self {
+            BloscStored::Frame(frame) | BloscStored::Legacy078(frame) => frame,
+        }
+    }
+}
+
 /// The header of the frame `src` (`blosc_cbuffer_sizes`), checked against
 /// the bytes it claims: a MEMCPYED body, or the bstarts table.
 #[cfg(feature = "blosc")]
-fn blosc_frame(src: &[u8]) -> FormatResult<BloscFrame> {
+fn blosc_frame(src: &[u8]) -> FormatResult<BloscStored> {
     let bad = |what: &str| FormatError::InvalidData(format!("blosc: {what}"));
     if src.len() < BLOSC_MAX_OVERHEAD {
         return Err(bad("header too short"));
@@ -3137,18 +3180,36 @@ fn blosc_frame(src: &[u8]) -> FormatResult<BloscFrame> {
     if nbytes > BLOSC_MAX_BUFFERSIZE {
         return Err(bad("nbytes exceeds BLOSC_MAX_BUFFERSIZE"));
     }
+    // A c-blosc frame of one block (blocksize == nbytes) starts it at 20,
+    // past the header and its one bstarts entry; a 0.7.8 stream never opens
+    // with those four bytes: BloscLZ sets bit 5 of its first, LZ4 would name
+    // offset 0, zlib opens 0x78, zstd with its magic, and Snappy only for a
+    // 20-byte input opening with two one-byte literals, which snap merges.
+    // The empty stream 0.7.8 wrote for a BloscLZ input under 16 bytes
+    // decodes short of its nbytes and fails.
+    let legacy = src[..2] == [BLOSC_VERSION_FORMAT, BLOSC_CODEC_VERSION_FORMAT]
+        && flags & !BLOSC_DOSHUFFLE == 0
+        && nbytes > 0
+        && blocksize == nbytes
+        && word(12) == src.len()
+        && (src.len() < BLOSC_MAX_OVERHEAD + 4 || word(16) != BLOSC_MAX_OVERHEAD + 4);
+    if legacy {
+        return Ok(BloscStored::Legacy078(BloscFrame::new(
+            flags, typesize, nbytes, blocksize,
+        )));
+    }
     if flags & BLOSC_MEMCPYED != 0 || nbytes == 0 {
         if flags & BLOSC_MEMCPYED != 0 && src.len() < BLOSC_MAX_OVERHEAD + nbytes {
             return Err(bad("memcpy frame shorter than its nbytes"));
         }
         // nothing to decode block by block
-        return Ok(BloscFrame {
+        return Ok(BloscStored::Frame(BloscFrame {
             flags,
             typesize,
             nbytes,
             blocksize,
             nblocks: 0,
-        });
+        }));
     }
     if blocksize == 0 || typesize == 0 {
         return Err(bad("zero blocksize or typesize"));
@@ -3157,32 +3218,42 @@ fn blosc_frame(src: &[u8]) -> FormatResult<BloscFrame> {
     if src.len() < BLOSC_MAX_OVERHEAD + 4 * frame.nblocks {
         return Err(bad("bstarts run past the frame"));
     }
-    Ok(frame)
+    Ok(BloscStored::Frame(frame))
 }
 
 /// `blosc_decompress` straight into `out`, returning the frame's
 /// uncompressed length; a frame whose nbytes `out` cannot hold fails, as
-/// `blosc_decompress_ctx` refuses a short `destsize`.
+/// `blosc_decompress_ctx` refuses a short `destsize`. `cd_values` name the
+/// codec of a frame rust-hdf5 0.7.8 wrote.
 #[cfg(feature = "blosc")]
-fn blosc_decompress_into(src: &[u8], out: &mut [u8]) -> FormatResult<usize> {
-    let frame = blosc_frame(src)?;
+fn blosc_decompress_into(src: &[u8], cd_values: &[u32], out: &mut [u8]) -> FormatResult<usize> {
+    let stored = blosc_frame(src)?;
+    let frame = stored.frame();
     if frame.nbytes > out.len() {
         return Err(past_limit("blosc", out.len()));
     }
     let out = &mut out[..frame.nbytes];
+    if let BloscStored::Legacy078(frame) = &stored {
+        let compformat = blosc_compformat(cd_values.get(6).copied().unwrap_or(BLOSC_LZ4))?;
+        let stream = &src[BLOSC_MAX_OVERHEAD..];
+        with_blosc_scratch(frame.nbytes, |s| {
+            s.decompress_078(frame, compformat, stream, out)
+        })?;
+        return Ok(frame.nbytes);
+    }
     if frame.flags & BLOSC_MEMCPYED != 0 {
         out.copy_from_slice(&src[BLOSC_MAX_OVERHEAD..BLOSC_MAX_OVERHEAD + frame.nbytes]);
         return Ok(frame.nbytes);
     }
     #[cfg(feature = "parallel")]
-    let first = blosc_decompress_pooled(&frame, src, out)?;
+    let first = blosc_decompress_pooled(frame, src, out)?;
     #[cfg(not(feature = "parallel"))]
     let first = 0;
     // A header's blocksize past nbytes makes one short block.
     with_blosc_scratch(frame.blocksize.min(frame.nbytes), |scratch| {
         for j in first..frame.nblocks {
             let lo = j * frame.blocksize;
-            scratch.decompress_block(&frame, j, src, &mut out[lo..lo + frame.block_len(j)])?;
+            scratch.decompress_block(frame, j, src, &mut out[lo..lo + frame.block_len(j)])?;
         }
         Ok(frame.nbytes)
     })
@@ -3212,13 +3283,13 @@ fn blosc_decompress_pooled(frame: &BloscFrame, src: &[u8], out: &mut [u8]) -> Fo
 /// `blosc_decompress` into a buffer of the length the header records, which
 /// may be at most `limit`.
 #[cfg(feature = "blosc")]
-fn blosc_decompress(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
-    let nbytes = blosc_frame(data)?.nbytes;
+fn blosc_decompress(data: &[u8], cd_values: &[u32], limit: usize) -> FormatResult<Vec<u8>> {
+    let nbytes = blosc_frame(data)?.frame().nbytes;
     if nbytes > limit {
         return Err(past_limit("blosc", limit));
     }
     let mut out = vec![0u8; nbytes];
-    blosc_decompress_into(data, &mut out)?;
+    blosc_decompress_into(data, cd_values, &mut out)?;
     Ok(out)
 }
 
@@ -5181,6 +5252,12 @@ mod tests {
             if compcode == BLOSC_BLOSCLZ || frame[2] & BLOSC_MEMCPYED != 0 {
                 assert_eq!(ours, frame, "{ctx} encode");
             }
+            for f in [frame, &ours[..]] {
+                assert!(
+                    matches!(blosc_frame(f), Ok(BloscStored::Frame(_))),
+                    "{ctx} read as 0.7.8's"
+                );
+            }
             assert_eq!(
                 reverse_filters(&pipeline, &ours).unwrap(),
                 input,
@@ -5335,7 +5412,7 @@ mod tests {
             for cut in [0, 15, 16, 17, frame.len() / 2] {
                 let cut = cut.min(frame.len() - 1);
                 assert!(
-                    blosc_decompress_into(&frame[..cut], &mut out).is_err(),
+                    blosc_decompress_into(&frame[..cut], &cd, &mut out).is_err(),
                     "cut {cut}"
                 );
             }
@@ -5345,7 +5422,7 @@ mod tests {
             let mut bad = frame.to_vec();
             for at in 16..bad.len().min(16 + 4 * 8 + 32) {
                 bad[at] ^= 0x5A;
-                let _ = blosc_decompress_into(&bad, &mut out);
+                let _ = blosc_decompress_into(&bad, &cd, &mut out);
                 bad[at] ^= 0x5A;
             }
         }
