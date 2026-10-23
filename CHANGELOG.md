@@ -24,7 +24,10 @@
   c-blosc cannot read, and decoded a compressed c-blosc frame as such a
   stream. Chunks 0.7.8 wrote are still read, with the codec their
   `cd_values[6]` names; a BloscLZ input under 16 bytes, which 0.7.8
-  stored as a header with no payload, is refused.
+  stored as a header with no payload, is refused. A frame valid in both
+  layouts, which only a one-block c-blosc frame whose stream does not
+  follow its bstarts entry can be and no encoder writes, is read as
+  0.7.8's.
 - A stored chunk whose filters decode to more or fewer bytes than its
   image is refused by every read and by the read-back of a partial write
   or a shrink. `reverse_filters_masked_into` returns `Err` for such a
