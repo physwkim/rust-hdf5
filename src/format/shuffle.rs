@@ -220,6 +220,7 @@ fn shuffle_bit_eightelem_from(
 
 /// The stage buffers of one block's transposes, sized for the largest block
 /// of a stream and reused across its blocks.
+#[derive(Default)]
 pub(crate) struct BitshuffleScratch {
     a: Vec<u8>,
     b: Vec<u8>,
@@ -231,6 +232,15 @@ impl BitshuffleScratch {
         Self {
             a: vec![0u8; nbyte],
             b: vec![0u8; nbyte],
+        }
+    }
+
+    /// Make room for blocks of up to `nbyte` bytes; the buffers only grow.
+    #[cfg(feature = "blosc")]
+    pub(crate) fn grow(&mut self, nbyte: usize) {
+        if self.a.len() < nbyte {
+            self.a.resize(nbyte, 0);
+            self.b.resize(nbyte, 0);
         }
     }
 }
