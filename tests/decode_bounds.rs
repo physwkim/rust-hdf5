@@ -341,6 +341,8 @@ fn boundary_pipelines() -> Vec<(&'static str, FilterPipeline, u32)> {
         ),
         // The shuffle was skipped on write: the deflate decodes the image.
         ("masked shuffle+deflate", deflate, shuffle_deflate(), 1),
+        // Both were: the stored bytes are the image.
+        ("all-masked shuffle+deflate", true, shuffle_deflate(), 3),
         (
             "zstd",
             cfg!(feature = "zstd"),
