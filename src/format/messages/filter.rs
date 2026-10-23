@@ -729,13 +729,17 @@ fn copy_image_into(image: &[u8], out: &mut [u8]) -> usize {
 /// produced (which may exceed `out.len()`; see
 /// [`reverse_filters_masked_into`]).
 ///
-/// Only the inflate has a decoder that can be pointed at a caller's buffer;
-/// every other filter builds its image and copies it, which is what the caller
-/// would have done with it anyway.
+/// Only the inflate and blosc have decoders that can be pointed at a caller's
+/// buffer; every other filter builds its image and copies it, which is what
+/// the caller would have done with it anyway.
 fn reverse_single_filter_into(filter: &Filter, data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
     #[cfg(feature = "deflate")]
     if filter.id == FILTER_DEFLATE {
         return inflate_zlib_into(data, out);
+    }
+    #[cfg(feature = "blosc")]
+    if filter.id == FILTER_BLOSC {
+        return blosc_decompress_into(data, out);
     }
     Ok(copy_image_into(
         &apply_single_filter(filter, data, false)?,
