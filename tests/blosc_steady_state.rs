@@ -204,19 +204,23 @@ fn a_block_past_the_largest_blosc_makes_is_not_kept() {
 }
 
 /// A thread keeps a zstd context of up to the workspace of a level-15
-/// stream of 512 KiB, and builds one for each larger stream: a clevel 8 frame
-/// of 512 KiB compresses a second time with the allocations of a kept
-/// context, a clevel 9 frame of 512 KiB with those of a new one.
+/// stream of 512 KiB, whatever its level, and builds one for each larger
+/// stream: a frame compresses a second time with the allocations of a kept
+/// context at clevel 8 and 512 KiB and at clevel 9 and 256 KiB, and with
+/// those of a new one at clevel 9 and 256 KiB + 2.
 #[cfg(feature = "zstd")]
 #[test]
 fn a_zstd_workspace_past_the_kept_bound_is_not_kept() {
     let _serial = serial();
-    let nbytes = 512 * 1024;
-    let data = image(nbytes);
-    let mut out = vec![0u8; nbytes + 16];
     let mut kept = Vec::new();
-    // (blosc clevel, its zstd level, the workspace of its one stream)
-    for (clevel, level, workspace) in [(8, 15, 8_900_472), (9, 22, 9_694_198)] {
+    // (blosc clevel, its zstd level, frame and stream length, the workspace)
+    for (clevel, level, nbytes, workspace) in [
+        (8, 15, 512 * 1024, 8_900_472),
+        (9, 22, 256 * 1024, 5_499_894),
+        (9, 22, 256 * 1024 + 2, 9_694_198),
+    ] {
+        let data = image(nbytes);
+        let mut out = vec![0u8; nbytes + 16];
         let mut z = rust_zstd::Compressor::new(rust_zstd::CompressOptions {
             level,
             ..Default::default()
@@ -241,5 +245,5 @@ fn a_zstd_workspace_past_the_kept_bound_is_not_kept() {
         // The steady state's allowance for one zstd stream.
         kept.push(least <= 2);
     }
-    assert_eq!(kept, [true, false]);
+    assert_eq!(kept, [true, true, false]);
 }
