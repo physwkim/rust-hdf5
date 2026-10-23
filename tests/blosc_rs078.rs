@@ -2,8 +2,8 @@
 //! frames: `fixtures/blosc_rs078.h5`, from `fixtures/gen_blosc_rs078.rs`.
 #![cfg(feature = "blosc")]
 
-use rust_hdf5::format::messages::filter::reverse_filters;
-use rust_hdf5::{FilterPipeline, H5File};
+use rust_hdf5::format::messages::filter::{apply_filters, reverse_filters, FILTER_BLOSC};
+use rust_hdf5::{Filter, FilterPipeline, H5File};
 
 const FIXTURE: &str = "tests/fixtures/blosc_rs078.h5";
 
@@ -77,4 +77,40 @@ fn a_0_7_8_chunk_written_without_its_payload_is_refused() {
     assert_eq!(ds.read_chunk_raw_at(&[0]).unwrap().0.len(), 16);
     assert!(ds.read_raw::<u8>().is_err());
     assert!(ds.read_slice::<u8>(&[2], &[3]).is_err());
+}
+
+/// A one-block c-blosc frame with 8 bytes between its bstarts entry and its
+/// stream, which c-blosc reads, also decodes as a 0.7.8 BloscLZ stream to
+/// other bytes.
+#[test]
+fn a_c_frame_padded_after_its_bstarts_is_refused() {
+    let mut x = 40u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let input: Vec<u8> = (0..128)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(8) {
+                (x >> 32) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
+    let pipeline = FilterPipeline {
+        filters: vec![Filter {
+            id: FILTER_BLOSC,
+            flags: 0,
+            cd_values: vec![2, 2, 1, 128, 9, 0, 0],
+        }],
+    };
+    let frame = apply_filters(&pipeline, &input).unwrap();
+    assert_eq!(frame[16..20], 20u32.to_le_bytes());
+    assert_eq!(reverse_filters(&pipeline, &frame).unwrap(), input);
+    let mut padded = frame[..20].to_vec();
+    padded[12..16].copy_from_slice(&(frame.len() as u32 + 8).to_le_bytes());
+    padded[16..20].copy_from_slice(&28u32.to_le_bytes());
+    padded.extend([0; 8]);
+    padded.extend_from_slice(&frame[20..]);
+    assert!(reverse_filters(&pipeline, &padded).is_err());
 }

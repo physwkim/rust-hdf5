@@ -3187,7 +3187,10 @@ fn blosc_frame(src: &[u8], cd_values: &[u32]) -> FormatResult<BloscStored> {
     // offset 0, zlib opens 0x78, zstd with its magic, and Snappy only for a
     // 20-byte input opening with two one-byte literals, which snap merges.
     // The empty stream 0.7.8 wrote for a BloscLZ input under 16 bytes
-    // decodes short of its nbytes and fails.
+    // decodes short of its nbytes and fails. A one-block c-blosc frame with
+    // bytes between its bstarts entry and its stream, which no encoder
+    // writes, passes these checks too; one whose streams then end at cbytes
+    // reads either way and is refused.
     let legacy = src[..2] == [BLOSC_VERSION_FORMAT, BLOSC_CODEC_VERSION_FORMAT]
         && flags & !BLOSC_DOSHUFFLE == 0
         && nbytes > 0
@@ -3195,6 +3198,9 @@ fn blosc_frame(src: &[u8], cd_values: &[u32]) -> FormatResult<BloscStored> {
         && word(12) == src.len()
         && (src.len() < BLOSC_MAX_OVERHEAD + 4 || word(16) != BLOSC_MAX_OVERHEAD + 4);
     if legacy {
+        if blosc_one_block_walks(src, &BloscFrame::new(flags, typesize, nbytes, blocksize)) {
+            return Err(bad("frame reads as c-blosc's and as rust-hdf5 0.7.8's"));
+        }
         // 0.7.8 shuffled by cd_values[2] and kept only its low byte here.
         let typesize = cd_values.get(2).map_or(typesize, |&t| t as usize);
         return Ok(BloscStored::Legacy078 {
@@ -3223,6 +3229,31 @@ fn blosc_frame(src: &[u8], cd_values: &[u32]) -> FormatResult<BloscStored> {
         return Err(bad("bstarts run past the frame"));
     }
     Ok(BloscStored::Frame(frame))
+}
+
+/// Whether `src` walks as the c-blosc frame of one block `frame` reads:
+/// from its bstarts entry each stream `decompress_block` would take is in
+/// `src`, and the last ends where `src` does.
+#[cfg(feature = "blosc")]
+fn blosc_one_block_walks(src: &[u8], frame: &BloscFrame) -> bool {
+    if frame.typesize == 0 || src.len() < BLOSC_MAX_OVERHEAD + 4 {
+        return false;
+    }
+    let nsplits = frame.nsplits(0);
+    if !frame.nbytes.is_multiple_of(nsplits) {
+        return false;
+    }
+    let mut pos = u32::from_le_bytes(src[16..20].try_into().unwrap()) as usize;
+    for _ in 0..nsplits {
+        let Some(csize) = pos.checked_add(4).and_then(|end| src.get(pos..end)) else {
+            return false;
+        };
+        let Ok(csize) = usize::try_from(i32::from_le_bytes(csize.try_into().unwrap())) else {
+            return false;
+        };
+        pos += 4 + csize;
+    }
+    pos == src.len()
 }
 
 /// `blosc_decompress` straight into `out`, returning the frame's
