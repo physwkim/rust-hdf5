@@ -2543,8 +2543,10 @@ fn carve_sinks<'a>(
 ///
 /// The counterpart of [`decompress_chunk`] for a chunk whose image is already
 /// the output's own bytes. A length below `out.len()` means the stored chunk
-/// decoded short; a length above it means the surplus was discarded, which is
-/// what copying `out.len()` bytes out of a materialized image does too.
+/// decoded short. A filter whose output would outrun `out` fails; a length
+/// above it comes only from stored bytes no filter ran over, and means the
+/// surplus was discarded, which is what copying `out.len()` bytes out of them
+/// does too.
 fn decompress_chunk_into(
     pipeline: Option<&FilterPipeline>,
     raw: &[u8],
@@ -2580,9 +2582,12 @@ fn decompress_chunk(
 ) -> IoResult<Vec<u8>> {
     let Some(pl) = pipeline else { return Ok(raw) };
     let Some(image_bytes) = image_bytes.and_then(|b| usize::try_from(b).ok()) else {
-        // Geometry a corrupt file can carry says nothing about the size; the
-        // pipeline discovers it.
-        return Ok(filter::reverse_filters_masked(pl, &raw, mask)?);
+        // Geometry a corrupt file can carry says nothing about the size, and
+        // nothing else bounds what the filters may decode to.
+        return Err(crate::format::FormatError::InvalidData(
+            "chunk image size is not addressable".into(),
+        )
+        .into());
     };
     let mut image = vec![0u8; image_bytes];
     let produced = filter::reverse_filters_masked_into(pl, &raw, mask, &mut image)?;

@@ -53,7 +53,7 @@ fn an_nbit_record_with_no_parameters_is_refused() {
 #[test]
 fn an_nbit_element_count_past_the_packed_chunk_is_refused() {
     let err = read_refusal("bad_nbit_decompress.h5", "Nbit_float_data_le");
-    assert!(err.contains("nbit: buffer too short"), "{err}");
+    assert!(err.contains("nbit: decodes past"), "{err}");
 }
 
 #[test]

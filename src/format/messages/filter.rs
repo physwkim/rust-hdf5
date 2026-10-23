@@ -626,7 +626,7 @@ pub fn apply_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec
         buf = Some(apply_single_filter(
             filter,
             buf.as_deref().unwrap_or(data),
-            true,
+            Pass::Forward,
         )?);
     }
     // Only an empty pipeline leaves `buf` unset, and only then is a copy of
@@ -652,7 +652,7 @@ pub fn apply_filters_into(
         buf = Some(apply_single_filter(
             filter,
             buf.as_deref().unwrap_or(data),
-            true,
+            Pass::Forward,
         )?);
     }
     let data = buf.as_deref().unwrap_or(data);
@@ -660,7 +660,7 @@ pub fn apply_filters_into(
     if last.id == FILTER_BLOSC {
         return blosc_compress_into(data, last, out);
     }
-    copy_output_into(&apply_single_filter(last, data, true)?, out)
+    copy_output_into(&apply_single_filter(last, data, Pass::Forward)?, out)
 }
 
 /// Copy a stage's whole output into `out`, which must hold it.
@@ -685,20 +685,39 @@ fn copy_output_into(output: &[u8], out: &mut [u8]) -> FormatResult<usize> {
 /// raw — so its reverse must be skipped here too. The mask addresses only the
 /// first 32 filters (the HDF5 limit); a position beyond that cannot be marked
 /// skipped and is always applied.
+///
+/// Nothing bounds what the stages decode to but the streams themselves; a
+/// caller that knows the image's size passes it to
+/// [`reverse_filters_masked_bounded`] or [`reverse_filters_masked_into`].
 pub fn reverse_filters_masked(
     pipeline: &FilterPipeline,
     data: &[u8],
     filter_mask: u32,
 ) -> FormatResult<Vec<u8>> {
+    reverse_filters_masked_bounded(pipeline, data, filter_mask, usize::MAX)
+}
+
+/// [`reverse_filters_masked`] for an image of at most `image_limit` bytes.
+///
+/// Every stage decodes under a bound: the image's for the last, and for the
+/// one above it the most the forward stage below could have written from
+/// that, and so on up. A stream that decodes past its
+/// stage's bound fails before more than about the bound is allocated.
+pub fn reverse_filters_masked_bounded(
+    pipeline: &FilterPipeline,
+    data: &[u8],
+    filter_mask: u32,
+    image_limit: usize,
+) -> FormatResult<Vec<u8>> {
     let mut buf: Option<Vec<u8>> = None;
     for (i, filter) in pipeline.filters.iter().enumerate().rev() {
-        if i < 32 && filter_mask & (1u32 << i) != 0 {
+        if is_masked(filter_mask, i) {
             continue;
         }
-        buf = Some(apply_single_filter(
+        buf = Some(reverse_single_filter(
             filter,
             buf.as_deref().unwrap_or(data),
-            false,
+            stage_limit(pipeline, filter_mask, i, image_limit),
         )?);
     }
     // Reached only when every filter was masked off (or the pipeline is
@@ -722,40 +741,87 @@ pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<V
 /// before the last still materialize their own buffer; only the last one has a
 /// destination the caller can name.
 ///
-/// The returned length is the whole image the pipeline produced, which may
-/// exceed `out.len()` — the surplus is discarded, exactly as a caller copying
-/// `out.len()` bytes out of a materialized image discards it. A length below
-/// `out.len()` means the stored chunk decoded short of its image; `out` past
-/// that length is then left **unspecified**, because the inflate writes its
-/// output in blocks and the last one can run past the byte the stream ends on.
-/// A caller whose destination may outlast the image owns every byte of it,
-/// not just the tail past the image.
+/// The stages decode under the bounds of [`reverse_filters_masked_bounded`]
+/// with `out.len()` as the image's, so a decoded image longer than `out` is an
+/// error. With every filter masked off the stored bytes are the image and are
+/// copied as they are; the returned length is then theirs, and a surplus is
+/// discarded. A length below `out.len()` means the stored chunk decoded short
+/// of its image; `out` past that length is then left **unspecified**, because
+/// the inflate writes its output in blocks and the last one can run past the
+/// byte the stream ends on. A caller whose destination may outlast the image
+/// owns every byte of it, not just the tail past the image.
 pub fn reverse_filters_masked_into(
     pipeline: &FilterPipeline,
     data: &[u8],
     filter_mask: u32,
     out: &mut [u8],
 ) -> FormatResult<usize> {
-    let masked = |i: usize| i < 32 && filter_mask & (1u32 << i) != 0;
     // The last stage to run is the lowest-numbered filter still in play; it is
     // the one whose output is the image, so it is the one that writes to `out`.
-    let Some(last) = (0..pipeline.filters.len()).find(|i| !masked(*i)) else {
+    let Some(last) = (0..pipeline.filters.len()).find(|i| !is_masked(filter_mask, *i)) else {
         // Every filter masked off (or an empty pipeline): the stored bytes are
         // already the chunk's image.
         return Ok(copy_image_into(data, out));
     };
     let mut buf: Option<Vec<u8>> = None;
     for (i, filter) in pipeline.filters.iter().enumerate().rev() {
-        if masked(i) || i == last {
+        if is_masked(filter_mask, i) || i == last {
             continue;
         }
-        buf = Some(apply_single_filter(
+        buf = Some(reverse_single_filter(
             filter,
             buf.as_deref().unwrap_or(data),
-            false,
+            stage_limit(pipeline, filter_mask, i, out.len()),
         )?);
     }
     reverse_single_filter_into(&pipeline.filters[last], buf.as_deref().unwrap_or(data), out)
+}
+
+/// Whether bit `i` of a chunk's filter mask skips filter `i`.
+fn is_masked(filter_mask: u32, i: usize) -> bool {
+    i < 32 && filter_mask & (1u32 << i) != 0
+}
+
+/// The most bytes the reverse of filter `i` may produce when the image is
+/// at most `image_limit`: what the unmasked filters below it write from the
+/// image, each bound taken from the one before.
+fn stage_limit(pipeline: &FilterPipeline, filter_mask: u32, i: usize, image_limit: usize) -> usize {
+    (0..i)
+        .filter(|j| !is_masked(filter_mask, *j))
+        .fold(image_limit, |n, j| encoded_bound(&pipeline.filters[j], n))
+}
+
+/// The most bytes `filter` writes forward from an `n`-byte input.
+///
+/// A compressor's bound covers every encoder the filter's format names:
+/// LZ4 framing with 1-byte blocks stores each byte behind a 4-byte length,
+/// five bytes per byte, and the largest fixed overhead is bzip2's 600.
+fn encoded_bound(filter: &Filter, n: usize) -> usize {
+    match filter.id {
+        FILTER_SHUFFLE | FILTER_BITGROOM | FILTER_BITROUND => n,
+        FILTER_FLETCHER32 => n.saturating_add(4),
+        // libhdf5 reports the packed bytes plus one.
+        FILTER_NBIT => n.saturating_add(1),
+        // The 21-byte parameter header, then the packed bytes plus one.
+        FILTER_SCALEOFFSET => n.saturating_add(22),
+        _ => n.saturating_mul(5).saturating_add(1024),
+    }
+}
+
+/// The error of a stage whose output would pass its bound.
+fn past_limit(what: &str, limit: usize) -> FormatError {
+    FormatError::InvalidData(format!(
+        "{what}: decodes past the {limit} bytes it may produce"
+    ))
+}
+
+/// Reverse one filter, refusing output past `limit`.
+fn reverse_single_filter(filter: &Filter, data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
+    let out = apply_single_filter(filter, data, Pass::Reverse { limit })?;
+    if out.len() > limit {
+        return Err(past_limit(&format!("filter {}", filter.id), limit));
+    }
+    Ok(out)
 }
 
 /// Copy an already-decoded image into a caller's destination, returning the
@@ -767,8 +833,7 @@ fn copy_image_into(image: &[u8], out: &mut [u8]) -> usize {
 }
 
 /// Reverse one filter into `out`, returning the length of the image it
-/// produced (which may exceed `out.len()`; see
-/// [`reverse_filters_masked_into`]).
+/// produced, which `out` holds.
 ///
 /// Only the inflate and blosc have decoders that can be pointed at a caller's
 /// buffer; every other filter builds its image and copies it, which is what
@@ -783,7 +848,7 @@ fn reverse_single_filter_into(filter: &Filter, data: &[u8], out: &mut [u8]) -> F
         return blosc_decompress_into(data, out);
     }
     Ok(copy_image_into(
-        &apply_single_filter(filter, data, false)?,
+        &reverse_single_filter(filter, data, out.len())?,
         out,
     ))
 }
@@ -823,7 +888,44 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     dest
 }
 
-/// Inflate one zlib stream, growing a single output buffer.
+/// Run a streaming decoder into a buffer that grows by doubling from `start`
+/// up to one byte past `limit`: that byte filled means the stream decodes
+/// past its limit, which fails before anything larger is allocated.
+///
+/// `step` decodes into the window it is handed, returning the bytes it wrote
+/// and whether the stream ended; it fails a stream that stops short.
+#[cfg(any(feature = "deflate", feature = "zstd", feature = "bzip2"))]
+fn decode_growing(
+    what: &str,
+    start: usize,
+    limit: usize,
+    mut step: impl FnMut(&mut [u8]) -> FormatResult<(usize, bool)>,
+) -> FormatResult<Vec<u8>> {
+    let room = limit.saturating_add(1);
+    let mut out = vec![0u8; start.clamp(1, room)];
+    let mut filled = 0;
+    loop {
+        if filled == out.len() {
+            if filled == room {
+                return Err(past_limit(what, limit));
+            }
+            out.resize(out.len().saturating_mul(2).min(room), 0);
+        }
+        let (made, ended) = step(&mut out[filled..])?;
+        filled += made;
+        if ended {
+            break;
+        }
+    }
+    if filled > limit {
+        return Err(past_limit(what, limit));
+    }
+    out.truncate(filled);
+    Ok(out)
+}
+
+/// Inflate one zlib stream of at most `limit` bytes, growing a single output
+/// buffer.
 ///
 /// The engine is zlib-rs rather than the miniz_oxide behind `flate2`: on the
 /// same level-6 streams it inflates 1.2x faster on incompressible chunks and
@@ -836,63 +938,46 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
 /// per growth step, which on a 2 MiB chunk that compresses well costs about
 /// as much as the inflate itself.
 ///
-/// `expected` is the uncompressed length when the caller knows it — blosc
-/// records one in its own header. The deflate filter does not: HDF5 keeps the
-/// uncompressed chunk size nowhere the filter can see, so its buffer starts at
-/// the next power of two above the compressed length and doubles. Chunk sizes
-/// are themselves powers of two often enough that this usually lands on the
-/// exact size in two or three steps; doubling from the compressed length
-/// instead overshoots by up to 2x and cost more than `read_to_end` did.
+/// HDF5 keeps the uncompressed chunk size nowhere the filter can see, so the
+/// buffer starts at the next power of two above the compressed length and
+/// doubles. Chunk sizes are themselves powers of two often enough that this
+/// usually lands on the exact size in two or three steps; doubling from the
+/// compressed length instead overshoots by up to 2x and cost more than
+/// `read_to_end` did.
 #[cfg(feature = "deflate")]
-fn inflate_zlib(data: &[u8], expected: Option<usize>) -> FormatResult<Vec<u8>> {
+fn inflate_zlib(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
     use zlib_rs::{Inflate, InflateFlush, Status};
 
     let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
     // 15 is the largest LZ77 window; a stream that declares a smaller one in
     // its zlib header still inflates against it.
     let mut inflate = Inflate::new(true, 15);
-    let start = expected
-        .filter(|n| *n > 0)
-        .unwrap_or_else(|| data.len().max(4096).next_power_of_two());
-    let mut out = vec![0u8; start];
-    loop {
+    let start = data.len().max(4096).next_power_of_two();
+    decode_growing("deflate", start, limit, |window| {
         let consumed = inflate.total_in() as usize;
-        let filled = inflate.total_out() as usize;
-        if filled == out.len() {
-            out.resize(out.len() * 2, 0);
-        }
+        let before = inflate.total_out();
         let status = inflate
-            .decompress(&data[consumed..], &mut out[filled..], InflateFlush::NoFlush)
+            .decompress(&data[consumed..], window, InflateFlush::NoFlush)
             .map_err(|e| err(e.as_str()))?;
-        if status == Status::StreamEnd {
-            break;
-        }
+        let made = (inflate.total_out() - before) as usize;
+        let ended = status == Status::StreamEnd;
         // Neither side moved with output still to spare: the stored bytes end
         // before the stream does.
-        if inflate.total_in() as usize == consumed && inflate.total_out() as usize == filled {
+        if !ended && made == 0 && inflate.total_in() as usize == consumed {
             return Err(err("truncated stream"));
         }
-    }
-    out.truncate(inflate.total_out() as usize);
-    Ok(out)
+        Ok((made, ended))
+    })
 }
 
-/// Bytes of scratch the overflow drain works through when a stream turns out
-/// to be longer than the destination the caller named. Allocated only when
-/// that happens, which for a chunk whose image is the size the layout says it
-/// is never does.
-#[cfg(feature = "deflate")]
-const INFLATE_DRAIN_BYTES: usize = 32 * 1024;
-
-/// Inflate one zlib stream straight into `out`, returning the stream's whole
-/// decompressed length.
+/// Inflate one zlib stream straight into `out`, returning its decompressed
+/// length; a stream longer than `out` fails.
 ///
 /// The destination is fixed, so nothing is allocated, grown or copied: the
 /// [`inflate_zlib`] growth loop exists only because that spelling has no
-/// destination to write to. A stream longer than `out` keeps inflating through
-/// a small scratch buffer and the surplus is dropped — so a stream that is
-/// malformed past the caller's window still fails here, as it does when
-/// `inflate_zlib` grows a buffer to the stream's end.
+/// destination to write to. Once `out` is full the stream gets one byte more
+/// to write into, enough for its trailer to end it and too little for
+/// anything past `out` to pass unseen.
 ///
 /// `out` past the returned length is left unspecified: the decoder copies
 /// output in blocks and the block that finishes the stream may reach past the
@@ -903,28 +988,26 @@ fn inflate_zlib_into(data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
 
     let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
     let mut inflate = Inflate::new(true, 15);
-    let mut drain: Vec<u8> = Vec::new();
+    let mut probe = [0u8; 1];
     let mut filled = 0usize;
-    let mut produced = 0usize;
     loop {
         let consumed = inflate.total_in() as usize;
         let before = inflate.total_out();
-        let status = if filled < out.len() {
-            inflate.decompress(&data[consumed..], &mut out[filled..], InflateFlush::NoFlush)
+        let window = if filled < out.len() {
+            &mut out[filled..]
         } else {
-            if drain.is_empty() {
-                drain = vec![0u8; INFLATE_DRAIN_BYTES];
-            }
-            inflate.decompress(&data[consumed..], &mut drain, InflateFlush::NoFlush)
-        }
-        .map_err(|e| err(e.as_str()))?;
+            &mut probe[..]
+        };
+        let status = inflate
+            .decompress(&data[consumed..], window, InflateFlush::NoFlush)
+            .map_err(|e| err(e.as_str()))?;
         let made = (inflate.total_out() - before) as usize;
-        if filled < out.len() {
-            filled += made;
+        filled += made;
+        if filled > out.len() {
+            return Err(past_limit("deflate", out.len()));
         }
-        produced += made;
         if status == Status::StreamEnd {
-            break;
+            return Ok(filled);
         }
         // Neither side moved with output still to spare: the stored bytes end
         // before the stream does.
@@ -932,14 +1015,94 @@ fn inflate_zlib_into(data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
             return Err(err("truncated stream"));
         }
     }
-    Ok(produced)
 }
 
-fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatResult<Vec<u8>> {
+/// Decode the zstd frames of `data`, at most `limit` bytes of them.
+///
+/// `rust_zstd::decompress` sizes its output by the Frame_Content_Size a frame
+/// claims, or by what its blocks expand to; the streaming decoder writes into
+/// a buffer of ours instead, and takes no more memory than the content it has
+/// decoded, up to the frame's window.
+#[cfg(feature = "zstd")]
+fn zstd_decompress(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
+    let err = |e: String| FormatError::InvalidData(format!("zstd decompress: {e}"));
+    let mut zstd = rust_zstd::Decompressor::new();
+    let mut ip = 0;
+    let start = data.len().max(4096).next_power_of_two();
+    decode_growing("zstd", start, limit, |window| {
+        let mut op = 0;
+        let hint = zstd
+            .decompress_stream(data, &mut ip, window, &mut op)
+            .map_err(err)?;
+        // 0 with input left: another frame follows. Not 0 with the window
+        // full: the frame has more content than the window took.
+        if hint == 0 && ip < data.len() || hint != 0 && op == window.len() {
+            return Ok((op, false));
+        }
+        // The input has run out: between frames, or short of a frame's end.
+        zstd.finish().map_err(err)?;
+        Ok((op, true))
+    })
+}
+
+/// Decode the zstd frames of `src` straight into `dst`, returning their
+/// length; content past `dst` fails.
+#[cfg(all(feature = "zstd", feature = "blosc"))]
+fn zstd_decompress_into(src: &[u8], dst: &mut [u8]) -> FormatResult<usize> {
+    let err = |e: String| FormatError::InvalidData(format!("zstd decompress: {e}"));
+    let mut zstd = rust_zstd::Decompressor::new();
+    let (mut ip, mut op) = (0, 0);
+    loop {
+        let hint = zstd
+            .decompress_stream(src, &mut ip, dst, &mut op)
+            .map_err(err)?;
+        if hint == 0 && ip < src.len() {
+            continue;
+        }
+        if hint != 0 && op == dst.len() {
+            return Err(past_limit("zstd", dst.len()));
+        }
+        zstd.finish().map_err(err)?;
+        return Ok(op);
+    }
+}
+
+/// Decode one bzip2 stream of at most `limit` bytes, as `H5Z_filter_bzip2`
+/// decodes one and ignores what follows it.
+#[cfg(feature = "bzip2")]
+fn bzip2_decompress(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
+    let err =
+        |e: &dyn std::fmt::Display| FormatError::InvalidData(format!("bzip2 decompress: {e}"));
+    let mut bz = bzip2::Decompress::new(false);
+    let start = data.len().saturating_mul(3).max(4096);
+    decode_growing("bzip2", start, limit, |window| {
+        let consumed = bz.total_in() as usize;
+        let before = bz.total_out();
+        let status = bz
+            .decompress(&data[consumed..], window)
+            .map_err(|e| err(&e))?;
+        let made = (bz.total_out() - before) as usize;
+        let ended = status == bzip2::Status::StreamEnd;
+        if !ended && made == 0 && bz.total_in() as usize == consumed {
+            return Err(err(&"truncated stream"));
+        }
+        Ok((made, ended))
+    })
+}
+
+/// Which way a filter runs: forward on write, or in reverse on read under
+/// the most bytes the reverse may produce.
+#[derive(Clone, Copy)]
+enum Pass {
+    Forward,
+    Reverse { limit: usize },
+}
+
+fn apply_single_filter(filter: &Filter, data: &[u8], pass: Pass) -> FormatResult<Vec<u8>> {
     match filter.id {
         #[cfg(feature = "deflate")]
-        FILTER_DEFLATE => {
-            if compress {
+        FILTER_DEFLATE => match pass {
+            Pass::Forward => {
                 use flate2::write::ZlibEncoder;
                 use flate2::Compression;
                 use std::io::Write;
@@ -952,10 +1115,9 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 encoder
                     .finish()
                     .map_err(|e| FormatError::InvalidData(format!("deflate finish error: {}", e)))
-            } else {
-                inflate_zlib(data, None)
             }
-        }
+            Pass::Reverse { limit } => inflate_zlib(data, limit),
+        },
         #[cfg(not(feature = "deflate"))]
         FILTER_DEFLATE => Err(FormatError::UnsupportedFeature(
             "deflate filter requires the 'deflate' feature".into(),
@@ -963,14 +1125,13 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         FILTER_SHUFFLE => {
             // cd_values[0] = bytesoftype (element size)
             let bytesoftype = filter.cd_values.first().copied().unwrap_or(1) as usize;
-            if compress {
-                Ok(shuffle(data, bytesoftype))
-            } else {
-                Ok(unshuffle(data, bytesoftype))
+            match pass {
+                Pass::Forward => Ok(shuffle(data, bytesoftype)),
+                Pass::Reverse { .. } => Ok(unshuffle(data, bytesoftype)),
             }
         }
-        FILTER_FLETCHER32 => {
-            if compress {
+        FILTER_FLETCHER32 => match pass {
+            Pass::Forward => {
                 // Fletcher-32 appends a 4-byte checksum trailer. libhdf5
                 // (H5Zfletcher32.c) writes it with `UINT32ENCODE`, which is
                 // little-endian, over the single u32 returned by
@@ -979,7 +1140,8 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 let mut out = data.to_vec();
                 out.extend_from_slice(&cksum.to_le_bytes());
                 Ok(out)
-            } else {
+            }
+            Pass::Reverse { .. } => {
                 // Strip the trailing 4-byte checksum
                 if data.len() < 4 {
                     return Err(FormatError::InvalidData(
@@ -988,7 +1150,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 }
                 Ok(data[..data.len() - 4].to_vec())
             }
-        }
+        },
         FILTER_SZIP => {
             // cd_values layout per H5Zpublic.h: index 0 = options_mask,
             // 1 = pixels_per_block, 2 = bits_per_pixel, 3 = pixels_per_scanline.
@@ -1000,37 +1162,44 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             let pixels_per_block = filter.cd_values.get(1).copied().unwrap_or(32);
             let bits_per_pixel = filter.cd_values.get(2).copied().unwrap_or(8);
             let pixels_per_scanline = filter.cd_values.get(3).copied().unwrap_or(256);
-            if compress {
-                let compressed = crate::format::szip::compress(
-                    data,
-                    bits_per_pixel,
-                    pixels_per_block,
-                    pixels_per_scanline,
-                    options_mask,
-                )
-                .map_err(|e| FormatError::InvalidData(format!("SZIP compress: {}", e)))?;
-                // Prepend the 4-byte LE uncompressed-length header.
-                let mut out = Vec::with_capacity(compressed.len() + 4);
-                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                out.extend_from_slice(&compressed);
-                Ok(out)
-            } else {
-                if data.len() < 4 {
-                    return Err(FormatError::InvalidData(
-                        "SZIP: data too short for length header".into(),
-                    ));
+            match pass {
+                Pass::Forward => {
+                    let compressed = crate::format::szip::compress(
+                        data,
+                        bits_per_pixel,
+                        pixels_per_block,
+                        pixels_per_scanline,
+                        options_mask,
+                    )
+                    .map_err(|e| FormatError::InvalidData(format!("SZIP compress: {}", e)))?;
+                    // Prepend the 4-byte LE uncompressed-length header.
+                    let mut out = Vec::with_capacity(compressed.len() + 4);
+                    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&compressed);
+                    Ok(out)
                 }
-                // Read the 4-byte LE uncompressed-length header.
-                let out_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                crate::format::szip::decompress(
-                    &data[4..],
-                    out_size,
-                    bits_per_pixel,
-                    pixels_per_block,
-                    pixels_per_scanline,
-                    options_mask,
-                )
-                .map_err(|e| FormatError::InvalidData(format!("SZIP decompress: {}", e)))
+                Pass::Reverse { limit } => {
+                    if data.len() < 4 {
+                        return Err(FormatError::InvalidData(
+                            "SZIP: data too short for length header".into(),
+                        ));
+                    }
+                    // Read the 4-byte LE uncompressed-length header.
+                    let out_size =
+                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                    if out_size > limit {
+                        return Err(past_limit("SZIP", limit));
+                    }
+                    crate::format::szip::decompress(
+                        &data[4..],
+                        out_size,
+                        bits_per_pixel,
+                        pixels_per_block,
+                        pixels_per_scanline,
+                        options_mask,
+                    )
+                    .map_err(|e| FormatError::InvalidData(format!("SZIP decompress: {}", e)))
+                }
             }
         }
         // =====================================================================
@@ -1039,7 +1208,16 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // tree; both directions are byte-exact with libhdf5.
         // =====================================================================
         FILTER_NBIT => {
-            crate::format::nbit_scaleoffset::apply_nbit(data, &filter.cd_values, compress)
+            use crate::format::nbit_scaleoffset::{apply_nbit, nbit_decoded_len};
+            match pass {
+                Pass::Forward => apply_nbit(data, &filter.cd_values, true),
+                Pass::Reverse { limit } => {
+                    if nbit_decoded_len(&filter.cd_values).is_some_and(|n| n > limit) {
+                        return Err(past_limit("nbit", limit));
+                    }
+                    apply_nbit(data, &filter.cd_values, false)
+                }
+            }
         }
 
         // =====================================================================
@@ -1047,104 +1225,113 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // per-chunk minimum (H5Zscaleoffset.c). Both directions are byte-exact
         // with libhdf5.
         // =====================================================================
-        FILTER_SCALEOFFSET => {
-            if compress {
+        FILTER_SCALEOFFSET => match pass {
+            Pass::Forward => {
                 crate::format::nbit_scaleoffset::forward_scaleoffset(data, &filter.cd_values)
-            } else {
-                crate::format::nbit_scaleoffset::reverse_scaleoffset(data, &filter.cd_values)
             }
-        }
+            Pass::Reverse { limit } => {
+                use crate::format::nbit_scaleoffset::{
+                    reverse_scaleoffset, scaleoffset_decoded_len,
+                };
+                if scaleoffset_decoded_len(&filter.cd_values).is_some_and(|n| n > limit) {
+                    return Err(past_limit("scaleoffset", limit));
+                }
+                reverse_scaleoffset(data, &filter.cd_values)
+            }
+        },
         // =====================================================================
         // LZ4 (32004) — C-compatible block framing: 8-byte BE orig_size +
         // 4-byte BE block_size, then per-block: 4-byte BE compressed_size + data
         // =====================================================================
         #[cfg(feature = "lz4")]
         FILTER_LZ4 => {
-            if compress {
-                let orig_size = data.len() as u64;
-                let block_size = filter.cd_values.first().copied().unwrap_or(1 << 30) as usize;
-                let block_size = std::cmp::min(block_size, data.len());
-                let block_size = if block_size == 0 {
-                    data.len()
-                } else {
-                    block_size
-                };
-
-                let mut out = Vec::with_capacity(12 + data.len());
-                out.extend_from_slice(&orig_size.to_be_bytes());
-                out.extend_from_slice(&(block_size as u32).to_be_bytes());
-
-                let mut pos = 0;
-                while pos < data.len() {
-                    let end = std::cmp::min(pos + block_size, data.len());
-                    let block = &data[pos..end];
-                    let compressed = lz4_flex::compress(block);
-                    if compressed.len() >= block.len() {
-                        // Incompressible block: store uncompressed
-                        out.extend_from_slice(&(block.len() as u32).to_be_bytes());
-                        out.extend_from_slice(block);
+            match pass {
+                Pass::Forward => {
+                    let orig_size = data.len() as u64;
+                    let block_size = filter.cd_values.first().copied().unwrap_or(1 << 30) as usize;
+                    let block_size = std::cmp::min(block_size, data.len());
+                    let block_size = if block_size == 0 {
+                        data.len()
                     } else {
-                        out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-                        out.extend_from_slice(&compressed);
-                    }
-                    pos = end;
-                }
-                Ok(out)
-            } else {
-                if data.len() < 12 {
-                    return Err(FormatError::InvalidData("LZ4: header too short".into()));
-                }
-                let orig_size = u64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]) as usize;
-                // Sanity check: orig_size should not exceed a reasonable limit.
-                // HDF5 chunks are typically < 64MB.
-                if orig_size > 64 * 1024 * 1024 {
-                    return Err(FormatError::InvalidData(format!(
-                        "LZ4: orig_size {} exceeds 64MB limit",
-                        orig_size
-                    )));
-                }
-                let mut block_size =
-                    u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-                if block_size > orig_size {
-                    block_size = orig_size;
-                }
+                        block_size
+                    };
 
-                let mut output = Vec::with_capacity(orig_size);
-                let mut rpos = 12;
-                while output.len() < orig_size {
-                    if rpos + 4 > data.len() {
-                        break;
+                    let mut out = Vec::with_capacity(12 + data.len());
+                    out.extend_from_slice(&orig_size.to_be_bytes());
+                    out.extend_from_slice(&(block_size as u32).to_be_bytes());
+
+                    let mut pos = 0;
+                    while pos < data.len() {
+                        let end = std::cmp::min(pos + block_size, data.len());
+                        let block = &data[pos..end];
+                        let compressed = lz4_flex::compress(block);
+                        if compressed.len() >= block.len() {
+                            // Incompressible block: store uncompressed
+                            out.extend_from_slice(&(block.len() as u32).to_be_bytes());
+                            out.extend_from_slice(block);
+                        } else {
+                            out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+                            out.extend_from_slice(&compressed);
+                        }
+                        pos = end;
                     }
-                    let comp_size = u32::from_be_bytes([
-                        data[rpos],
-                        data[rpos + 1],
-                        data[rpos + 2],
-                        data[rpos + 3],
-                    ]) as usize;
-                    rpos += 4;
-                    if rpos + comp_size > data.len() {
-                        break;
+                    Ok(out)
+                }
+                Pass::Reverse { limit } => {
+                    if data.len() < 12 {
+                        return Err(FormatError::InvalidData("LZ4: header too short".into()));
+                    }
+                    let orig_size = u64::from_be_bytes([
+                        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                    ]);
+                    let orig_size = usize::try_from(orig_size)
+                        .ok()
+                        .filter(|n| *n <= limit)
+                        .ok_or_else(|| past_limit("LZ4", limit))?;
+                    let mut block_size =
+                        u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                    if block_size > orig_size {
+                        block_size = orig_size;
                     }
 
-                    let remaining = orig_size - output.len();
-                    let cur_block = std::cmp::min(block_size, remaining);
+                    let mut output = Vec::new();
+                    output.try_reserve_exact(orig_size).map_err(|_| {
+                        FormatError::InvalidData(format!("LZ4: cannot reserve {orig_size} bytes"))
+                    })?;
+                    let mut rpos = 12;
+                    while output.len() < orig_size {
+                        if rpos + 4 > data.len() {
+                            break;
+                        }
+                        let comp_size = u32::from_be_bytes([
+                            data[rpos],
+                            data[rpos + 1],
+                            data[rpos + 2],
+                            data[rpos + 3],
+                        ]) as usize;
+                        rpos += 4;
+                        if rpos + comp_size > data.len() {
+                            break;
+                        }
 
-                    if comp_size == cur_block {
-                        // Uncompressed block
-                        output.extend_from_slice(&data[rpos..rpos + comp_size]);
-                    } else {
-                        let decompressed =
-                            lz4_flex::decompress(&data[rpos..rpos + comp_size], cur_block)
-                                .map_err(|e| {
-                                    FormatError::InvalidData(format!("LZ4 decompress: {}", e))
-                                })?;
-                        output.extend_from_slice(&decompressed);
+                        let remaining = orig_size - output.len();
+                        let cur_block = std::cmp::min(block_size, remaining);
+
+                        if comp_size == cur_block {
+                            // Uncompressed block
+                            output.extend_from_slice(&data[rpos..rpos + comp_size]);
+                        } else {
+                            let decompressed =
+                                lz4_flex::decompress(&data[rpos..rpos + comp_size], cur_block)
+                                    .map_err(|e| {
+                                        FormatError::InvalidData(format!("LZ4 decompress: {}", e))
+                                    })?;
+                            output.extend_from_slice(&decompressed);
+                        }
+                        rpos += comp_size;
                     }
-                    rpos += comp_size;
+                    Ok(output)
                 }
-                Ok(output)
             }
         }
         #[cfg(not(feature = "lz4"))]
@@ -1156,15 +1343,13 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // ZSTD (32015) — Zstandard compression via pure Rust rust-zstd crate
         // =====================================================================
         #[cfg(feature = "zstd")]
-        FILTER_ZSTD => {
-            if compress {
+        FILTER_ZSTD => match pass {
+            Pass::Forward => {
                 let level = filter.cd_values.first().copied().unwrap_or(3) as i32;
                 Ok(rust_zstd::compress(data, level))
-            } else {
-                rust_zstd::decompress(data)
-                    .map_err(|e| FormatError::InvalidData(format!("zstd decompress: {}", e)))
             }
-        }
+            Pass::Reverse { limit } => zstd_decompress(data, limit),
+        },
         #[cfg(not(feature = "zstd"))]
         FILTER_ZSTD => Err(FormatError::UnsupportedFeature(
             "ZSTD filter requires the 'zstd' feature".into(),
@@ -1174,8 +1359,8 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // BZIP2 (307) — raw bzip2 stream
         // =====================================================================
         #[cfg(feature = "bzip2")]
-        FILTER_BZIP2 => {
-            if compress {
+        FILTER_BZIP2 => match pass {
+            Pass::Forward => {
                 use bzip2::write::BzEncoder;
                 use bzip2::Compression;
                 use std::io::Write;
@@ -1185,16 +1370,9 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                     .map_err(|e| FormatError::InvalidData(format!("bzip2 compress: {}", e)))?;
                 enc.finish()
                     .map_err(|e| FormatError::InvalidData(format!("bzip2 finish: {}", e)))
-            } else {
-                use bzip2::read::BzDecoder;
-                use std::io::Read;
-                let mut dec = BzDecoder::new(data);
-                let mut out = Vec::new();
-                dec.read_to_end(&mut out)
-                    .map_err(|e| FormatError::InvalidData(format!("bzip2 decompress: {}", e)))?;
-                Ok(out)
             }
-        }
+            Pass::Reverse { limit } => bzip2_decompress(data, limit),
+        },
         #[cfg(not(feature = "bzip2"))]
         FILTER_BZIP2 => Err(FormatError::UnsupportedFeature(
             "BZIP2 requires 'bzip2_filter' feature".into(),
@@ -1205,15 +1383,16 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // =====================================================================
         FILTER_LZF => {
             let chunk_size = filter.cd_values.get(2).copied().unwrap_or(0) as usize;
-            if compress {
-                Ok(lzf_compress(data))
-            } else {
-                let out_size = if chunk_size > 0 {
-                    chunk_size
-                } else {
-                    data.len() * 4
-                };
-                lzf_decompress(data, out_size)
+            match pass {
+                Pass::Forward => Ok(lzf_compress(data)),
+                Pass::Reverse { limit } => {
+                    let out_size = if chunk_size > 0 {
+                        chunk_size
+                    } else {
+                        data.len() * 4
+                    };
+                    lzf_decompress(data, out_size, limit)
+                }
             }
         }
 
@@ -1224,46 +1403,40 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             let elem_size = filter.cd_values.get(2).copied().unwrap_or(1) as usize;
             let block_size = filter.cd_values.get(3).copied().unwrap_or(0) as usize;
             let comp_type = filter.cd_values.get(4).copied().unwrap_or(0);
-            if compress {
-                bitshuffle_compress(data, elem_size, block_size, comp_type, filter)
-            } else {
-                bitshuffle_decompress(data, elem_size, block_size, comp_type)
+            match pass {
+                Pass::Forward => {
+                    bitshuffle_compress(data, elem_size, block_size, comp_type, filter)
+                }
+                Pass::Reverse { limit } => {
+                    bitshuffle_decompress(data, elem_size, block_size, comp_type, limit)
+                }
             }
         }
 
         // =====================================================================
         // BitGroom (32022) — lossy float quantization (alternating shave/set)
         // =====================================================================
-        FILTER_BITGROOM => {
-            if compress {
-                bitgroom_quantize(data, filter)
-            } else {
-                Ok(data.to_vec()) // no-op on decompress
-            }
-        }
+        FILTER_BITGROOM => match pass {
+            Pass::Forward => bitgroom_quantize(data, filter),
+            Pass::Reverse { .. } => Ok(data.to_vec()), // no-op on decompress
+        },
 
         // =====================================================================
         // Granular BitRound (32023) — lossy float quantization (round-then-shave)
         // =====================================================================
-        FILTER_BITROUND => {
-            if compress {
-                bitround_quantize(data, filter)
-            } else {
-                Ok(data.to_vec()) // no-op on decompress
-            }
-        }
+        FILTER_BITROUND => match pass {
+            Pass::Forward => bitround_quantize(data, filter),
+            Pass::Reverse { .. } => Ok(data.to_vec()), // no-op on decompress
+        },
 
         // =====================================================================
         // BLOSC (32001) — c-blosc 1.x frames
         // =====================================================================
         #[cfg(feature = "blosc")]
-        FILTER_BLOSC => {
-            if compress {
-                blosc_compress(data, filter)
-            } else {
-                blosc_decompress(data)
-            }
-        }
+        FILTER_BLOSC => match pass {
+            Pass::Forward => blosc_compress(data, filter),
+            Pass::Reverse { limit } => blosc_decompress(data, limit),
+        },
         #[cfg(not(feature = "blosc"))]
         FILTER_BLOSC => Err(FormatError::UnsupportedFeature(
             "BLOSC requires 'blosc' feature".into(),
@@ -1555,10 +1728,12 @@ fn lzf_compress(input: &[u8]) -> Vec<u8> {
 /// buffer on `E2BIG`) it is a sizing hint, not a bound on what the stream may
 /// expand to; the stream itself bounds that, at 88 bytes of output per byte
 /// of input (a 3-byte back-reference of 264 bytes), so a declared size past
-/// what the input could produce sizes nothing.
-fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
+/// what the input could produce sizes nothing. Output past `limit` fails.
+fn lzf_decompress(input: &[u8], max_output: usize, limit: usize) -> FormatResult<Vec<u8>> {
     const MAX_EXPANSION: usize = 88;
-    let reserve = max_output.min(input.len().saturating_mul(MAX_EXPANSION));
+    let reserve = max_output
+        .min(input.len().saturating_mul(MAX_EXPANSION))
+        .min(limit);
     let mut out = Vec::new();
     out.try_reserve_exact(reserve).map_err(|_| {
         FormatError::InvalidData(format!("LZF: cannot reserve {reserve} bytes of output"))
@@ -1576,6 +1751,9 @@ fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
                 return Err(FormatError::InvalidData(
                     "LZF: truncated literal run".into(),
                 ));
+            }
+            if out.len() + count > limit {
+                return Err(past_limit("LZF", limit));
             }
             out.extend_from_slice(&input[ip..ip + count]);
             ip += count;
@@ -1603,6 +1781,9 @@ fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
                 return Err(FormatError::InvalidData(
                     "LZF: invalid back-ref offset".into(),
                 ));
+            }
+            if out.len() + ml > limit {
+                return Err(past_limit("LZF", limit));
             }
             let ref_start = out.len() - off - 1;
             for i in 0..ml {
@@ -1766,12 +1947,16 @@ fn bitshuffle_decompress(
     elem_size: usize,
     block_size: usize,
     comp_type: u32,
+    limit: usize,
 ) -> FormatResult<Vec<u8>> {
     if comp_type == 0 {
         // No compression and no header: the stream is the same length as the
         // original, so reconstruct the canonical block plan from its length
         // and the filter's block size, then bitunshuffle each block. The
         // trailing `n_elems % 8` elements are raw.
+        if data.len() > limit {
+            return Err(past_limit("bitshuffle", limit));
+        }
         if elem_size == 0 {
             return Ok(data.to_vec());
         }
@@ -1813,7 +1998,11 @@ fn bitshuffle_decompress(
         }
         let orig_size = u64::from_be_bytes([
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ]) as usize;
+        ]);
+        let orig_size = usize::try_from(orig_size)
+            .ok()
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| past_limit("bitshuffle", limit))?;
         // Block size is read from the header, overriding the filter value
         // (matching the canonical filter), and must be a multiple of 8.
         let block_bytes = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
@@ -1828,14 +2017,17 @@ fn bitshuffle_decompress(
                 "bitshuffle: invalid block size in header".into(),
             ));
         }
-        // `orig_size` is file-derived; cap the pre-allocation so a hostile
-        // header cannot drive an unbounded allocation.
-        let mut output = Vec::with_capacity(orig_size.min(64 * 1024 * 1024));
+        let mut output = Vec::new();
+        output.try_reserve_exact(orig_size).map_err(|_| {
+            FormatError::InvalidData(format!("bitshuffle: cannot reserve {orig_size} bytes"))
+        })?;
         let mut rpos = 12;
 
         let n_elems = orig_size / elem_size;
-        let mut scratch = BitshuffleScratch::new(block_bytes);
-        let mut decompressed = vec![0u8; block_bytes];
+        // No block holds more than the chunk, whatever the header's size.
+        let block_room = block_bytes.min(orig_size);
+        let mut scratch = BitshuffleScratch::new(block_room);
+        let mut decompressed = vec![0u8; block_room];
         // Every block (full or final) is a length-prefixed LZ4 block; only the
         // `n_elems % 8` trailing elements are stored raw.
         for &block in &bshuf_block_plan(n_elems, block_elems) {
@@ -2516,14 +2708,7 @@ fn blosc_codec_decompress(compformat: u8, src: &[u8], dst: &mut [u8]) -> FormatR
         #[cfg(feature = "deflate")]
         BLOSC_ZLIB_FORMAT => inflate_zlib_into(src, dst)?,
         #[cfg(feature = "zstd")]
-        BLOSC_ZSTD_FORMAT => {
-            // rust-zstd decodes only into a buffer of its own.
-            let v = rust_zstd::decompress(src).map_err(|e| bad("zstd", &e))?;
-            if v.len() == dst.len() {
-                dst.copy_from_slice(&v);
-            }
-            v.len()
-        }
+        BLOSC_ZSTD_FORMAT => zstd_decompress_into(src, dst)?,
         #[cfg(not(feature = "deflate"))]
         BLOSC_ZLIB_FORMAT => {
             return Err(FormatError::UnsupportedFeature(
@@ -2832,72 +3017,61 @@ fn blosc_frame(src: &[u8]) -> FormatResult<BloscFrame> {
     Ok(frame)
 }
 
-/// `blosc_decompress` straight into `out`, returning the frame's whole
-/// uncompressed length (see [`reverse_filters_masked_into`]). Blocks past
-/// the end of `out` still decode — into scratch — so a frame corrupt past
-/// the caller's window fails here too.
+/// `blosc_decompress` straight into `out`, returning the frame's
+/// uncompressed length; a frame whose nbytes `out` cannot hold fails, as
+/// `blosc_decompress_ctx` refuses a short `destsize`.
 #[cfg(feature = "blosc")]
 fn blosc_decompress_into(src: &[u8], out: &mut [u8]) -> FormatResult<usize> {
     let frame = blosc_frame(src)?;
+    if frame.nbytes > out.len() {
+        return Err(past_limit("blosc", out.len()));
+    }
+    let out = &mut out[..frame.nbytes];
     if frame.flags & BLOSC_MEMCPYED != 0 {
-        let body = &src[BLOSC_MAX_OVERHEAD..BLOSC_MAX_OVERHEAD + frame.nbytes];
-        return Ok(copy_image_into(body, out));
+        out.copy_from_slice(&src[BLOSC_MAX_OVERHEAD..BLOSC_MAX_OVERHEAD + frame.nbytes]);
+        return Ok(frame.nbytes);
     }
     #[cfg(feature = "parallel")]
     let first = blosc_decompress_pooled(&frame, src, out)?;
     #[cfg(not(feature = "parallel"))]
     let first = 0;
     let mut decompressor = BloscDecompressor::new(&frame);
-    let mut spill = Vec::new();
     for j in first..frame.nblocks {
         let lo = j * frame.blocksize;
-        let len = frame.block_len(j);
-        if lo + len <= out.len() {
-            decompressor.block(&frame, j, src, &mut out[lo..lo + len])?;
-        } else {
-            spill.resize(len, 0);
-            decompressor.block(&frame, j, src, &mut spill)?;
-            if lo < out.len() {
-                let n = out.len() - lo;
-                out[lo..].copy_from_slice(&spill[..n]);
-            }
-        }
+        decompressor.block(&frame, j, src, &mut out[lo..lo + frame.block_len(j)])?;
     }
     Ok(frame.nbytes)
 }
 
-/// The pool's share of [`blosc_decompress_into`]: the blocks wholly inside
+/// The pool's share of [`blosc_decompress_into`]: every block of the frame,
 /// `out`, decoded in place. Returns the first block left to the serial loop.
 #[cfg(all(feature = "blosc", feature = "parallel"))]
 fn blosc_decompress_pooled(frame: &BloscFrame, src: &[u8], out: &mut [u8]) -> FormatResult<usize> {
     use rayon::prelude::*;
-    let inside = if out.len() >= frame.nbytes {
-        frame.nblocks
-    } else {
-        out.len() / frame.blocksize
-    };
     let pool = match crate::parallel::io_pool() {
-        Some(pool) if inside > 1 && frame.nbytes >= BLOSC_POOL_MIN_DECODE => pool,
+        Some(pool) if frame.nblocks > 1 && frame.nbytes >= BLOSC_POOL_MIN_DECODE => pool,
         _ => return Ok(0),
     };
-    let end = frame.nbytes.min(out.len());
     pool.install(|| {
-        out[..end]
-            .par_chunks_mut(frame.blocksize)
-            .take(inside)
+        out.par_chunks_mut(frame.blocksize)
             .enumerate()
             .try_for_each_init(
                 || BloscDecompressor::new(frame),
                 |d, (j, dest)| d.block(frame, j, src, dest),
             )
     })?;
-    Ok(inside)
+    Ok(frame.nblocks)
 }
 
-/// `blosc_decompress` into a buffer of the length the header records.
+/// `blosc_decompress` into a buffer of the length the header records, which
+/// may be at most `limit`.
 #[cfg(feature = "blosc")]
-fn blosc_decompress(data: &[u8]) -> FormatResult<Vec<u8>> {
-    let mut out = vec![0u8; blosc_frame(data)?.nbytes];
+fn blosc_decompress(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
+    let nbytes = blosc_frame(data)?.nbytes;
+    if nbytes > limit {
+        return Err(past_limit("blosc", limit));
+    }
+    let mut out = vec![0u8; nbytes];
     blosc_decompress_into(data, &mut out)?;
     Ok(out)
 }
@@ -3608,10 +3782,9 @@ mod tests {
         }
     }
 
-    /// The returned length is the image the pipeline produced, not what fitted:
-    /// a destination shorter than the image keeps its first bytes and reports
-    /// the whole length, a longer one is written only as far as the image goes.
-    /// Both are what a caller copying out of a materialized image would see.
+    /// The returned length is the image the pipeline produced, not the
+    /// destination's: a longer destination is written only as far as the
+    /// image goes. A shorter one bounds the decode and fails it.
     #[cfg(feature = "deflate")]
     #[test]
     fn reverse_into_reports_the_image_length_not_the_destination() {
@@ -3620,11 +3793,7 @@ mod tests {
         let compressed = apply_filters(&pipeline, &original).unwrap();
 
         let mut short = vec![0u8; 1000];
-        assert_eq!(
-            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut short).unwrap(),
-            original.len()
-        );
-        assert_eq!(short, original[..1000]);
+        assert!(reverse_filters_masked_into(&pipeline, &compressed, 0, &mut short).is_err());
 
         // A destination outlasting the image keeps the image; what the slack
         // past it holds is unspecified (the inflate's last output block can
@@ -3905,7 +4074,7 @@ mod tests {
         let data = vec![0u8; 1024];
         let compressed = lzf_compress(&data);
         assert!(compressed.len() < data.len());
-        let decompressed = lzf_decompress(&compressed, data.len()).unwrap();
+        let decompressed = lzf_decompress(&compressed, data.len(), usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -3915,16 +4084,19 @@ mod tests {
     /// decodes, as h5py's filter does.
     #[test]
     fn lzf_declared_size_is_a_hint_not_a_reservation() {
-        assert_eq!(lzf_decompress(&[], usize::MAX).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            lzf_decompress(&[], usize::MAX, usize::MAX).unwrap(),
+            Vec::<u8>::new()
+        );
         // One literal byte under a declaration of 2^60 bytes.
-        let out = lzf_decompress(&[0x00, 0x41], 1 << 60).unwrap();
+        let out = lzf_decompress(&[0x00, 0x41], 1 << 60, usize::MAX).unwrap();
         assert_eq!(out, b"A");
         assert!(out.capacity() <= 88 * 2);
 
         let data = vec![7u8; 4096];
         let compressed = lzf_compress(&data);
-        assert_eq!(lzf_decompress(&compressed, 16).unwrap(), data);
-        assert_eq!(lzf_decompress(&compressed, 0).unwrap(), data);
+        assert_eq!(lzf_decompress(&compressed, 16, usize::MAX).unwrap(), data);
+        assert_eq!(lzf_decompress(&compressed, 0, usize::MAX).unwrap(), data);
     }
 
     #[test]
@@ -3935,7 +4107,7 @@ mod tests {
         let decompressed = if compressed == data {
             data.clone() // returned unchanged
         } else {
-            lzf_decompress(&compressed, data.len()).unwrap()
+            lzf_decompress(&compressed, data.len(), usize::MAX).unwrap()
         };
         assert_eq!(decompressed, data);
     }
@@ -4113,7 +4285,7 @@ mod tests {
                 got, expected,
                 "shuffle mismatch in case {i} (es={elem_size}, block={block})"
             );
-            let back = bitshuffle_decompress(&got, elem_size, block, 0).unwrap();
+            let back = bitshuffle_decompress(&got, elem_size, block, 0, usize::MAX).unwrap();
             assert_eq!(back, input, "roundtrip mismatch in case {i}");
         }
     }
@@ -4208,8 +4380,14 @@ mod tests {
             ),
         ];
         for (i, &(elem_size, block, input, filter_bytes)) in cases.iter().enumerate() {
-            let back =
-                bitshuffle_decompress(filter_bytes, elem_size, block, BSHUF_COMPRESS_LZ4).unwrap();
+            let back = bitshuffle_decompress(
+                filter_bytes,
+                elem_size,
+                block,
+                BSHUF_COMPRESS_LZ4,
+                usize::MAX,
+            )
+            .unwrap();
             assert_eq!(back, input, "canonical BSLZ4 decode mismatch in case {i}");
         }
     }
@@ -4233,7 +4411,9 @@ mod tests {
                 .collect();
             let comp =
                 bitshuffle_compress(&data, elem_size, block, BSHUF_COMPRESS_LZ4, &filter).unwrap();
-            let back = bitshuffle_decompress(&comp, elem_size, block, BSHUF_COMPRESS_LZ4).unwrap();
+            let back =
+                bitshuffle_decompress(&comp, elem_size, block, BSHUF_COMPRESS_LZ4, usize::MAX)
+                    .unwrap();
             assert_eq!(
                 back, data,
                 "lz4 framing roundtrip failed for es={elem_size} block={block} n={n_elems}"
@@ -4839,10 +5019,8 @@ mod tests {
             let n = reverse_filters_masked_into(&pipeline, frame, 0, &mut out).unwrap();
             assert_eq!((n, &out), (nbytes, &input), "{ctx} into");
             let mut short = vec![0u8; nbytes / 3];
-            let n = reverse_filters_masked_into(&pipeline, frame, 0, &mut short).unwrap();
-            assert_eq!(
-                (n, &short[..]),
-                (nbytes, &input[..nbytes / 3]),
+            assert!(
+                reverse_filters_masked_into(&pipeline, frame, 0, &mut short).is_err(),
                 "{ctx} short"
             );
             // Only the frame's last stream is past its end.
