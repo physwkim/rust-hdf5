@@ -2556,6 +2556,24 @@ fn blosc_maxout(compcode: u32, neblock: usize) -> usize {
 #[cfg(feature = "blosc")]
 const BLOSC_MAX_KEPT_BLOCK: usize = 16 * 2 * BLOSC_L1;
 
+/// The largest zstd workspace a thread keeps: a 512 KiB level-15 stream's,
+/// the largest any clevel under 9 compresses. A context built per stream
+/// faults its whole workspace in; on 48 threads that made frames of those
+/// streams 2.6 times slower, and frames of 1 MiB level-22 streams (18 MB
+/// workspaces) a fifth slower, where keeping theirs left 1 GB resident.
+#[cfg(all(feature = "blosc", feature = "zstd"))]
+const BLOSC_MAX_KEPT_ZSTD: usize = 8_900_472;
+
+/// The workspace a `rust_zstd::Compressor` sizes its context to for one
+/// frame of `len` bytes at `level`: `ZSTD_estimateCCtxSize` of the
+/// parameters it picks.
+#[cfg(all(feature = "blosc", feature = "zstd"))]
+fn zstd_workspace(level: i32, len: usize) -> usize {
+    use rust_zstd::compress::{lazy::default_search_method, matchstate::needed_space, CParams};
+    let cparams = CParams::for_level(level, len);
+    needed_space(&cparams, default_search_method(&cparams), None, len as u64)
+}
+
 /// One thread's working memory for blosc blocks, kept from frame to frame:
 /// each buffer is sized by the largest block it has served, never by a
 /// frame. A pool worker serves every frame's blocks it is given from its
@@ -2587,7 +2605,7 @@ struct BloscCodecs {
     zlib: Option<(u32, flate2::Compress)>,
     #[cfg(feature = "deflate")]
     inflate: Option<zlib_rs::Inflate>,
-    /// With the level it compresses at.
+    /// With the level it compresses at; never past [`BLOSC_MAX_KEPT_ZSTD`].
     #[cfg(feature = "zstd")]
     zstd: Option<(i32, rust_zstd::Compressor)>,
     #[cfg(feature = "zstd")]
@@ -2851,14 +2869,18 @@ impl BloscCodecs {
                 } else {
                     22
                 };
-                let z = match &mut self.zstd {
-                    Some((l, z)) if *l == level => z,
-                    slot => {
-                        let opts = rust_zstd::CompressOptions {
-                            level,
-                            ..Default::default()
-                        };
-                        &mut slot.insert((level, rust_zstd::Compressor::new(opts))).1
+                let opts = rust_zstd::CompressOptions {
+                    level,
+                    ..Default::default()
+                };
+                let mut fresh;
+                let z = if zstd_workspace(level, src.len()) > BLOSC_MAX_KEPT_ZSTD {
+                    fresh = rust_zstd::Compressor::new(opts);
+                    &mut fresh
+                } else {
+                    match &mut self.zstd {
+                        Some((l, z)) if *l == level => z,
+                        slot => &mut slot.insert((level, rust_zstd::Compressor::new(opts))).1,
                     }
                 };
                 self.staging.clear();
