@@ -4,6 +4,16 @@
 
 ### Changed
 
+- The blosc filter writes and reads c-blosc 1.x frames, laid out as
+  blosc.c 1.12.0 lays them, so c-blosc reads what this crate writes and
+  this crate reads c-blosc's; BloscLZ frames are byte-identical to C's,
+  a frame is decoded with the codec its header names, and the default
+  codec is BloscLZ, as in `blosc_filter.c`, where 0.7.8's was LZ4. 0.7.8
+  wrote one codec stream after the header with no bstarts table, which
+  c-blosc cannot read, and decoded a compressed c-blosc frame as such a
+  stream. Chunks 0.7.8 wrote are still read, with the codec their
+  `cd_values[6]` names; a BloscLZ input under 16 bytes, which 0.7.8
+  stored as a header with no payload, is refused.
 - A stored chunk whose filters decode to more or fewer bytes than its
   image is refused by every read and by the read-back of a partial write
   or a shrink. `reverse_filters_masked_into` returns `Err` for such a
