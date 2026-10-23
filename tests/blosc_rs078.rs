@@ -1,0 +1,164 @@
+//! Blosc chunks as rust-hdf5 0.7.8 wrote them, before it wrote c-blosc
+//! frames: `fixtures/blosc_rs078.h5`, from `fixtures/gen_blosc_rs078.rs`.
+#![cfg(feature = "blosc")]
+
+use rust_hdf5::format::messages::filter::{apply_filters, reverse_filters, FILTER_BLOSC};
+use rust_hdf5::{Filter, FilterPipeline, H5File};
+
+const FIXTURE: &str = "tests/fixtures/blosc_rs078.h5";
+
+fn value(i: usize) -> u16 {
+    ((i / 4) * 3 + i % 3) as u16
+}
+
+#[test]
+fn reads_the_blosc_chunks_rust_hdf5_0_7_8_wrote() {
+    let want: Vec<u16> = (0..1024).map(value).collect();
+    let second: Vec<u8> = want[512..].iter().flat_map(|v| v.to_le_bytes()).collect();
+    // zlib and zstd need their features
+    let codecs = (0..6)
+        .filter(|&c| (c != 4 || cfg!(feature = "deflate")) && (c != 5 || cfg!(feature = "zstd")));
+    let mut names: Vec<String> = codecs
+        .flat_map(|c| (0..3).map(move |sh| format!("c{c}_sh{sh}")))
+        .collect();
+    names.push("default_codec".into());
+    let file = H5File::open(FIXTURE).unwrap();
+    for name in names {
+        let ds = file.dataset(&name).unwrap();
+        assert_eq!(ds.read_raw::<u16>().unwrap(), want, "{name}");
+        assert_eq!(
+            ds.read_slice::<u16>(&[500], &[24]).unwrap(),
+            want[500..524],
+            "{name} across the chunks"
+        );
+        let pipeline = FilterPipeline {
+            filters: ds.filters().unwrap(),
+        };
+        let (raw, mask) = ds.read_chunk_raw_at(&[1]).unwrap();
+        assert_eq!(mask, 0);
+        assert_eq!(reverse_filters(&pipeline, &raw).unwrap(), second, "{name}");
+    }
+}
+
+/// 0.7.8 shuffled by `cd_values[2]` and wrote its low byte as the header's
+/// typesize: 0 for 256, 44 for 300.
+#[test]
+fn reads_a_0_7_8_chunk_shuffled_by_a_typesize_past_255() {
+    let want: Vec<u8> = (0..4096)
+        .map(|i: usize| (i % 251) as u8 ^ (i / 256) as u8)
+        .collect();
+    let file = H5File::open(FIXTURE).unwrap();
+    for (name, header) in [("ts256", 0), ("ts300", 44)] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.read_chunk_raw_at(&[1]).unwrap().0[3], header, "{name}");
+        assert!(ds.read_raw::<u8>().unwrap() == want, "{name}");
+        assert_eq!(
+            ds.read_slice::<u8>(&[2040], &[16]).unwrap(),
+            want[2040..2056],
+            "{name} across the chunks"
+        );
+    }
+}
+
+/// An LZ4 frame ends before a c-blosc frame's bstarts table would.
+#[test]
+fn reads_a_0_7_8_frame_shorter_than_a_bstarts_table() {
+    let file = H5File::open(FIXTURE).unwrap();
+    let ds = file.dataset("one_byte").unwrap();
+    assert_eq!(ds.read_chunk_raw_at(&[0]).unwrap().0.len(), 18);
+    assert_eq!(ds.read_raw::<u8>().unwrap(), [0xA5]);
+}
+
+/// 0.7.8 stored a BloscLZ input under 16 bytes as a header alone.
+#[test]
+fn a_0_7_8_chunk_written_without_its_payload_is_refused() {
+    let file = H5File::open(FIXTURE).unwrap();
+    let ds = file.dataset("lost").unwrap();
+    assert_eq!(ds.read_chunk_raw_at(&[0]).unwrap().0.len(), 16);
+    assert!(ds.read_raw::<u8>().is_err());
+    assert!(ds.read_slice::<u8>(&[2], &[3]).is_err());
+}
+
+/// A one-block c-blosc frame with 8 bytes between its bstarts entry and its
+/// stream, which c-blosc reads as its input, is also a 0.7.8 BloscLZ frame,
+/// and is read as 0.7.8 reads it.
+#[test]
+fn a_frame_valid_in_both_layouts_is_read_as_0_7_8s() {
+    let mut x = 40u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let input: Vec<u8> = (0..128)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(8) {
+                (x >> 32) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
+    let pipeline = FilterPipeline {
+        filters: vec![Filter {
+            id: FILTER_BLOSC,
+            flags: 0,
+            cd_values: vec![2, 2, 1, 128, 9, 0, 0],
+        }],
+    };
+    let frame = apply_filters(&pipeline, &input).unwrap();
+    assert_eq!(frame[16..20], 20u32.to_le_bytes());
+    assert_eq!(reverse_filters(&pipeline, &frame).unwrap(), input);
+    let mut padded = frame[..20].to_vec();
+    padded[12..16].copy_from_slice(&(frame.len() as u32 + 8).to_le_bytes());
+    padded[16..20].copy_from_slice(&28u32.to_le_bytes());
+    padded.extend([0; 8]);
+    padded.extend_from_slice(&frame[20..]);
+    // What rust-hdf5 0.7.8 reads it as.
+    let read_by_0_7_8: [u8; 128] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 79, 0, 0, 0, 34, 0, 98, 0, 224, 1, 0, 3, 218, 0, 0, 3,
+        224, 2, 2, 121, 0, 229, 32, 13, 0, 89, 32, 3, 64, 0, 1, 138, 127, 32, 3, 64, 0, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 51, 1, 1, 1, 1, 1, 1, 140, 1, 1, 1, 1, 1, 1, 40, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 8, 1, 1, 1, 1, 213, 1, 1, 1, 1, 1, 1, 1, 1, 1, 126, 1, 1, 1, 1, 1, 1, 0, 199,
+        0, 93, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 254, 0, 0, 0, 0,
+    ];
+    assert_eq!(reverse_filters(&pipeline, &padded).unwrap(), read_by_0_7_8);
+}
+
+/// A 0.7.8 chunk with other version bytes or a shorter length in its
+/// header is no frame 0.7.8 wrote, nor a c-blosc frame.
+#[test]
+fn a_0_7_8_chunk_under_another_header_is_refused() {
+    let file = H5File::open(FIXTURE).unwrap();
+    let ds = file.dataset("default_codec").unwrap();
+    let pipeline = FilterPipeline {
+        filters: ds.filters().unwrap(),
+    };
+    let (raw, _) = ds.read_chunk_raw_at(&[0]).unwrap();
+    assert!(reverse_filters(&pipeline, &raw).is_ok());
+    let cbytes = (raw.len() as u32 - 1).to_le_bytes();
+    for (what, at, bytes) in [
+        ("version", 0, &[3][..]),
+        ("versionlz", 1, &[2][..]),
+        ("cbytes", 12, &cbytes[..]),
+    ] {
+        let mut changed = raw.clone();
+        changed[at..at + bytes.len()].copy_from_slice(bytes);
+        assert!(reverse_filters(&pipeline, &changed).is_err(), "{what}");
+    }
+}
+
+/// A frame of no bytes reads as none whatever follows its header, where
+/// c-blosc 1.12 divides by its zero blocksize.
+#[test]
+fn a_frame_of_no_bytes_reads_as_none() {
+    let pipeline = FilterPipeline {
+        filters: vec![Filter {
+            id: FILTER_BLOSC,
+            flags: 0,
+            cd_values: vec![2, 2, 2, 0, 5, 0],
+        }],
+    };
+    let frame = [
+        2u8, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0xAB, 0xCD, 0xEF, 0x01,
+    ];
+    assert!(reverse_filters(&pipeline, &frame).unwrap().is_empty());
+}

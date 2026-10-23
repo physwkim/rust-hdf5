@@ -632,6 +632,15 @@ fn nbit_compress_one_compound(
 /// flag, element count, datatype class and datatype size.
 const NBIT_HEADER_NPARMS: usize = 5;
 
+/// The bytes [`apply_nbit`] decompresses to, or `None` where it passes the
+/// buffer through or refuses `cd_values`.
+pub(crate) fn nbit_decoded_len(cd_values: &[u32]) -> Option<usize> {
+    if cd_values.len() < NBIT_HEADER_NPARMS || cd_values[1] != 0 {
+        return None;
+    }
+    (cd_values[2] as usize).checked_mul(cd_values[4] as usize)
+}
+
 /// Apply the HDF5 N-bit filter.
 ///
 /// `cd_values` follows `H5Znbit.c`'s schema:
@@ -952,6 +961,13 @@ fn so_unpack<const N: usize>(
         *elem = store_uint(r.get(minbits)?, le);
     }
     Ok(())
+}
+
+/// The bytes [`reverse_scaleoffset`] decompresses to, or `None` where it
+/// refuses `cd_values`.
+pub(crate) fn scaleoffset_decoded_len(cd_values: &[u32]) -> Option<usize> {
+    let p = SoParams::parse(cd_values).ok()?;
+    p.d_nelmts.checked_mul(p.size)
 }
 
 /// Reverse the HDF5 scale-offset filter (decompress only).

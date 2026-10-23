@@ -626,12 +626,53 @@ pub fn apply_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec
         buf = Some(apply_single_filter(
             filter,
             buf.as_deref().unwrap_or(data),
-            true,
+            Pass::Forward,
         )?);
     }
     // Only an empty pipeline leaves `buf` unset, and only then is a copy of
     // the input the answer; every stage already produces a fresh buffer.
     Ok(buf.unwrap_or_else(|| data.to_vec()))
+}
+
+/// Apply the filter pipeline straight into `out`, returning the length
+/// written — [`apply_filters`] with the last stage writing where the caller
+/// wants the chunk. Output that does not fit `out` is
+/// [`FormatError::BufferTooShort`], as `blosc_compress_ctx` refuses a short
+/// `destsize`; a blosc frame always fits `data.len()` + 16 bytes.
+pub fn apply_filters_into(
+    pipeline: &FilterPipeline,
+    data: &[u8],
+    out: &mut [u8],
+) -> FormatResult<usize> {
+    let Some((last, rest)) = pipeline.filters.split_last() else {
+        return copy_output_into(data, out);
+    };
+    let mut buf: Option<Vec<u8>> = None;
+    for filter in rest {
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            Pass::Forward,
+        )?);
+    }
+    let data = buf.as_deref().unwrap_or(data);
+    #[cfg(feature = "blosc")]
+    if last.id == FILTER_BLOSC {
+        return blosc_compress_into(data, last, out);
+    }
+    copy_output_into(&apply_single_filter(last, data, Pass::Forward)?, out)
+}
+
+/// Copy a stage's whole output into `out`, which must hold it.
+fn copy_output_into(output: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    let available = out.len();
+    out.get_mut(..output.len())
+        .ok_or(FormatError::BufferTooShort {
+            needed: output.len(),
+            available,
+        })?
+        .copy_from_slice(output);
+    Ok(output.len())
 }
 
 /// Reverse the filter pipeline, skipping any filter whose bit is set in
@@ -644,25 +685,48 @@ pub fn apply_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec
 /// raw — so its reverse must be skipped here too. The mask addresses only the
 /// first 32 filters (the HDF5 limit); a position beyond that cannot be marked
 /// skipped and is always applied.
+///
+/// Nothing bounds what the stages decode to but the streams themselves; a
+/// caller that knows the image's size passes it to
+/// [`reverse_filters_masked_bounded`] or [`reverse_filters_masked_into`].
 pub fn reverse_filters_masked(
     pipeline: &FilterPipeline,
     data: &[u8],
     filter_mask: u32,
 ) -> FormatResult<Vec<u8>> {
+    reverse_filters_masked_bounded(pipeline, data, filter_mask, usize::MAX)
+}
+
+/// [`reverse_filters_masked`] for an image of at most `image_limit` bytes.
+///
+/// Every stage decodes under a bound: the image's for the last, and for the
+/// one above it the most the forward stage below could have written from
+/// that, and so on up. A stream that decodes past its
+/// stage's bound fails before more than about the bound is allocated.
+pub fn reverse_filters_masked_bounded(
+    pipeline: &FilterPipeline,
+    data: &[u8],
+    filter_mask: u32,
+    image_limit: usize,
+) -> FormatResult<Vec<u8>> {
     let mut buf: Option<Vec<u8>> = None;
     for (i, filter) in pipeline.filters.iter().enumerate().rev() {
-        if i < 32 && filter_mask & (1u32 << i) != 0 {
+        if is_masked(filter_mask, i) {
             continue;
         }
-        buf = Some(apply_single_filter(
+        buf = Some(reverse_single_filter(
             filter,
             buf.as_deref().unwrap_or(data),
-            false,
+            stage_limit(pipeline, filter_mask, i, image_limit),
         )?);
     }
-    // Reached only when every filter was masked off (or the pipeline is
-    // empty): the stored bytes are already the chunk's data.
-    Ok(buf.unwrap_or_else(|| data.to_vec()))
+    match buf {
+        Some(image) => Ok(image),
+        // Every filter was masked off (or the pipeline is empty): the stored
+        // bytes are already the chunk's data.
+        None if data.len() > image_limit => Err(past_limit("stored chunk", image_limit)),
+        None => Ok(data.to_vec()),
+    }
 }
 
 /// Reverse filter pipeline to decompress raw chunk data (the full pipeline,
@@ -671,8 +735,9 @@ pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<V
     reverse_filters_masked(pipeline, data, 0)
 }
 
-/// Reverse the filter pipeline straight into `out`, returning the length of
-/// the image it produced.
+/// Reverse the filter pipeline straight into `out`, which is the chunk's
+/// image: a stored chunk that decodes to any other length than `out.len()`
+/// is an error, and `Ok` carries `out.len()`.
 ///
 /// A chunk's decoded image is frequently one contiguous stretch of the read's
 /// output — for a whole chunk of a full read it always is — and then the image
@@ -681,40 +746,97 @@ pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<V
 /// before the last still materialize their own buffer; only the last one has a
 /// destination the caller can name.
 ///
-/// The returned length is the whole image the pipeline produced, which may
-/// exceed `out.len()` — the surplus is discarded, exactly as a caller copying
-/// `out.len()` bytes out of a materialized image discards it. A length below
-/// `out.len()` means the stored chunk decoded short of its image; `out` past
-/// that length is then left **unspecified**, because the inflate writes its
-/// output in blocks and the last one can run past the byte the stream ends on.
-/// A caller whose destination may outlast the image owns every byte of it,
-/// not just the tail past the image.
+/// The stages decode under the bounds of [`reverse_filters_masked_bounded`]
+/// with `out.len()` as the image's, so a stage that decodes past it fails
+/// there, and a chunk that decodes short fails once its last stage ends.
+/// With every filter masked off the stored bytes are the image, and must be
+/// its length. libhdf5 instead drops a long chunk's surplus and keeps what a
+/// short one decoded. After an error `out` holds whatever the stages wrote.
 pub fn reverse_filters_masked_into(
     pipeline: &FilterPipeline,
     data: &[u8],
     filter_mask: u32,
     out: &mut [u8],
 ) -> FormatResult<usize> {
-    let masked = |i: usize| i < 32 && filter_mask & (1u32 << i) != 0;
     // The last stage to run is the lowest-numbered filter still in play; it is
     // the one whose output is the image, so it is the one that writes to `out`.
-    let Some(last) = (0..pipeline.filters.len()).find(|i| !masked(*i)) else {
+    let produced = match (0..pipeline.filters.len()).find(|i| !is_masked(filter_mask, *i)) {
         // Every filter masked off (or an empty pipeline): the stored bytes are
         // already the chunk's image.
-        return Ok(copy_image_into(data, out));
-    };
-    let mut buf: Option<Vec<u8>> = None;
-    for (i, filter) in pipeline.filters.iter().enumerate().rev() {
-        if masked(i) || i == last {
-            continue;
+        None => copy_image_into(data, out),
+        Some(last) => {
+            let mut buf: Option<Vec<u8>> = None;
+            for (i, filter) in pipeline.filters.iter().enumerate().rev() {
+                if is_masked(filter_mask, i) || i == last {
+                    continue;
+                }
+                buf = Some(reverse_single_filter(
+                    filter,
+                    buf.as_deref().unwrap_or(data),
+                    stage_limit(pipeline, filter_mask, i, out.len()),
+                )?);
+            }
+            reverse_single_filter_into(
+                &pipeline.filters[last],
+                buf.as_deref().unwrap_or(data),
+                out,
+            )?
         }
-        buf = Some(apply_single_filter(
-            filter,
-            buf.as_deref().unwrap_or(data),
-            false,
-        )?);
+    };
+    if produced != out.len() {
+        return Err(FormatError::InvalidData(format!(
+            "chunk decodes to {produced} bytes, its image is {}",
+            out.len()
+        )));
     }
-    reverse_single_filter_into(&pipeline.filters[last], buf.as_deref().unwrap_or(data), out)
+    Ok(produced)
+}
+
+/// Whether bit `i` of a chunk's filter mask skips filter `i`.
+fn is_masked(filter_mask: u32, i: usize) -> bool {
+    i < 32 && filter_mask & (1u32 << i) != 0
+}
+
+/// The most bytes the reverse of filter `i` may produce when the image is
+/// at most `image_limit`: what the unmasked filters below it write from the
+/// image, each bound taken from the one before.
+fn stage_limit(pipeline: &FilterPipeline, filter_mask: u32, i: usize, image_limit: usize) -> usize {
+    (0..i)
+        .filter(|j| !is_masked(filter_mask, *j))
+        .fold(image_limit, |n, j| encoded_bound(&pipeline.filters[j], n))
+}
+
+/// The most bytes `filter` writes forward from an `n`-byte input.
+///
+/// A compressor's bound covers every encoder the filter's format names:
+/// LZ4 framing with 1-byte blocks stores each byte behind a 4-byte length,
+/// five bytes per byte, and the largest fixed overhead is bzip2's 600.
+fn encoded_bound(filter: &Filter, n: usize) -> usize {
+    match filter.id {
+        FILTER_SHUFFLE | FILTER_BITGROOM | FILTER_BITROUND => n,
+        FILTER_FLETCHER32 => n.saturating_add(4),
+        // libhdf5 reports the packed bytes plus one.
+        FILTER_NBIT => n.saturating_add(1),
+        // The 21-byte parameter header, then the packed bytes plus one.
+        FILTER_SCALEOFFSET => n.saturating_add(22),
+        _ => n.saturating_mul(5).saturating_add(1024),
+    }
+}
+
+/// The error of a stage whose output would pass its bound.
+fn past_limit(what: &str, limit: usize) -> FormatError {
+    FormatError::InvalidData(format!(
+        "{what}: decodes past the {limit} bytes it may produce"
+    ))
+}
+
+/// Reverse one filter, refusing output past `limit`.
+fn reverse_single_filter(filter: &Filter, data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
+    let out = apply_single_filter(filter, data, Pass::Reverse { limit })?;
+    if out.len() > limit {
+        return Err(past_limit(&format!("filter {}", filter.id), limit));
+    }
+    Ok(out)
 }
 
 /// Copy an already-decoded image into a caller's destination, returning the
@@ -726,19 +848,22 @@ fn copy_image_into(image: &[u8], out: &mut [u8]) -> usize {
 }
 
 /// Reverse one filter into `out`, returning the length of the image it
-/// produced (which may exceed `out.len()`; see
-/// [`reverse_filters_masked_into`]).
+/// produced, which `out` holds.
 ///
-/// Only the inflate has a decoder that can be pointed at a caller's buffer;
-/// every other filter builds its image and copies it, which is what the caller
-/// would have done with it anyway.
+/// Only the inflate and blosc have decoders that can be pointed at a caller's
+/// buffer; every other filter builds its image and copies it, which is what
+/// the caller would have done with it anyway.
 fn reverse_single_filter_into(filter: &Filter, data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
     #[cfg(feature = "deflate")]
     if filter.id == FILTER_DEFLATE {
-        return inflate_zlib_into(data, out);
+        return inflate_zlib_into(&mut zlib_rs::Inflate::new(true, 15), data, out);
+    }
+    #[cfg(feature = "blosc")]
+    if filter.id == FILTER_BLOSC {
+        return blosc_decompress_into(data, &filter.cd_values, out);
     }
     Ok(copy_image_into(
-        &apply_single_filter(filter, data, false)?,
+        &reverse_single_filter(filter, data, out.len())?,
         out,
     ))
 }
@@ -778,7 +903,44 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     dest
 }
 
-/// Inflate one zlib stream, growing a single output buffer.
+/// Run a streaming decoder into a buffer that grows by doubling from `start`
+/// up to one byte past `limit`: that byte filled means the stream decodes
+/// past its limit, which fails before anything larger is allocated.
+///
+/// `step` decodes into the window it is handed, returning the bytes it wrote
+/// and whether the stream ended; it fails a stream that stops short.
+#[cfg(any(feature = "deflate", feature = "zstd", feature = "bzip2"))]
+fn decode_growing(
+    what: &str,
+    start: usize,
+    limit: usize,
+    mut step: impl FnMut(&mut [u8]) -> FormatResult<(usize, bool)>,
+) -> FormatResult<Vec<u8>> {
+    let room = limit.saturating_add(1);
+    let mut out = vec![0u8; start.clamp(1, room)];
+    let mut filled = 0;
+    loop {
+        if filled == out.len() {
+            if filled == room {
+                return Err(past_limit(what, limit));
+            }
+            out.resize(out.len().saturating_mul(2).min(room), 0);
+        }
+        let (made, ended) = step(&mut out[filled..])?;
+        filled += made;
+        if ended {
+            break;
+        }
+    }
+    if filled > limit {
+        return Err(past_limit(what, limit));
+    }
+    out.truncate(filled);
+    Ok(out)
+}
+
+/// Inflate one zlib stream of at most `limit` bytes, growing a single output
+/// buffer.
 ///
 /// The engine is zlib-rs rather than the miniz_oxide behind `flate2`: on the
 /// same level-6 streams it inflates 1.2x faster on incompressible chunks and
@@ -791,95 +953,82 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
 /// per growth step, which on a 2 MiB chunk that compresses well costs about
 /// as much as the inflate itself.
 ///
-/// `expected` is the uncompressed length when the caller knows it — blosc
-/// records one in its own header. The deflate filter does not: HDF5 keeps the
-/// uncompressed chunk size nowhere the filter can see, so its buffer starts at
-/// the next power of two above the compressed length and doubles. Chunk sizes
-/// are themselves powers of two often enough that this usually lands on the
-/// exact size in two or three steps; doubling from the compressed length
-/// instead overshoots by up to 2x and cost more than `read_to_end` did.
+/// HDF5 keeps the uncompressed chunk size nowhere the filter can see, so the
+/// buffer starts at the next power of two above the compressed length and
+/// doubles. Chunk sizes are themselves powers of two often enough that this
+/// usually lands on the exact size in two or three steps; doubling from the
+/// compressed length instead overshoots by up to 2x and cost more than
+/// `read_to_end` did.
 #[cfg(feature = "deflate")]
-fn inflate_zlib(data: &[u8], expected: Option<usize>) -> FormatResult<Vec<u8>> {
+fn inflate_zlib(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
     use zlib_rs::{Inflate, InflateFlush, Status};
 
     let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
     // 15 is the largest LZ77 window; a stream that declares a smaller one in
     // its zlib header still inflates against it.
     let mut inflate = Inflate::new(true, 15);
-    let start = expected
-        .filter(|n| *n > 0)
-        .unwrap_or_else(|| data.len().max(4096).next_power_of_two());
-    let mut out = vec![0u8; start];
-    loop {
+    let start = data.len().max(4096).next_power_of_two();
+    decode_growing("deflate", start, limit, |window| {
         let consumed = inflate.total_in() as usize;
-        let filled = inflate.total_out() as usize;
-        if filled == out.len() {
-            out.resize(out.len() * 2, 0);
-        }
+        let before = inflate.total_out();
         let status = inflate
-            .decompress(&data[consumed..], &mut out[filled..], InflateFlush::NoFlush)
+            .decompress(&data[consumed..], window, InflateFlush::NoFlush)
             .map_err(|e| err(e.as_str()))?;
-        if status == Status::StreamEnd {
-            break;
-        }
+        let made = (inflate.total_out() - before) as usize;
+        let ended = status == Status::StreamEnd;
         // Neither side moved with output still to spare: the stored bytes end
         // before the stream does.
-        if inflate.total_in() as usize == consumed && inflate.total_out() as usize == filled {
+        if !ended && made == 0 && inflate.total_in() as usize == consumed {
             return Err(err("truncated stream"));
         }
-    }
-    out.truncate(inflate.total_out() as usize);
-    Ok(out)
+        Ok((made, ended))
+    })
 }
 
-/// Bytes of scratch the overflow drain works through when a stream turns out
-/// to be longer than the destination the caller named. Allocated only when
-/// that happens, which for a chunk whose image is the size the layout says it
-/// is never does.
-#[cfg(feature = "deflate")]
-const INFLATE_DRAIN_BYTES: usize = 32 * 1024;
-
-/// Inflate one zlib stream straight into `out`, returning the stream's whole
-/// decompressed length.
+/// Inflate one zlib stream straight into `out`, returning its decompressed
+/// length; a stream longer than `out` fails.
 ///
 /// The destination is fixed, so nothing is allocated, grown or copied: the
 /// [`inflate_zlib`] growth loop exists only because that spelling has no
-/// destination to write to. A stream longer than `out` keeps inflating through
-/// a small scratch buffer and the surplus is dropped — so a stream that is
-/// malformed past the caller's window still fails here, as it does when
-/// `inflate_zlib` grows a buffer to the stream's end.
+/// destination to write to. Once `out` is full the stream gets one byte more
+/// to write into, enough for its trailer to end it and too little for
+/// anything past `out` to pass unseen.
 ///
 /// `out` past the returned length is left unspecified: the decoder copies
 /// output in blocks and the block that finishes the stream may reach past the
 /// stream's last byte, into slack the caller offered.
+///
+/// `inflate` is reset first, so one decoder serves stream after stream.
 #[cfg(feature = "deflate")]
-fn inflate_zlib_into(data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
-    use zlib_rs::{Inflate, InflateFlush, Status};
+fn inflate_zlib_into(
+    inflate: &mut zlib_rs::Inflate,
+    data: &[u8],
+    out: &mut [u8],
+) -> FormatResult<usize> {
+    use zlib_rs::{InflateFlush, Status};
 
     let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
-    let mut inflate = Inflate::new(true, 15);
-    let mut drain: Vec<u8> = Vec::new();
+    inflate.reset(true);
+    let mut probe = [0u8; 1];
     let mut filled = 0usize;
-    let mut produced = 0usize;
     loop {
         let consumed = inflate.total_in() as usize;
         let before = inflate.total_out();
-        let status = if filled < out.len() {
-            inflate.decompress(&data[consumed..], &mut out[filled..], InflateFlush::NoFlush)
+        let window = if filled < out.len() {
+            &mut out[filled..]
         } else {
-            if drain.is_empty() {
-                drain = vec![0u8; INFLATE_DRAIN_BYTES];
-            }
-            inflate.decompress(&data[consumed..], &mut drain, InflateFlush::NoFlush)
-        }
-        .map_err(|e| err(e.as_str()))?;
+            &mut probe[..]
+        };
+        let status = inflate
+            .decompress(&data[consumed..], window, InflateFlush::NoFlush)
+            .map_err(|e| err(e.as_str()))?;
         let made = (inflate.total_out() - before) as usize;
-        if filled < out.len() {
-            filled += made;
+        filled += made;
+        if filled > out.len() {
+            return Err(past_limit("deflate", out.len()));
         }
-        produced += made;
         if status == Status::StreamEnd {
-            break;
+            return Ok(filled);
         }
         // Neither side moved with output still to spare: the stored bytes end
         // before the stream does.
@@ -887,14 +1036,98 @@ fn inflate_zlib_into(data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
             return Err(err("truncated stream"));
         }
     }
-    Ok(produced)
 }
 
-fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatResult<Vec<u8>> {
+/// Decode the zstd frames of `data`, at most `limit` bytes of them.
+///
+/// `rust_zstd::decompress` sizes its output by the Frame_Content_Size a frame
+/// claims, or by what its blocks expand to; the streaming decoder writes into
+/// a buffer of ours instead, and takes no more memory than the content it has
+/// decoded, up to the frame's window.
+#[cfg(feature = "zstd")]
+fn zstd_decompress(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
+    let err = |e: String| FormatError::InvalidData(format!("zstd decompress: {e}"));
+    let mut zstd = rust_zstd::Decompressor::new();
+    let mut ip = 0;
+    let start = data.len().max(4096).next_power_of_two();
+    decode_growing("zstd", start, limit, |window| {
+        let mut op = 0;
+        let hint = zstd
+            .decompress_stream(data, &mut ip, window, &mut op)
+            .map_err(err)?;
+        // 0 with input left: another frame follows. Not 0 with the window
+        // full: the frame has more content than the window took.
+        if hint == 0 && ip < data.len() || hint != 0 && op == window.len() {
+            return Ok((op, false));
+        }
+        // The input has run out: between frames, or short of a frame's end.
+        zstd.finish().map_err(err)?;
+        Ok((op, true))
+    })
+}
+
+/// Decode the zstd frames of `src` straight into `dst`, returning their
+/// length; content past `dst` fails. `zstd` is reset first.
+#[cfg(all(feature = "zstd", feature = "blosc"))]
+fn zstd_decompress_into(
+    zstd: &mut rust_zstd::Decompressor,
+    src: &[u8],
+    dst: &mut [u8],
+) -> FormatResult<usize> {
+    let err = |e: String| FormatError::InvalidData(format!("zstd decompress: {e}"));
+    zstd.reset();
+    let (mut ip, mut op) = (0, 0);
+    loop {
+        let hint = zstd
+            .decompress_stream(src, &mut ip, dst, &mut op)
+            .map_err(err)?;
+        if hint == 0 && ip < src.len() {
+            continue;
+        }
+        if hint != 0 && op == dst.len() {
+            return Err(past_limit("zstd", dst.len()));
+        }
+        zstd.finish().map_err(err)?;
+        return Ok(op);
+    }
+}
+
+/// Decode one bzip2 stream of at most `limit` bytes, as `H5Z_filter_bzip2`
+/// decodes one and ignores what follows it.
+#[cfg(feature = "bzip2")]
+fn bzip2_decompress(data: &[u8], limit: usize) -> FormatResult<Vec<u8>> {
+    let err =
+        |e: &dyn std::fmt::Display| FormatError::InvalidData(format!("bzip2 decompress: {e}"));
+    let mut bz = bzip2::Decompress::new(false);
+    let start = data.len().saturating_mul(3).max(4096);
+    decode_growing("bzip2", start, limit, |window| {
+        let consumed = bz.total_in() as usize;
+        let before = bz.total_out();
+        let status = bz
+            .decompress(&data[consumed..], window)
+            .map_err(|e| err(&e))?;
+        let made = (bz.total_out() - before) as usize;
+        let ended = status == bzip2::Status::StreamEnd;
+        if !ended && made == 0 && bz.total_in() as usize == consumed {
+            return Err(err(&"truncated stream"));
+        }
+        Ok((made, ended))
+    })
+}
+
+/// Which way a filter runs: forward on write, or in reverse on read under
+/// the most bytes the reverse may produce.
+#[derive(Clone, Copy)]
+enum Pass {
+    Forward,
+    Reverse { limit: usize },
+}
+
+fn apply_single_filter(filter: &Filter, data: &[u8], pass: Pass) -> FormatResult<Vec<u8>> {
     match filter.id {
         #[cfg(feature = "deflate")]
-        FILTER_DEFLATE => {
-            if compress {
+        FILTER_DEFLATE => match pass {
+            Pass::Forward => {
                 use flate2::write::ZlibEncoder;
                 use flate2::Compression;
                 use std::io::Write;
@@ -907,10 +1140,9 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 encoder
                     .finish()
                     .map_err(|e| FormatError::InvalidData(format!("deflate finish error: {}", e)))
-            } else {
-                inflate_zlib(data, None)
             }
-        }
+            Pass::Reverse { limit } => inflate_zlib(data, limit),
+        },
         #[cfg(not(feature = "deflate"))]
         FILTER_DEFLATE => Err(FormatError::UnsupportedFeature(
             "deflate filter requires the 'deflate' feature".into(),
@@ -918,14 +1150,13 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         FILTER_SHUFFLE => {
             // cd_values[0] = bytesoftype (element size)
             let bytesoftype = filter.cd_values.first().copied().unwrap_or(1) as usize;
-            if compress {
-                Ok(shuffle(data, bytesoftype))
-            } else {
-                Ok(unshuffle(data, bytesoftype))
+            match pass {
+                Pass::Forward => Ok(shuffle(data, bytesoftype)),
+                Pass::Reverse { .. } => Ok(unshuffle(data, bytesoftype)),
             }
         }
-        FILTER_FLETCHER32 => {
-            if compress {
+        FILTER_FLETCHER32 => match pass {
+            Pass::Forward => {
                 // Fletcher-32 appends a 4-byte checksum trailer. libhdf5
                 // (H5Zfletcher32.c) writes it with `UINT32ENCODE`, which is
                 // little-endian, over the single u32 returned by
@@ -934,7 +1165,8 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 let mut out = data.to_vec();
                 out.extend_from_slice(&cksum.to_le_bytes());
                 Ok(out)
-            } else {
+            }
+            Pass::Reverse { .. } => {
                 // Strip the trailing 4-byte checksum
                 if data.len() < 4 {
                     return Err(FormatError::InvalidData(
@@ -943,7 +1175,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 }
                 Ok(data[..data.len() - 4].to_vec())
             }
-        }
+        },
         FILTER_SZIP => {
             // cd_values layout per H5Zpublic.h: index 0 = options_mask,
             // 1 = pixels_per_block, 2 = bits_per_pixel, 3 = pixels_per_scanline.
@@ -955,37 +1187,44 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             let pixels_per_block = filter.cd_values.get(1).copied().unwrap_or(32);
             let bits_per_pixel = filter.cd_values.get(2).copied().unwrap_or(8);
             let pixels_per_scanline = filter.cd_values.get(3).copied().unwrap_or(256);
-            if compress {
-                let compressed = crate::format::szip::compress(
-                    data,
-                    bits_per_pixel,
-                    pixels_per_block,
-                    pixels_per_scanline,
-                    options_mask,
-                )
-                .map_err(|e| FormatError::InvalidData(format!("SZIP compress: {}", e)))?;
-                // Prepend the 4-byte LE uncompressed-length header.
-                let mut out = Vec::with_capacity(compressed.len() + 4);
-                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                out.extend_from_slice(&compressed);
-                Ok(out)
-            } else {
-                if data.len() < 4 {
-                    return Err(FormatError::InvalidData(
-                        "SZIP: data too short for length header".into(),
-                    ));
+            match pass {
+                Pass::Forward => {
+                    let compressed = crate::format::szip::compress(
+                        data,
+                        bits_per_pixel,
+                        pixels_per_block,
+                        pixels_per_scanline,
+                        options_mask,
+                    )
+                    .map_err(|e| FormatError::InvalidData(format!("SZIP compress: {}", e)))?;
+                    // Prepend the 4-byte LE uncompressed-length header.
+                    let mut out = Vec::with_capacity(compressed.len() + 4);
+                    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&compressed);
+                    Ok(out)
                 }
-                // Read the 4-byte LE uncompressed-length header.
-                let out_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                crate::format::szip::decompress(
-                    &data[4..],
-                    out_size,
-                    bits_per_pixel,
-                    pixels_per_block,
-                    pixels_per_scanline,
-                    options_mask,
-                )
-                .map_err(|e| FormatError::InvalidData(format!("SZIP decompress: {}", e)))
+                Pass::Reverse { limit } => {
+                    if data.len() < 4 {
+                        return Err(FormatError::InvalidData(
+                            "SZIP: data too short for length header".into(),
+                        ));
+                    }
+                    // Read the 4-byte LE uncompressed-length header.
+                    let out_size =
+                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                    if out_size > limit {
+                        return Err(past_limit("SZIP", limit));
+                    }
+                    crate::format::szip::decompress(
+                        &data[4..],
+                        out_size,
+                        bits_per_pixel,
+                        pixels_per_block,
+                        pixels_per_scanline,
+                        options_mask,
+                    )
+                    .map_err(|e| FormatError::InvalidData(format!("SZIP decompress: {}", e)))
+                }
             }
         }
         // =====================================================================
@@ -994,7 +1233,16 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // tree; both directions are byte-exact with libhdf5.
         // =====================================================================
         FILTER_NBIT => {
-            crate::format::nbit_scaleoffset::apply_nbit(data, &filter.cd_values, compress)
+            use crate::format::nbit_scaleoffset::{apply_nbit, nbit_decoded_len};
+            match pass {
+                Pass::Forward => apply_nbit(data, &filter.cd_values, true),
+                Pass::Reverse { limit } => {
+                    if nbit_decoded_len(&filter.cd_values).is_some_and(|n| n > limit) {
+                        return Err(past_limit("nbit", limit));
+                    }
+                    apply_nbit(data, &filter.cd_values, false)
+                }
+            }
         }
 
         // =====================================================================
@@ -1002,104 +1250,113 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // per-chunk minimum (H5Zscaleoffset.c). Both directions are byte-exact
         // with libhdf5.
         // =====================================================================
-        FILTER_SCALEOFFSET => {
-            if compress {
+        FILTER_SCALEOFFSET => match pass {
+            Pass::Forward => {
                 crate::format::nbit_scaleoffset::forward_scaleoffset(data, &filter.cd_values)
-            } else {
-                crate::format::nbit_scaleoffset::reverse_scaleoffset(data, &filter.cd_values)
             }
-        }
+            Pass::Reverse { limit } => {
+                use crate::format::nbit_scaleoffset::{
+                    reverse_scaleoffset, scaleoffset_decoded_len,
+                };
+                if scaleoffset_decoded_len(&filter.cd_values).is_some_and(|n| n > limit) {
+                    return Err(past_limit("scaleoffset", limit));
+                }
+                reverse_scaleoffset(data, &filter.cd_values)
+            }
+        },
         // =====================================================================
         // LZ4 (32004) — C-compatible block framing: 8-byte BE orig_size +
         // 4-byte BE block_size, then per-block: 4-byte BE compressed_size + data
         // =====================================================================
         #[cfg(feature = "lz4")]
         FILTER_LZ4 => {
-            if compress {
-                let orig_size = data.len() as u64;
-                let block_size = filter.cd_values.first().copied().unwrap_or(1 << 30) as usize;
-                let block_size = std::cmp::min(block_size, data.len());
-                let block_size = if block_size == 0 {
-                    data.len()
-                } else {
-                    block_size
-                };
-
-                let mut out = Vec::with_capacity(12 + data.len());
-                out.extend_from_slice(&orig_size.to_be_bytes());
-                out.extend_from_slice(&(block_size as u32).to_be_bytes());
-
-                let mut pos = 0;
-                while pos < data.len() {
-                    let end = std::cmp::min(pos + block_size, data.len());
-                    let block = &data[pos..end];
-                    let compressed = lz4_flex::compress(block);
-                    if compressed.len() >= block.len() {
-                        // Incompressible block: store uncompressed
-                        out.extend_from_slice(&(block.len() as u32).to_be_bytes());
-                        out.extend_from_slice(block);
+            match pass {
+                Pass::Forward => {
+                    let orig_size = data.len() as u64;
+                    let block_size = filter.cd_values.first().copied().unwrap_or(1 << 30) as usize;
+                    let block_size = std::cmp::min(block_size, data.len());
+                    let block_size = if block_size == 0 {
+                        data.len()
                     } else {
-                        out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-                        out.extend_from_slice(&compressed);
-                    }
-                    pos = end;
-                }
-                Ok(out)
-            } else {
-                if data.len() < 12 {
-                    return Err(FormatError::InvalidData("LZ4: header too short".into()));
-                }
-                let orig_size = u64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]) as usize;
-                // Sanity check: orig_size should not exceed a reasonable limit.
-                // HDF5 chunks are typically < 64MB.
-                if orig_size > 64 * 1024 * 1024 {
-                    return Err(FormatError::InvalidData(format!(
-                        "LZ4: orig_size {} exceeds 64MB limit",
-                        orig_size
-                    )));
-                }
-                let mut block_size =
-                    u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-                if block_size > orig_size {
-                    block_size = orig_size;
-                }
+                        block_size
+                    };
 
-                let mut output = Vec::with_capacity(orig_size);
-                let mut rpos = 12;
-                while output.len() < orig_size {
-                    if rpos + 4 > data.len() {
-                        break;
+                    let mut out = Vec::with_capacity(12 + data.len());
+                    out.extend_from_slice(&orig_size.to_be_bytes());
+                    out.extend_from_slice(&(block_size as u32).to_be_bytes());
+
+                    let mut pos = 0;
+                    while pos < data.len() {
+                        let end = std::cmp::min(pos + block_size, data.len());
+                        let block = &data[pos..end];
+                        let compressed = lz4_flex::compress(block);
+                        if compressed.len() >= block.len() {
+                            // Incompressible block: store uncompressed
+                            out.extend_from_slice(&(block.len() as u32).to_be_bytes());
+                            out.extend_from_slice(block);
+                        } else {
+                            out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+                            out.extend_from_slice(&compressed);
+                        }
+                        pos = end;
                     }
-                    let comp_size = u32::from_be_bytes([
-                        data[rpos],
-                        data[rpos + 1],
-                        data[rpos + 2],
-                        data[rpos + 3],
-                    ]) as usize;
-                    rpos += 4;
-                    if rpos + comp_size > data.len() {
-                        break;
+                    Ok(out)
+                }
+                Pass::Reverse { limit } => {
+                    if data.len() < 12 {
+                        return Err(FormatError::InvalidData("LZ4: header too short".into()));
+                    }
+                    let orig_size = u64::from_be_bytes([
+                        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                    ]);
+                    let orig_size = usize::try_from(orig_size)
+                        .ok()
+                        .filter(|n| *n <= limit)
+                        .ok_or_else(|| past_limit("LZ4", limit))?;
+                    let mut block_size =
+                        u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                    if block_size > orig_size {
+                        block_size = orig_size;
                     }
 
-                    let remaining = orig_size - output.len();
-                    let cur_block = std::cmp::min(block_size, remaining);
+                    let mut output = Vec::new();
+                    output.try_reserve_exact(orig_size).map_err(|_| {
+                        FormatError::InvalidData(format!("LZ4: cannot reserve {orig_size} bytes"))
+                    })?;
+                    let mut rpos = 12;
+                    while output.len() < orig_size {
+                        if rpos + 4 > data.len() {
+                            break;
+                        }
+                        let comp_size = u32::from_be_bytes([
+                            data[rpos],
+                            data[rpos + 1],
+                            data[rpos + 2],
+                            data[rpos + 3],
+                        ]) as usize;
+                        rpos += 4;
+                        if rpos + comp_size > data.len() {
+                            break;
+                        }
 
-                    if comp_size == cur_block {
-                        // Uncompressed block
-                        output.extend_from_slice(&data[rpos..rpos + comp_size]);
-                    } else {
-                        let decompressed =
-                            lz4_flex::decompress(&data[rpos..rpos + comp_size], cur_block)
-                                .map_err(|e| {
-                                    FormatError::InvalidData(format!("LZ4 decompress: {}", e))
-                                })?;
-                        output.extend_from_slice(&decompressed);
+                        let remaining = orig_size - output.len();
+                        let cur_block = std::cmp::min(block_size, remaining);
+
+                        if comp_size == cur_block {
+                            // Uncompressed block
+                            output.extend_from_slice(&data[rpos..rpos + comp_size]);
+                        } else {
+                            let decompressed =
+                                lz4_flex::decompress(&data[rpos..rpos + comp_size], cur_block)
+                                    .map_err(|e| {
+                                        FormatError::InvalidData(format!("LZ4 decompress: {}", e))
+                                    })?;
+                            output.extend_from_slice(&decompressed);
+                        }
+                        rpos += comp_size;
                     }
-                    rpos += comp_size;
+                    Ok(output)
                 }
-                Ok(output)
             }
         }
         #[cfg(not(feature = "lz4"))]
@@ -1111,15 +1368,13 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // ZSTD (32015) — Zstandard compression via pure Rust rust-zstd crate
         // =====================================================================
         #[cfg(feature = "zstd")]
-        FILTER_ZSTD => {
-            if compress {
+        FILTER_ZSTD => match pass {
+            Pass::Forward => {
                 let level = filter.cd_values.first().copied().unwrap_or(3) as i32;
                 Ok(rust_zstd::compress(data, level))
-            } else {
-                rust_zstd::decompress(data)
-                    .map_err(|e| FormatError::InvalidData(format!("zstd decompress: {}", e)))
             }
-        }
+            Pass::Reverse { limit } => zstd_decompress(data, limit),
+        },
         #[cfg(not(feature = "zstd"))]
         FILTER_ZSTD => Err(FormatError::UnsupportedFeature(
             "ZSTD filter requires the 'zstd' feature".into(),
@@ -1129,8 +1384,8 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // BZIP2 (307) — raw bzip2 stream
         // =====================================================================
         #[cfg(feature = "bzip2")]
-        FILTER_BZIP2 => {
-            if compress {
+        FILTER_BZIP2 => match pass {
+            Pass::Forward => {
                 use bzip2::write::BzEncoder;
                 use bzip2::Compression;
                 use std::io::Write;
@@ -1140,16 +1395,9 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                     .map_err(|e| FormatError::InvalidData(format!("bzip2 compress: {}", e)))?;
                 enc.finish()
                     .map_err(|e| FormatError::InvalidData(format!("bzip2 finish: {}", e)))
-            } else {
-                use bzip2::read::BzDecoder;
-                use std::io::Read;
-                let mut dec = BzDecoder::new(data);
-                let mut out = Vec::new();
-                dec.read_to_end(&mut out)
-                    .map_err(|e| FormatError::InvalidData(format!("bzip2 decompress: {}", e)))?;
-                Ok(out)
             }
-        }
+            Pass::Reverse { limit } => bzip2_decompress(data, limit),
+        },
         #[cfg(not(feature = "bzip2"))]
         FILTER_BZIP2 => Err(FormatError::UnsupportedFeature(
             "BZIP2 requires 'bzip2_filter' feature".into(),
@@ -1160,15 +1408,16 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         // =====================================================================
         FILTER_LZF => {
             let chunk_size = filter.cd_values.get(2).copied().unwrap_or(0) as usize;
-            if compress {
-                Ok(lzf_compress(data))
-            } else {
-                let out_size = if chunk_size > 0 {
-                    chunk_size
-                } else {
-                    data.len() * 4
-                };
-                lzf_decompress(data, out_size)
+            match pass {
+                Pass::Forward => Ok(lzf_compress(data)),
+                Pass::Reverse { limit } => {
+                    let out_size = if chunk_size > 0 {
+                        chunk_size
+                    } else {
+                        data.len() * 4
+                    };
+                    lzf_decompress(data, out_size, limit)
+                }
             }
         }
 
@@ -1179,46 +1428,40 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             let elem_size = filter.cd_values.get(2).copied().unwrap_or(1) as usize;
             let block_size = filter.cd_values.get(3).copied().unwrap_or(0) as usize;
             let comp_type = filter.cd_values.get(4).copied().unwrap_or(0);
-            if compress {
-                bitshuffle_compress(data, elem_size, block_size, comp_type, filter)
-            } else {
-                bitshuffle_decompress(data, elem_size, block_size, comp_type)
+            match pass {
+                Pass::Forward => {
+                    bitshuffle_compress(data, elem_size, block_size, comp_type, filter)
+                }
+                Pass::Reverse { limit } => {
+                    bitshuffle_decompress(data, elem_size, block_size, comp_type, limit)
+                }
             }
         }
 
         // =====================================================================
         // BitGroom (32022) — lossy float quantization (alternating shave/set)
         // =====================================================================
-        FILTER_BITGROOM => {
-            if compress {
-                bitgroom_quantize(data, filter)
-            } else {
-                Ok(data.to_vec()) // no-op on decompress
-            }
-        }
+        FILTER_BITGROOM => match pass {
+            Pass::Forward => bitgroom_quantize(data, filter),
+            Pass::Reverse { .. } => Ok(data.to_vec()), // no-op on decompress
+        },
 
         // =====================================================================
         // Granular BitRound (32023) — lossy float quantization (round-then-shave)
         // =====================================================================
-        FILTER_BITROUND => {
-            if compress {
-                bitround_quantize(data, filter)
-            } else {
-                Ok(data.to_vec()) // no-op on decompress
-            }
-        }
+        FILTER_BITROUND => match pass {
+            Pass::Forward => bitround_quantize(data, filter),
+            Pass::Reverse { .. } => Ok(data.to_vec()), // no-op on decompress
+        },
 
         // =====================================================================
-        // BLOSC (32001) — decompress only via sub-codec dispatch
+        // BLOSC (32001) — c-blosc 1.x frames
         // =====================================================================
         #[cfg(feature = "blosc")]
-        FILTER_BLOSC => {
-            if compress {
-                blosc_compress(data, filter)
-            } else {
-                blosc_decompress(data, filter)
-            }
-        }
+        FILTER_BLOSC => match pass {
+            Pass::Forward => blosc_compress(data, filter),
+            Pass::Reverse { limit } => blosc_decompress(data, &filter.cd_values, limit),
+        },
         #[cfg(not(feature = "blosc"))]
         FILTER_BLOSC => Err(FormatError::UnsupportedFeature(
             "BLOSC requires 'blosc' feature".into(),
@@ -1510,10 +1753,12 @@ fn lzf_compress(input: &[u8]) -> Vec<u8> {
 /// buffer on `E2BIG`) it is a sizing hint, not a bound on what the stream may
 /// expand to; the stream itself bounds that, at 88 bytes of output per byte
 /// of input (a 3-byte back-reference of 264 bytes), so a declared size past
-/// what the input could produce sizes nothing.
-fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
+/// what the input could produce sizes nothing. Output past `limit` fails.
+fn lzf_decompress(input: &[u8], max_output: usize, limit: usize) -> FormatResult<Vec<u8>> {
     const MAX_EXPANSION: usize = 88;
-    let reserve = max_output.min(input.len().saturating_mul(MAX_EXPANSION));
+    let reserve = max_output
+        .min(input.len().saturating_mul(MAX_EXPANSION))
+        .min(limit);
     let mut out = Vec::new();
     out.try_reserve_exact(reserve).map_err(|_| {
         FormatError::InvalidData(format!("LZF: cannot reserve {reserve} bytes of output"))
@@ -1531,6 +1776,9 @@ fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
                 return Err(FormatError::InvalidData(
                     "LZF: truncated literal run".into(),
                 ));
+            }
+            if out.len() + count > limit {
+                return Err(past_limit("LZF", limit));
             }
             out.extend_from_slice(&input[ip..ip + count]);
             ip += count;
@@ -1558,6 +1806,9 @@ fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
                 return Err(FormatError::InvalidData(
                     "LZF: invalid back-ref offset".into(),
                 ));
+            }
+            if out.len() + ml > limit {
+                return Err(past_limit("LZF", limit));
             }
             let ref_start = out.len() - off - 1;
             for i in 0..ml {
@@ -1721,12 +1972,16 @@ fn bitshuffle_decompress(
     elem_size: usize,
     block_size: usize,
     comp_type: u32,
+    limit: usize,
 ) -> FormatResult<Vec<u8>> {
     if comp_type == 0 {
         // No compression and no header: the stream is the same length as the
         // original, so reconstruct the canonical block plan from its length
         // and the filter's block size, then bitunshuffle each block. The
         // trailing `n_elems % 8` elements are raw.
+        if data.len() > limit {
+            return Err(past_limit("bitshuffle", limit));
+        }
         if elem_size == 0 {
             return Ok(data.to_vec());
         }
@@ -1768,7 +2023,11 @@ fn bitshuffle_decompress(
         }
         let orig_size = u64::from_be_bytes([
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ]) as usize;
+        ]);
+        let orig_size = usize::try_from(orig_size)
+            .ok()
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| past_limit("bitshuffle", limit))?;
         // Block size is read from the header, overriding the filter value
         // (matching the canonical filter), and must be a multiple of 8.
         let block_bytes = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
@@ -1783,14 +2042,17 @@ fn bitshuffle_decompress(
                 "bitshuffle: invalid block size in header".into(),
             ));
         }
-        // `orig_size` is file-derived; cap the pre-allocation so a hostile
-        // header cannot drive an unbounded allocation.
-        let mut output = Vec::with_capacity(orig_size.min(64 * 1024 * 1024));
+        let mut output = Vec::new();
+        output.try_reserve_exact(orig_size).map_err(|_| {
+            FormatError::InvalidData(format!("bitshuffle: cannot reserve {orig_size} bytes"))
+        })?;
         let mut rpos = 12;
 
         let n_elems = orig_size / elem_size;
-        let mut scratch = BitshuffleScratch::new(block_bytes);
-        let mut decompressed = vec![0u8; block_bytes];
+        // No block holds more than the chunk, whatever the header's size.
+        let block_room = block_bytes.min(orig_size);
+        let mut scratch = BitshuffleScratch::new(block_room);
+        let mut decompressed = vec![0u8; block_room];
         // Every block (full or final) is a length-prefixed LZ4 block; only the
         // `n_elems % 8` trailing elements are stored raw.
         for &block in &bshuf_block_plan(n_elems, block_elems) {
@@ -2030,7 +2292,14 @@ fn frexp_f64(x: f64) -> (f64, i32) {
 }
 
 // =========================================================================
-// BLOSC (32001) — sub-codec dispatch: BloscLZ, LZ4, LZ4HC, Snappy, Zlib, Zstd
+// BLOSC (32001) — the c-blosc 1.x frame (blosc.c 1.12.0, format version 2)
+//
+// A frame is a 16-byte header, one u32 offset per block (bstarts), then the
+// blocks. A block is shuffled whole, cut into `typesize` streams (BloscLZ
+// and Snappy only) or kept as one, and each stream is stored as a u32
+// length followed by the codec's output — or by the raw bytes when that
+// length equals the stream's own. A MEMCPYED frame holds the input verbatim
+// after the header. The codec of a frame is in its flags, bits 5-7.
 // =========================================================================
 
 /// Blosc compressor codes (cd_values[6]).
@@ -2047,36 +2316,67 @@ const BLOSC_ZLIB: u32 = 4;
 #[cfg(feature = "blosc")]
 const BLOSC_ZSTD: u32 = 5;
 
+/// Compressor library formats, the header's flags bits 5-7 (LZ4HC writes LZ4).
 #[cfg(feature = "blosc")]
-fn blosc_sub_compress(compressor: u32, data: &[u8]) -> FormatResult<Vec<u8>> {
-    match compressor {
-        BLOSC_BLOSCLZ => Ok(blosclz_compress(data, 5)),
-        BLOSC_LZ4 | BLOSC_LZ4HC => {
-            // LZ4HC decompresses identically to LZ4; we compress with standard LZ4
-            Ok(lz4_flex::compress(data))
-        }
-        BLOSC_SNAPPY => {
-            let mut enc = snap::raw::Encoder::new();
-            enc.compress_vec(data)
-                .map_err(|e| FormatError::InvalidData(format!("blosc snappy compress: {}", e)))
-        }
+const BLOSC_BLOSCLZ_FORMAT: u8 = 0;
+#[cfg(feature = "blosc")]
+const BLOSC_LZ4_FORMAT: u8 = 1;
+#[cfg(feature = "blosc")]
+const BLOSC_SNAPPY_FORMAT: u8 = 2;
+#[cfg(feature = "blosc")]
+const BLOSC_ZLIB_FORMAT: u8 = 3;
+#[cfg(feature = "blosc")]
+const BLOSC_ZSTD_FORMAT: u8 = 4;
+
+#[cfg(feature = "blosc")]
+const BLOSC_VERSION_FORMAT: u8 = 2;
+/// Every compressor writes format version 1.
+#[cfg(feature = "blosc")]
+const BLOSC_CODEC_VERSION_FORMAT: u8 = 1;
+#[cfg(feature = "blosc")]
+const BLOSC_MAX_OVERHEAD: usize = 16;
+#[cfg(feature = "blosc")]
+const BLOSC_MAX_BUFFERSIZE: usize = i32::MAX as usize - BLOSC_MAX_OVERHEAD;
+#[cfg(feature = "blosc")]
+const BLOSC_MAX_TYPESIZE: usize = 255;
+#[cfg(feature = "blosc")]
+const BLOSC_MIN_BUFFERSIZE: usize = 128;
+#[cfg(feature = "blosc")]
+const BLOSC_MAX_SPLITS: usize = 16;
+#[cfg(feature = "blosc")]
+const BLOSC_L1: usize = 32 * 1024;
+
+/// The smallest frames whose blocks go to the pool: below these, entering it
+/// cost more than it saved (blosclz/lz4/zstd, 4 and 24 threads).
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+const BLOSC_POOL_MIN_ENCODE: usize = 512 * 1024;
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+const BLOSC_POOL_MIN_DECODE: usize = 1024 * 1024;
+
+#[cfg(feature = "blosc")]
+const BLOSC_DOSHUFFLE: u8 = 0x1;
+#[cfg(feature = "blosc")]
+const BLOSC_MEMCPYED: u8 = 0x2;
+#[cfg(feature = "blosc")]
+const BLOSC_DOBITSHUFFLE: u8 = 0x4;
+#[cfg(feature = "blosc")]
+const BLOSC_DONT_SPLIT: u8 = 0x10;
+
+/// The library format a compressor code writes, or why it cannot be used.
+#[cfg(feature = "blosc")]
+fn blosc_compformat(compcode: u32) -> FormatResult<u8> {
+    match compcode {
+        BLOSC_BLOSCLZ => Ok(BLOSC_BLOSCLZ_FORMAT),
+        BLOSC_LZ4 | BLOSC_LZ4HC => Ok(BLOSC_LZ4_FORMAT),
+        BLOSC_SNAPPY => Ok(BLOSC_SNAPPY_FORMAT),
         #[cfg(feature = "deflate")]
-        BLOSC_ZLIB => {
-            use flate2::write::ZlibEncoder;
-            use flate2::Compression;
-            use std::io::Write;
-            let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(6));
-            enc.write_all(data)
-                .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {}", e)))?;
-            enc.finish()
-                .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {}", e)))
-        }
+        BLOSC_ZLIB => Ok(BLOSC_ZLIB_FORMAT),
         #[cfg(not(feature = "deflate"))]
         BLOSC_ZLIB => Err(FormatError::UnsupportedFeature(
             "blosc zlib sub-codec requires the 'deflate' feature".into(),
         )),
         #[cfg(feature = "zstd")]
-        BLOSC_ZSTD => Ok(rust_zstd::compress(data, 3)),
+        BLOSC_ZSTD => Ok(BLOSC_ZSTD_FORMAT),
         #[cfg(not(feature = "zstd"))]
         BLOSC_ZSTD => Err(FormatError::UnsupportedFeature(
             "blosc zstd sub-codec requires the 'zstd' feature".into(),
@@ -2088,101 +2388,937 @@ fn blosc_sub_compress(compressor: u32, data: &[u8]) -> FormatResult<Vec<u8>> {
     }
 }
 
+/// `compute_blocksize` without a forced block size.
 #[cfg(feature = "blosc")]
-fn blosc_sub_decompress(compressor: u32, data: &[u8], nbytes: usize) -> FormatResult<Vec<u8>> {
-    match compressor {
-        BLOSC_BLOSCLZ => blosclz_decompress(data, nbytes),
-        BLOSC_LZ4 | BLOSC_LZ4HC => lz4_flex::decompress(data, nbytes)
-            .map_err(|e| FormatError::InvalidData(format!("blosc lz4: {}", e))),
-        BLOSC_SNAPPY => {
-            let mut dec = snap::raw::Decoder::new();
-            dec.decompress_vec(data)
-                .map_err(|e| FormatError::InvalidData(format!("blosc snappy: {}", e)))
+fn blosc_blocksize(compcode: u32, clevel: u32, typesize: usize, nbytes: usize) -> usize {
+    if nbytes < typesize {
+        return 1;
+    }
+    let mut blocksize = nbytes;
+    if nbytes >= BLOSC_L1 {
+        // The high-ratio codecs get blocks twice as large.
+        let hcr = matches!(compcode, BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD);
+        let base = if hcr { 2 * BLOSC_L1 } else { BLOSC_L1 };
+        blocksize = match clevel {
+            0 => base / 4,
+            1..=3 => base / 2,
+            4 | 5 => base,
+            6 => base * 2,
+            7 => base * 4,
+            8 => base * 8,
+            _ => base * 16,
+        };
+    }
+    blocksize = blocksize.min(nbytes);
+    if blocksize > typesize {
+        blocksize = blocksize / typesize * typesize;
+    }
+    blocksize
+}
+
+/// `split_block`: whether the compressor cuts each block into `typesize`
+/// streams. c-blosc measured LZ4 faster unsplit.
+#[cfg(feature = "blosc")]
+fn blosc_split_block(compcode: u32, typesize: usize, blocksize: usize) -> bool {
+    matches!(compcode, BLOSC_BLOSCLZ | BLOSC_SNAPPY)
+        && typesize <= BLOSC_MAX_SPLITS
+        && blocksize / typesize >= BLOSC_MIN_BUFFERSIZE
+}
+
+/// One frame's header fields and block geometry.
+#[cfg(feature = "blosc")]
+#[derive(Clone, Copy)]
+struct BloscFrame {
+    flags: u8,
+    typesize: usize,
+    nbytes: usize,
+    blocksize: usize,
+    nblocks: usize,
+}
+
+#[cfg(feature = "blosc")]
+impl BloscFrame {
+    fn new(flags: u8, typesize: usize, nbytes: usize, blocksize: usize) -> Self {
+        Self {
+            flags,
+            typesize,
+            nbytes,
+            blocksize,
+            nblocks: nbytes.div_ceil(blocksize),
         }
-        #[cfg(feature = "deflate")]
-        BLOSC_ZLIB => inflate_zlib(data, Some(nbytes))
-            .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {e}"))),
-        #[cfg(not(feature = "deflate"))]
-        BLOSC_ZLIB => Err(FormatError::UnsupportedFeature(
-            "blosc zlib sub-codec requires the 'deflate' feature".into(),
-        )),
-        #[cfg(feature = "zstd")]
-        BLOSC_ZSTD => rust_zstd::decompress(data)
-            .map_err(|e| FormatError::InvalidData(format!("blosc zstd: {}", e))),
-        #[cfg(not(feature = "zstd"))]
-        BLOSC_ZSTD => Err(FormatError::UnsupportedFeature(
-            "blosc zstd sub-codec requires the 'zstd' feature".into(),
-        )),
-        other => Err(FormatError::UnsupportedFeature(format!(
-            "blosc compressor code {}",
-            other
-        ))),
+    }
+
+    fn is_leftover(&self, j: usize) -> bool {
+        j + 1 == self.nblocks && !self.nbytes.is_multiple_of(self.blocksize)
+    }
+
+    /// The most block `j` can take compressed with `compcode`; in a room this
+    /// large no stream's maxout is trimmed.
+    #[cfg(feature = "parallel")]
+    fn worst_case(&self, compcode: u32, j: usize) -> usize {
+        let nsplits = self.nsplits(j);
+        nsplits * (4 + blosc_maxout(compcode, self.block_len(j) / nsplits))
+    }
+
+    /// Block `j` of the frame's input `data`.
+    fn block_of<'a>(&self, data: &'a [u8], j: usize) -> &'a [u8] {
+        &data[j * self.blocksize..][..self.block_len(j)]
+    }
+
+    fn block_len(&self, j: usize) -> usize {
+        if self.is_leftover(j) {
+            self.nbytes % self.blocksize
+        } else {
+            self.blocksize
+        }
+    }
+
+    /// The streams block `j` is stored as — `blosc_d`'s rule. For a frame
+    /// c-blosc wrote it agrees with `blosc_c`'s, which only reads the
+    /// DONT_SPLIT flag, because `split_block` set that flag.
+    fn nsplits(&self, j: usize) -> usize {
+        let split = self.flags & BLOSC_DONT_SPLIT == 0
+            && self.typesize <= BLOSC_MAX_SPLITS
+            && self.block_len(j) / self.typesize >= BLOSC_MIN_BUFFERSIZE
+            && !self.is_leftover(j);
+        if split {
+            self.typesize
+        } else {
+            1
+        }
+    }
+
+    /// Byte shuffle only means something for elements wider than a byte, and
+    /// wins over the bit flag (`blosc_c`/`blosc_d` test it first).
+    fn byte_shuffled(&self) -> bool {
+        self.flags & BLOSC_DOSHUFFLE != 0 && self.typesize > 1
+    }
+
+    fn bit_shuffled(&self) -> bool {
+        !self.byte_shuffled() && self.flags & BLOSC_DOBITSHUFFLE != 0
     }
 }
 
+/// c-blosc `shuffle` (`inverse`: `unshuffle`) of one block: the byte
+/// transpose of its whole elements, a ragged tail copied as it is.
+#[cfg(feature = "blosc")]
+fn blosc_shuffle_block(typesize: usize, src: &[u8], dst: &mut [u8], inverse: bool) {
+    let n = src.len() / typesize;
+    if inverse {
+        untrans_byte_elem(src, dst, n, typesize);
+    } else {
+        trans_byte_elem(src, dst, n, typesize);
+    }
+    dst[n * typesize..].copy_from_slice(&src[n * typesize..]);
+}
+
+/// c-blosc `bitshuffle` (`inverse`: `bitunshuffle`) of one block. A block
+/// whose element count is not a multiple of 8 is copied untransposed. C
+/// leaves a ragged tail past the last whole element unwritten; it is copied
+/// here.
+#[cfg(feature = "blosc")]
+fn blosc_bitshuffle_block(
+    typesize: usize,
+    src: &[u8],
+    dst: &mut [u8],
+    scratch: &mut BitshuffleScratch,
+    inverse: bool,
+) {
+    let n = src.len() / typesize;
+    if !n.is_multiple_of(8) {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let whole = n * typesize;
+    if inverse {
+        bitunshuffle_block_into(&src[..whole], scratch, dst, typesize);
+    } else {
+        bitshuffle_block_into(&src[..whole], scratch, dst, typesize);
+    }
+    dst[whole..].copy_from_slice(&src[whole..]);
+}
+
+/// The room a stream of `neblock` bytes may take before the frame's room
+/// left trims it.
+#[cfg(feature = "blosc")]
+fn blosc_maxout(compcode: u32, neblock: usize) -> usize {
+    if compcode == BLOSC_SNAPPY {
+        snap::raw::max_compress_len(neblock)
+    } else {
+        neblock
+    }
+}
+
+/// The largest block whose buffers a thread keeps: the largest
+/// [`blosc_blocksize`] makes, clevel 9 of a high-ratio codec. A larger block
+/// is a foreign frame's, and keeping its buffers would leave that much
+/// resident on every thread it passed through.
+#[cfg(feature = "blosc")]
+const BLOSC_MAX_KEPT_BLOCK: usize = 16 * 2 * BLOSC_L1;
+
+/// The largest zstd workspace a thread keeps: a 512 KiB level-15 stream's,
+/// the largest any clevel under 9 compresses. A context built per stream
+/// faults its whole workspace in; on 48 threads that made frames of those
+/// streams 2.6 times slower, and frames of 1 MiB level-22 streams (18 MB
+/// workspaces) a fifth slower, where keeping theirs left 1 GB resident.
+#[cfg(all(feature = "blosc", feature = "zstd"))]
+const BLOSC_MAX_KEPT_ZSTD: usize = 8_900_472;
+
+/// The workspace a `rust_zstd::Compressor` sizes its context to for one
+/// frame of `len` bytes at `level`: `ZSTD_estimateCCtxSize` of the
+/// parameters it picks.
+#[cfg(all(feature = "blosc", feature = "zstd"))]
+fn zstd_workspace(level: i32, len: usize) -> usize {
+    use rust_zstd::compress::{lazy::default_search_method, matchstate::needed_space, CParams};
+    let cparams = CParams::for_level(level, len);
+    needed_space(&cparams, default_search_method(&cparams), None, len as u64)
+}
+
+/// One thread's working memory for blosc blocks, kept from frame to frame:
+/// each buffer is sized by the largest block it has served, never by a
+/// frame. A pool worker serves every frame's blocks it is given from its
+/// own.
+#[cfg(feature = "blosc")]
+#[derive(Default)]
+struct BloscScratch {
+    /// A block shuffled before it is compressed, or decoded before it is
+    /// unshuffled.
+    tmp: Vec<u8>,
+    bitshuffle: BitshuffleScratch,
+    codecs: BloscCodecs,
+    /// The pool's blocks a wave has no room for in the frame.
+    #[cfg(feature = "parallel")]
+    spill: Vec<u8>,
+}
+
+/// Each codec's reusable state.
+#[cfg(feature = "blosc")]
+#[derive(Default)]
+struct BloscCodecs {
+    /// LZ4 and zstd write only into room for their worst case.
+    staging: Vec<u8>,
+    /// BloscLZ's hash table.
+    blosclz: Vec<u16>,
+    snappy: Option<snap::raw::Encoder>,
+    /// With the clevel it compresses at.
+    #[cfg(feature = "deflate")]
+    zlib: Option<(u32, flate2::Compress)>,
+    #[cfg(feature = "deflate")]
+    inflate: Option<zlib_rs::Inflate>,
+    /// With the level it compresses at; never past [`BLOSC_MAX_KEPT_ZSTD`].
+    #[cfg(feature = "zstd")]
+    zstd: Option<(i32, rust_zstd::Compressor)>,
+    #[cfg(feature = "zstd")]
+    unzstd: Option<rust_zstd::Decompressor>,
+}
+
+#[cfg(feature = "blosc")]
+thread_local! {
+    static BLOSC_SCRATCH: std::cell::Cell<Option<Box<BloscScratch>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` on this thread's [`BloscScratch`] for blocks of up to `block`
+/// bytes.
+#[cfg(feature = "blosc")]
+fn with_blosc_scratch<R>(block: usize, f: impl FnOnce(&mut BloscScratch) -> R) -> R {
+    if block > BLOSC_MAX_KEPT_BLOCK {
+        return f(&mut BloscScratch::default());
+    }
+    let mut scratch = BLOSC_SCRATCH.take().unwrap_or_default();
+    let r = f(&mut scratch);
+    BLOSC_SCRATCH.set(Some(scratch));
+    r
+}
+
+/// One frame's `blosc_c` parameters.
+#[cfg(feature = "blosc")]
+#[derive(Clone, Copy)]
+struct BloscParams {
+    frame: BloscFrame,
+    clevel: u32,
+    compcode: u32,
+    /// `get_accel`; only BloscLZ honours it here.
+    accel: u32,
+}
+
+#[cfg(feature = "blosc")]
+impl BloscParams {
+    fn new(frame: BloscFrame, clevel: u32, compcode: u32) -> Self {
+        let typesize = frame.typesize;
+        let accel = if clevel == 9 {
+            1
+        } else if compcode == BLOSC_BLOSCLZ && typesize.is_power_of_two() && typesize < 32 {
+            32
+        } else if compcode == BLOSC_LZ4 {
+            10 - clevel
+        } else {
+            1
+        };
+        Self {
+            frame,
+            clevel,
+            compcode,
+            accel,
+        }
+    }
+}
+
+#[cfg(feature = "blosc")]
+impl BloscScratch {
+    /// `blosc_c`: shuffle and compress block `j` into `dest`, the frame's
+    /// room left, returning the bytes written or 0 when the block does not
+    /// fit — the frame is then stored MEMCPYED.
+    fn compress_block(
+        &mut self,
+        p: &BloscParams,
+        j: usize,
+        src: &[u8],
+        dest: &mut [u8],
+    ) -> FormatResult<usize> {
+        let BloscScratch {
+            tmp,
+            bitshuffle,
+            codecs,
+            ..
+        } = self;
+        let frame = p.frame;
+        let bsize = src.len();
+        if (frame.byte_shuffled() || frame.bit_shuffled()) && tmp.len() < bsize {
+            tmp.resize(bsize, 0);
+        }
+        let src = if frame.byte_shuffled() {
+            blosc_shuffle_block(frame.typesize, src, &mut tmp[..bsize], false);
+            &tmp[..bsize]
+        } else if frame.bit_shuffled() {
+            bitshuffle.grow(bsize);
+            blosc_bitshuffle_block(frame.typesize, src, &mut tmp[..bsize], bitshuffle, false);
+            &tmp[..bsize]
+        } else {
+            src
+        };
+        let nsplits = frame.nsplits(j);
+        let neblock = bsize / nsplits;
+        let mut pos = 0usize;
+        for split in src.chunks_exact(neblock).take(nsplits) {
+            pos += 4;
+            let mut maxout = blosc_maxout(p.compcode, neblock);
+            if pos + maxout > dest.len() {
+                if pos >= dest.len() {
+                    return Ok(0);
+                }
+                maxout = dest.len() - pos;
+            }
+            let mut cbytes = codecs.compress(p, split, &mut dest[pos..pos + maxout])?;
+            // A stream as long as its input reads back as raw bytes, so one
+            // that did not shrink is stored raw.
+            if cbytes == 0 || cbytes == neblock {
+                if pos + neblock > dest.len() {
+                    return Ok(0);
+                }
+                dest[pos..pos + neblock].copy_from_slice(split);
+                cbytes = neblock;
+            }
+            dest[pos - 4..pos].copy_from_slice(&(cbytes as u32).to_le_bytes());
+            pos += cbytes;
+        }
+        Ok(pos)
+    }
+
+    /// `blosc_d`: decode block `j` of the frame `src` into `dest`, which is
+    /// exactly the block's length.
+    fn decompress_block(
+        &mut self,
+        frame: &BloscFrame,
+        j: usize,
+        src: &[u8],
+        dest: &mut [u8],
+    ) -> FormatResult<()> {
+        let BloscScratch {
+            tmp,
+            bitshuffle,
+            codecs,
+            ..
+        } = self;
+        let bad = |what: &str| FormatError::InvalidData(format!("blosc: block {j} {what}"));
+        let bsize = dest.len();
+        let nsplits = frame.nsplits(j);
+        let neblock = bsize / nsplits;
+        if neblock * nsplits != bsize {
+            return Err(bad("is not a whole number of streams"));
+        }
+        let shuffled = frame.byte_shuffled() || frame.bit_shuffled();
+        if shuffled && tmp.len() < bsize {
+            tmp.resize(bsize, 0);
+        }
+        let mut pos = u32::from_le_bytes(src[16 + 4 * j..20 + 4 * j].try_into().unwrap()) as usize;
+        {
+            let target = if shuffled {
+                &mut tmp[..bsize]
+            } else {
+                &mut *dest
+            };
+            for part in target.chunks_exact_mut(neblock) {
+                let csize = src
+                    .get(pos..pos + 4)
+                    .ok_or_else(|| bad("runs past the frame"))?;
+                let csize = i32::from_le_bytes(csize.try_into().unwrap());
+                let csize =
+                    usize::try_from(csize).map_err(|_| bad("has a negative stream length"))?;
+                pos += 4;
+                let stream = src
+                    .get(pos..pos + csize)
+                    .ok_or_else(|| bad("runs past the frame"))?;
+                if csize == neblock {
+                    part.copy_from_slice(stream);
+                } else {
+                    codecs.decompress(frame.flags >> 5, stream, part)?;
+                }
+                pos += csize;
+            }
+        }
+        if frame.byte_shuffled() {
+            blosc_shuffle_block(frame.typesize, &tmp[..bsize], dest, true);
+        } else if frame.bit_shuffled() {
+            bitshuffle.grow(bsize);
+            blosc_bitshuffle_block(frame.typesize, &tmp[..bsize], dest, bitshuffle, true);
+        }
+        Ok(())
+    }
+
+    /// Decode the one stream of a frame rust-hdf5 0.7.8 wrote into `dest`,
+    /// its nbytes long, unshuffling it as 0.7.8's `unshuffle` did.
+    fn decompress_078(
+        &mut self,
+        frame: &BloscFrame,
+        compformat: u8,
+        stream: &[u8],
+        dest: &mut [u8],
+    ) -> FormatResult<()> {
+        let BloscScratch { tmp, codecs, .. } = self;
+        if !frame.byte_shuffled() {
+            return codecs.decompress(compformat, stream, dest);
+        }
+        let n = dest.len();
+        if tmp.len() < n {
+            tmp.resize(n, 0);
+        }
+        codecs.decompress(compformat, stream, &mut tmp[..n])?;
+        blosc_shuffle_block(frame.typesize, &tmp[..n], dest, true);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "blosc")]
+impl BloscCodecs {
+    /// Compress one stream into `dst`, returning its length, or 0 when it
+    /// does not fit — c-blosc's `*_wrap_compress` with `maxout = dst.len()`.
+    fn compress(&mut self, p: &BloscParams, src: &[u8], dst: &mut [u8]) -> FormatResult<usize> {
+        let fit = |out: &[u8], dst: &mut [u8]| {
+            if out.len() <= dst.len() {
+                dst[..out.len()].copy_from_slice(out);
+                out.len()
+            } else {
+                0
+            }
+        };
+        match p.compcode {
+            BLOSC_BLOSCLZ => Ok(blosclz_compress(
+                p.clevel,
+                src,
+                dst,
+                p.accel,
+                &mut self.blosclz,
+            )),
+            // LZ4HC streams are LZ4 streams; the LZ4 encoder writes them.
+            BLOSC_LZ4 | BLOSC_LZ4HC => {
+                let staging = &mut self.staging;
+                staging.resize(lz4_flex::block::get_maximum_output_size(src.len()), 0);
+                let n = lz4_flex::block::compress_into(src, staging)
+                    .map_err(|e| FormatError::InvalidData(format!("blosc lz4 compress: {e}")))?;
+                Ok(fit(&staging[..n], dst))
+            }
+            // Like snappy-c, refuses a destination short of the worst case.
+            BLOSC_SNAPPY => Ok(self
+                .snappy
+                .get_or_insert_with(snap::raw::Encoder::new)
+                .compress(src, dst)
+                .unwrap_or(0)),
+            #[cfg(feature = "deflate")]
+            BLOSC_ZLIB => {
+                use flate2::{Compress, Compression, FlushCompress, Status};
+                let z = match &mut self.zlib {
+                    Some((clevel, z)) if *clevel == p.clevel => z,
+                    slot => {
+                        let z = Compress::new(Compression::new(p.clevel), true);
+                        &mut slot.insert((p.clevel, z)).1
+                    }
+                };
+                z.reset();
+                match z.compress(src, dst, FlushCompress::Finish) {
+                    Ok(Status::StreamEnd) => Ok(z.total_out() as usize),
+                    _ => Ok(0),
+                }
+            }
+            #[cfg(feature = "zstd")]
+            BLOSC_ZSTD => {
+                // zstd_wrap_compress; its level-8 adjustment tests the already
+                // mapped (odd) level and never applies.
+                let level = if p.clevel < 9 {
+                    p.clevel as i32 * 2 - 1
+                } else {
+                    22
+                };
+                let opts = rust_zstd::CompressOptions {
+                    level,
+                    ..Default::default()
+                };
+                let mut fresh;
+                let z = if zstd_workspace(level, src.len()) > BLOSC_MAX_KEPT_ZSTD {
+                    fresh = rust_zstd::Compressor::new(opts);
+                    &mut fresh
+                } else {
+                    match &mut self.zstd {
+                        Some((l, z)) if *l == level => z,
+                        slot => &mut slot.insert((level, rust_zstd::Compressor::new(opts))).1,
+                    }
+                };
+                self.staging.clear();
+                z.compress(src, &mut self.staging);
+                Ok(fit(&self.staging, dst))
+            }
+            other => blosc_compformat(other).map(|_| 0),
+        }
+    }
+
+    /// Decode one stream into all of `dst` — c-blosc's `*_wrap_decompress`
+    /// with `maxout = dst.len()`, which `blosc_d` requires to come out full.
+    fn decompress(&mut self, compformat: u8, src: &[u8], dst: &mut [u8]) -> FormatResult<()> {
+        let bad = |codec: &str, e: &dyn std::fmt::Display| {
+            FormatError::InvalidData(format!("blosc {codec} decompress: {e}"))
+        };
+        let n = match compformat {
+            BLOSC_BLOSCLZ_FORMAT => {
+                blosclz_decompress(src, dst).ok_or_else(|| bad("blosclz", &"corrupt stream"))?
+            }
+            BLOSC_LZ4_FORMAT => {
+                lz4_flex::block::decompress_into(src, dst).map_err(|e| bad("lz4", &e))?
+            }
+            BLOSC_SNAPPY_FORMAT => snap::raw::Decoder::new()
+                .decompress(src, dst)
+                .map_err(|e| bad("snappy", &e))?,
+            #[cfg(feature = "deflate")]
+            BLOSC_ZLIB_FORMAT => {
+                let inflate = self
+                    .inflate
+                    .get_or_insert_with(|| zlib_rs::Inflate::new(true, 15));
+                inflate_zlib_into(inflate, src, dst)?
+            }
+            #[cfg(feature = "zstd")]
+            BLOSC_ZSTD_FORMAT => {
+                let zstd = self.unzstd.get_or_insert_with(rust_zstd::Decompressor::new);
+                zstd_decompress_into(zstd, src, dst)?
+            }
+            #[cfg(not(feature = "deflate"))]
+            BLOSC_ZLIB_FORMAT => {
+                return Err(FormatError::UnsupportedFeature(
+                    "blosc zlib sub-codec requires the 'deflate' feature".into(),
+                ))
+            }
+            #[cfg(not(feature = "zstd"))]
+            BLOSC_ZSTD_FORMAT => {
+                return Err(FormatError::UnsupportedFeature(
+                    "blosc zstd sub-codec requires the 'zstd' feature".into(),
+                ))
+            }
+            other => {
+                return Err(FormatError::UnsupportedFeature(format!(
+                    "blosc compressor format {other}"
+                )))
+            }
+        };
+        if n != dst.len() {
+            return Err(FormatError::InvalidData(format!(
+                "blosc: a stream decoded to {n} bytes, its block holds {}",
+                dst.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `blosc_compress` for the HDF5 filter's `cd_values` (blosc_filter.c).
+///
+/// The destination has room for the header past the input, so input that
+/// does not compress comes out as a MEMCPYED frame. The C filter offers only
+/// `nbytes` and fails such a chunk instead, for libhdf5 to store unfiltered;
+/// this crate's writers have no optional-filter skip to fall back on.
 #[cfg(feature = "blosc")]
 fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
-    let typesize = filter.cd_values.get(2).copied().unwrap_or(1) as usize;
-    let doshuffle = filter.cd_values.get(5).copied().unwrap_or(1);
-    let compressor = filter.cd_values.get(6).copied().unwrap_or(BLOSC_LZ4);
-
-    // Apply byte-shuffle if requested
-    let shuffled = if doshuffle == 1 && typesize > 1 {
-        shuffle(data, typesize)
-    } else {
-        data.to_vec()
-    };
-
-    let compressed = blosc_sub_compress(compressor, &shuffled)?;
-
-    // Build blosc header (16 bytes)
-    let flags: u8 = if doshuffle == 1 { 0x01 } else { 0x00 };
-    let nbytes = data.len() as u32;
-    let blocksize = data.len() as u32;
-    let cbytes = (16 + compressed.len()) as u32;
-
-    let mut out = Vec::with_capacity(cbytes as usize);
-    out.push(2); // blosc format version
-    out.push(1); // compressor format version (always 1, matches C blosc)
-    out.push(flags);
-    out.push(typesize as u8);
-    out.extend_from_slice(&nbytes.to_le_bytes());
-    out.extend_from_slice(&blocksize.to_le_bytes());
-    out.extend_from_slice(&cbytes.to_le_bytes());
-    out.extend_from_slice(&compressed);
+    let mut out = vec![0u8; data.len() + BLOSC_MAX_OVERHEAD];
+    let n = blosc_compress_into(data, filter, &mut out)?;
+    out.truncate(n);
     Ok(out)
 }
 
+/// `blosc_compress_ctx` into `out` (its `destsize` is `out.len()`),
+/// returning the frame's length. Where C returns 0 — the frame, compressed
+/// or MEMCPYED, does not fit — this is an error; `nbytes` + 16 always fits.
 #[cfg(feature = "blosc")]
-fn blosc_decompress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
-    if data.len() < 16 {
-        return Err(FormatError::InvalidData("blosc: header too short".into()));
+fn blosc_compress_into(data: &[u8], filter: &Filter, out: &mut [u8]) -> FormatResult<usize> {
+    let cd = &filter.cd_values;
+    // Slot 2 is the type size; clevel, shuffle and compressor are optional.
+    let typesize = cd.get(2).copied().unwrap_or(1) as usize;
+    let clevel = cd.get(4).copied().unwrap_or(5);
+    let doshuffle = cd.get(5).copied().unwrap_or(1);
+    let compcode = cd.get(6).copied().unwrap_or(BLOSC_BLOSCLZ);
+    let compformat = blosc_compformat(compcode)?;
+    let bad = |what: String| FormatError::InvalidData(format!("blosc compress: {what}"));
+    if clevel > 9 {
+        return Err(bad(format!("clevel {clevel} is not 0..9")));
     }
-    let _version = data[0];
-    let flags = data[2];
-    let typesize = data[3] as usize;
-    let nbytes = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-
-    let compressed_data = &data[16..];
-    let compressor = filter.cd_values.get(6).copied().unwrap_or(BLOSC_LZ4);
-
-    // Check for memcpy flag (flags bit 1)
-    let decompressed = if flags & 0x02 != 0 {
-        compressed_data[..nbytes].to_vec()
+    if doshuffle > 2 {
+        return Err(bad(format!("shuffle {doshuffle} is not 0, 1 or 2")));
+    }
+    if typesize == 0 {
+        return Err(bad("typesize 0".into()));
+    }
+    let nbytes = data.len();
+    if nbytes > BLOSC_MAX_BUFFERSIZE {
+        return Err(bad(format!("{nbytes} bytes exceed BLOSC_MAX_BUFFERSIZE")));
+    }
+    // A wider type is compressed as a stream of bytes.
+    let typesize = if typesize > BLOSC_MAX_TYPESIZE {
+        1
     } else {
-        blosc_sub_decompress(compressor, compressed_data, nbytes)?
+        typesize
     };
+    let blocksize = blosc_blocksize(compcode, clevel, typesize, nbytes);
+    let mut flags = compformat << 5;
+    if clevel == 0 || nbytes < BLOSC_MIN_BUFFERSIZE {
+        flags |= BLOSC_MEMCPYED;
+    }
+    flags |= match doshuffle {
+        1 => BLOSC_DOSHUFFLE,
+        2 => BLOSC_DOBITSHUFFLE,
+        _ => 0,
+    };
+    if !blosc_split_block(compcode, typesize, blocksize) {
+        flags |= BLOSC_DONT_SPLIT;
+    }
+    let frame = BloscFrame::new(flags, typesize, nbytes, blocksize);
 
-    // Unshuffle if byte-shuffle flag set
-    if flags & 0x01 != 0 && typesize > 1 {
-        Ok(unshuffle(&decompressed, typesize))
-    } else {
-        Ok(decompressed)
+    let too_short = FormatError::BufferTooShort {
+        needed: nbytes + BLOSC_MAX_OVERHEAD,
+        available: out.len(),
+    };
+    // C writes the header unchecked; a destination short of it is refused.
+    if out.len() < BLOSC_MAX_OVERHEAD {
+        return Err(too_short);
+    }
+    let mut ntbytes = 0;
+    if flags & BLOSC_MEMCPYED == 0 {
+        ntbytes = blosc_compress_blocks(BloscParams::new(frame, clevel, compcode), data, out)?;
+        if ntbytes == 0 {
+            flags |= BLOSC_MEMCPYED;
+        }
+    }
+    if flags & BLOSC_MEMCPYED != 0 {
+        let body = out
+            .get_mut(BLOSC_MAX_OVERHEAD..BLOSC_MAX_OVERHEAD + nbytes)
+            .ok_or(too_short)?;
+        body.copy_from_slice(data);
+        ntbytes = BLOSC_MAX_OVERHEAD + nbytes;
+    }
+    out[0] = BLOSC_VERSION_FORMAT;
+    out[1] = BLOSC_CODEC_VERSION_FORMAT;
+    out[2] = flags;
+    out[3] = typesize as u8;
+    out[4..8].copy_from_slice(&(nbytes as u32).to_le_bytes());
+    out[8..12].copy_from_slice(&(blocksize as u32).to_le_bytes());
+    out[12..16].copy_from_slice(&(ntbytes as u32).to_le_bytes());
+    Ok(ntbytes)
+}
+
+/// `serial_blosc` compressing: bstarts and every block into `out`,
+/// returning the frame's length, or 0 when it does not fit in `out`.
+#[cfg(feature = "blosc")]
+fn blosc_compress_blocks(p: BloscParams, data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    let frame = p.frame;
+    let ntbytes = BLOSC_MAX_OVERHEAD + 4 * frame.nblocks;
+    if ntbytes > out.len() {
+        return Ok(0);
+    }
+    #[cfg(feature = "parallel")]
+    let (first, ntbytes) = blosc_compress_pooled(&p, data, out, ntbytes)?;
+    #[cfg(not(feature = "parallel"))]
+    let first = 0;
+    blosc_compress_serial(&p, data, out, first, ntbytes)
+}
+
+/// The blocks from `first` on, one after another into `out` from `ntbytes`:
+/// the frame's length, or 0 when it does not fit.
+#[cfg(feature = "blosc")]
+fn blosc_compress_serial(
+    p: &BloscParams,
+    data: &[u8],
+    out: &mut [u8],
+    first: usize,
+    mut ntbytes: usize,
+) -> FormatResult<usize> {
+    let frame = p.frame;
+    with_blosc_scratch(frame.blocksize, |scratch| {
+        for j in first..frame.nblocks {
+            let at = BLOSC_MAX_OVERHEAD + 4 * j;
+            out[at..at + 4].copy_from_slice(&(ntbytes as u32).to_le_bytes());
+            let block = frame.block_of(data, j);
+            let cbytes = scratch.compress_block(p, j, block, &mut out[ntbytes..])?;
+            if cbytes == 0 {
+                return Ok(0);
+            }
+            ntbytes += cbytes;
+        }
+        Ok(ntbytes)
+    })
+}
+
+/// The most blocks of a wave that compress into a thread's
+/// [`BloscScratch::spill`] instead of `out`. The room left falls short of a
+/// frame's worst case by its bstarts and stream lengths, about 4 bytes a
+/// stream: a block or two for most frames, a few at 64 MiB. Snappy's worst
+/// case is a sixth over its input, and the wave after its spill is wide.
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+const BLOSC_SPILL_BLOCKS: usize = 4;
+
+/// The pool's share of [`blosc_compress_blocks`], in waves: as many blocks
+/// as the room left in `out` holds at a full block's worst case, which a
+/// leftover block's never exceeds, and up to [`BLOSC_SPILL_BLOCKS`] more in
+/// the spill. Each block compresses into its own such room, then the wave
+/// slides down to `ntbytes` in block order. A block given its worst case
+/// compresses to what the serial loop writes wherever the room left holds
+/// that worst case: no block from `out` lands past the room it had, and a
+/// spilled block is placed only where it would not be trimmed. Returns the
+/// first block left to the serial loop and where it starts.
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+fn blosc_compress_pooled(
+    p: &BloscParams,
+    data: &[u8],
+    out: &mut [u8],
+    mut ntbytes: usize,
+) -> FormatResult<(usize, usize)> {
+    use rayon::prelude::*;
+    let frame = p.frame;
+    let pool = match crate::parallel::io_pool() {
+        Some(pool) if frame.nblocks > 1 && frame.nbytes >= BLOSC_POOL_MIN_ENCODE => pool,
+        _ => return Ok((0, ntbytes)),
+    };
+    let room = frame.worst_case(p.compcode, 0);
+    pool.install(|| {
+        // A wave that fails drops the spill with it.
+        let mut spill = with_blosc_scratch(frame.blocksize, |s| std::mem::take(&mut s.spill));
+        let mut j = 0;
+        'waves: loop {
+            let n = ((out.len() - ntbytes) / room).min(frame.nblocks - j);
+            if n == 0 {
+                break;
+            }
+            let spilled = (frame.nblocks - j - n).min(BLOSC_SPILL_BLOCKS);
+            if spill.len() < spilled * room {
+                spill.resize(spilled * room, 0);
+            }
+            let base = ntbytes;
+            let (head, tail) = out.split_at_mut(base);
+            // Until the slide, a block's bstart holds its length.
+            head[BLOSC_MAX_OVERHEAD + 4 * j..][..4 * (n + spilled)]
+                .par_chunks_mut(4)
+                .zip(
+                    tail[..n * room]
+                        .par_chunks_mut(room)
+                        .chain(spill[..spilled * room].par_chunks_mut(room)),
+                )
+                .enumerate()
+                .try_for_each(|(k, (start, dest))| -> FormatResult<()> {
+                    let block = frame.block_of(data, j + k);
+                    let cbytes = with_blosc_scratch(frame.blocksize, |scratch| {
+                        scratch.compress_block(p, j + k, block, dest)
+                    })?;
+                    start.copy_from_slice(&(cbytes as u32).to_le_bytes());
+                    Ok(())
+                })?;
+            for k in 0..n + spilled {
+                let at = BLOSC_MAX_OVERHEAD + 4 * (j + k);
+                let cbytes = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+                if k < n {
+                    let from = base + k * room;
+                    out.copy_within(from..from + cbytes, ntbytes);
+                } else if ntbytes + room <= out.len() {
+                    let from = (k - n) * room;
+                    out[ntbytes..ntbytes + cbytes].copy_from_slice(&spill[from..from + cbytes]);
+                } else {
+                    j += k;
+                    break 'waves;
+                }
+                out[at..at + 4].copy_from_slice(&(ntbytes as u32).to_le_bytes());
+                ntbytes += cbytes;
+            }
+            j += n + spilled;
+        }
+        with_blosc_scratch(frame.blocksize, |s| s.spill = spill);
+        Ok((j, ntbytes))
+    })
+}
+
+/// A stored blosc chunk, as [`blosc_frame`] reads its header.
+#[cfg(feature = "blosc")]
+enum BloscStored {
+    /// A c-blosc 1.x frame.
+    Frame(BloscFrame),
+    /// What rust-hdf5 0.7.8 wrote: the header, with `blocksize` == `nbytes`
+    /// and no flag but DOSHUFFLE, then one stream over the whole input,
+    /// byte-shuffled under that flag, of the codec in `cd_values[6]` (LZ4
+    /// when absent) — no bstarts. It is read, never written.
+    Legacy078 { frame: BloscFrame, compformat: u8 },
+}
+
+#[cfg(feature = "blosc")]
+impl BloscStored {
+    fn frame(&self) -> &BloscFrame {
+        match self {
+            BloscStored::Frame(frame) | BloscStored::Legacy078 { frame, .. } => frame,
+        }
     }
 }
 
+/// The header of the frame `src` (`blosc_cbuffer_sizes`), checked against
+/// the bytes it claims: a MEMCPYED body, or the bstarts table. `cd_values`
+/// complete the header of a frame rust-hdf5 0.7.8 wrote.
+#[cfg(feature = "blosc")]
+fn blosc_frame(src: &[u8], cd_values: &[u32]) -> FormatResult<BloscStored> {
+    let bad = |what: &str| FormatError::InvalidData(format!("blosc: {what}"));
+    if src.len() < BLOSC_MAX_OVERHEAD {
+        return Err(bad("header too short"));
+    }
+    let word = |at: usize| u32::from_le_bytes(src[at..at + 4].try_into().unwrap()) as usize;
+    let (flags, typesize, nbytes, blocksize) = (src[2], src[3] as usize, word(4), word(8));
+    if nbytes > BLOSC_MAX_BUFFERSIZE {
+        return Err(bad("nbytes exceeds BLOSC_MAX_BUFFERSIZE"));
+    }
+    // A c-blosc frame of one block (blocksize == nbytes) starts it at 20,
+    // past the header and its one bstarts entry; a 0.7.8 stream never opens
+    // with those four bytes: BloscLZ sets bit 5 of its first, LZ4 would name
+    // offset 0, zlib opens 0x78, zstd with its magic, and Snappy only for a
+    // 20-byte input opening with two one-byte literals, which snap merges.
+    // The empty stream 0.7.8 wrote for a BloscLZ input under 16 bytes
+    // decodes short of its nbytes and fails.
+    let legacy = src[..2] == [BLOSC_VERSION_FORMAT, BLOSC_CODEC_VERSION_FORMAT]
+        && flags & !BLOSC_DOSHUFFLE == 0
+        && nbytes > 0
+        && blocksize == nbytes
+        && word(12) == src.len()
+        && (src.len() < BLOSC_MAX_OVERHEAD + 4 || word(16) != BLOSC_MAX_OVERHEAD + 4);
+    if legacy {
+        // 0.7.8 shuffled by cd_values[2] and kept only its low byte here.
+        let typesize = cd_values.get(2).map_or(typesize, |&t| t as usize);
+        return Ok(BloscStored::Legacy078 {
+            frame: BloscFrame::new(flags, typesize, nbytes, blocksize),
+            compformat: blosc_compformat(cd_values.get(6).copied().unwrap_or(BLOSC_LZ4))?,
+        });
+    }
+    if flags & BLOSC_MEMCPYED != 0 || nbytes == 0 {
+        if flags & BLOSC_MEMCPYED != 0 && src.len() < BLOSC_MAX_OVERHEAD + nbytes {
+            return Err(bad("memcpy frame shorter than its nbytes"));
+        }
+        // nothing to decode block by block
+        return Ok(BloscStored::Frame(BloscFrame {
+            flags,
+            typesize,
+            nbytes,
+            blocksize,
+            nblocks: 0,
+        }));
+    }
+    if blocksize == 0 || typesize == 0 {
+        return Err(bad("zero blocksize or typesize"));
+    }
+    let frame = BloscFrame::new(flags, typesize, nbytes, blocksize);
+    if src.len() < BLOSC_MAX_OVERHEAD + 4 * frame.nblocks {
+        return Err(bad("bstarts run past the frame"));
+    }
+    Ok(BloscStored::Frame(frame))
+}
+
+/// `blosc_decompress` straight into `out`, returning the frame's
+/// uncompressed length; a frame whose nbytes `out` cannot hold fails, as
+/// `blosc_decompress_ctx` refuses a short `destsize`.
+#[cfg(feature = "blosc")]
+fn blosc_decompress_into(src: &[u8], cd_values: &[u32], out: &mut [u8]) -> FormatResult<usize> {
+    let stored = blosc_frame(src, cd_values)?;
+    let frame = stored.frame();
+    if frame.nbytes > out.len() {
+        return Err(past_limit("blosc", out.len()));
+    }
+    let out = &mut out[..frame.nbytes];
+    if let BloscStored::Legacy078 { frame, compformat } = &stored {
+        let stream = &src[BLOSC_MAX_OVERHEAD..];
+        with_blosc_scratch(frame.nbytes, |s| {
+            s.decompress_078(frame, *compformat, stream, out)
+        })?;
+        return Ok(frame.nbytes);
+    }
+    if frame.flags & BLOSC_MEMCPYED != 0 {
+        out.copy_from_slice(&src[BLOSC_MAX_OVERHEAD..BLOSC_MAX_OVERHEAD + frame.nbytes]);
+        return Ok(frame.nbytes);
+    }
+    #[cfg(feature = "parallel")]
+    let first = blosc_decompress_pooled(frame, src, out)?;
+    #[cfg(not(feature = "parallel"))]
+    let first = 0;
+    // A header's blocksize past nbytes makes one short block.
+    with_blosc_scratch(frame.blocksize.min(frame.nbytes), |scratch| {
+        for j in first..frame.nblocks {
+            let lo = j * frame.blocksize;
+            scratch.decompress_block(frame, j, src, &mut out[lo..lo + frame.block_len(j)])?;
+        }
+        Ok(frame.nbytes)
+    })
+}
+
+/// The pool's share of [`blosc_decompress_into`]: every block of the frame,
+/// `out`, decoded in place. Returns the first block left to the serial loop.
+#[cfg(all(feature = "blosc", feature = "parallel"))]
+fn blosc_decompress_pooled(frame: &BloscFrame, src: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    use rayon::prelude::*;
+    let pool = match crate::parallel::io_pool() {
+        Some(pool) if frame.nblocks > 1 && frame.nbytes >= BLOSC_POOL_MIN_DECODE => pool,
+        _ => return Ok(0),
+    };
+    pool.install(|| {
+        out.par_chunks_mut(frame.blocksize)
+            .enumerate()
+            .try_for_each(|(j, dest)| {
+                with_blosc_scratch(frame.blocksize, |scratch| {
+                    scratch.decompress_block(frame, j, src, dest)
+                })
+            })
+    })?;
+    Ok(frame.nblocks)
+}
+
+/// `blosc_decompress` into a buffer of the length the header records, which
+/// may be at most `limit`.
+#[cfg(feature = "blosc")]
+fn blosc_decompress(data: &[u8], cd_values: &[u32], limit: usize) -> FormatResult<Vec<u8>> {
+    let nbytes = blosc_frame(data, cd_values)?.frame().nbytes;
+    if nbytes > limit {
+        return Err(past_limit("blosc", limit));
+    }
+    let mut out = vec![0u8; nbytes];
+    blosc_decompress_into(data, cd_values, &mut out)?;
+    Ok(out)
+}
+
 // =========================================================================
-// BloscLZ — pure Rust port of the FastLZ-derived LZ77 compressor
+// BloscLZ 1.0.5 (blosclz.c of c-blosc 1.12.0), FastLZ-derived LZ77
 // =========================================================================
 
 #[cfg(feature = "blosc")]
@@ -2192,298 +3328,255 @@ const BLOSCLZ_MAX_DISTANCE: usize = 8191;
 #[cfg(feature = "blosc")]
 const BLOSCLZ_MAX_FARDISTANCE: usize = 65535 + BLOSCLZ_MAX_DISTANCE - 1;
 
+/// `HASH_FUNCTION` over the 3 bytes at `p`.
 #[cfg(feature = "blosc")]
-fn blosclz_hash(seq: u32, hashlog: u32) -> u32 {
-    seq.wrapping_mul(2654435761) >> (32 - hashlog)
+fn blosclz_hash(input: &[u8], p: usize, hash_log: u32) -> usize {
+    let v = u16::from_le_bytes([input[p], input[p + 1]]) as u32;
+    let v = v ^ u16::from_le_bytes([input[p + 1], input[p + 2]]) as u32 ^ (v >> (16 - hash_log));
+    (v & ((1 << hash_log) - 1)) as usize
 }
 
+/// `blosclz_compress(opt_level, input, length, output, maxout = output.len(),
+/// accel)`: the stream's length, or 0 when it would not come in under
+/// `maxlength_[opt_level]` of the input. The match extension compares
+/// 8 bytes at a time and, where a whole word matches up to the bound, takes
+/// no byte-wise tail — the x86 build (no `BLOSCLZ_STRICT_ALIGN`) — so the
+/// output is byte for byte what c-blosc writes there. `htab` holds the hash
+/// table, zeroed here as C callocs it.
 #[cfg(feature = "blosc")]
-fn blosclz_compress(input: &[u8], clevel: u32) -> Vec<u8> {
+fn blosclz_compress(
+    opt_level: u32,
+    input: &[u8],
+    output: &mut [u8],
+    accel: u32,
+    htab: &mut Vec<u16>,
+) -> usize {
+    const HASH_LOG: [u32; 10] = [0, 11, 11, 11, 12, 13, 13, 13, 13, 13];
+    const MAXLENGTH: [f64; 10] = [-1.0, 0.1, 0.15, 0.2, 0.3, 0.45, 0.6, 0.75, 0.9, 1.0];
+    const IP_BOUNDARY: usize = 2;
+    let opt = opt_level.min(9) as usize;
     let length = input.len();
-    if length < 16 {
-        return Vec::new();
+    let maxlength = ((length as f64 * MAXLENGTH[opt]) as usize).min(output.len());
+    if opt == 0 || maxlength < 66 || length < 4 {
+        return 0;
     }
+    let op_limit = maxlength;
+    let ip_bound = length - IP_BOUNDARY;
+    let hash_log = HASH_LOG[opt];
+    let accel = accel.max(1) - 1;
+    // Positions are kept as u16, as C does: past 64 KiB a hit points at the
+    // wrong place and the byte compare rejects or accepts it on its merits.
+    htab.clear();
+    htab.resize(1 << hash_log, 0);
 
-    let hashlog_table: [u32; 10] = [0, 12, 13, 14, 14, 14, 14, 14, 14, 14];
-    let clevel = (clevel as usize).clamp(1, 9);
-    let hashlog = hashlog_table[clevel];
-    let htab_size = 1usize << hashlog;
-    let mut htab = vec![0u32; htab_size];
+    let mut op = 0usize;
+    let mut copy: usize = 2;
+    output[op] = (BLOSCLZ_MAX_COPY - 1) as u8;
+    output[op + 1] = input[0];
+    output[op + 2] = input[1];
+    op += 3;
+    let mut ip = 2usize;
 
-    let ipshift: usize = if clevel <= 2 { 3 } else { 4 };
-    let minlen: usize = if clevel <= 2 { 3 } else { 4 };
-
-    let maxout = length + length / 20 + 66;
-    let mut out = Vec::with_capacity(maxout);
-    let op_limit = maxout;
-
-    let ip_bound = length - 1;
-    let ip_limit = if length >= 12 {
-        length - 12
-    } else {
-        return Vec::new();
-    };
-
-    // Start with literal copy
-    let mut copy: usize = 4;
-    out.push((BLOSCLZ_MAX_COPY - 1) as u8);
-    out.push(input[0]);
-    out.push(input[1]);
-    out.push(input[2]);
-    out.push(input[3]);
-    let mut ip: usize = 4;
-
-    while ip < ip_limit {
-        if out.len() + 2 > op_limit {
-            return Vec::new();
-        }
-
+    while ip + 12 < length {
         let anchor = ip;
-        let seq = u32::from_le_bytes([input[ip], input[ip + 1], input[ip + 2], input[ip + 3]]);
-        let hval = blosclz_hash(seq, hashlog) as usize;
-        let r = htab[hval] as usize;
-        let distance = anchor.wrapping_sub(r);
+        let mut len = 3usize;
+        let mut rf: usize;
+        let mut distance: usize;
+        let mut literal = false;
 
-        htab[hval] = anchor as u32;
-
-        if distance == 0 || distance >= BLOSCLZ_MAX_FARDISTANCE {
-            // literal
-            out.push(input[anchor]);
-            ip = anchor + 1;
-            copy += 1;
-            if copy == BLOSCLZ_MAX_COPY {
-                copy = 0;
-                if out.len() + 1 > op_limit {
-                    return Vec::new();
-                }
-                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
-            }
-            continue;
-        }
-
-        // Check first 4 bytes for match
-        if r + 3 < length
-            && input[r] == input[ip]
-            && input[r + 1] == input[ip + 1]
-            && input[r + 2] == input[ip + 2]
-            && input[r + 3] == input[ip + 3]
-        {
-            // match found
+        if input[ip] == input[ip - 1] && input[ip - 1..ip + 1] == input[ip + 1..ip + 3] {
+            // a run
+            distance = 1;
+            rf = anchor + 2;
         } else {
-            // literal
-            out.push(input[anchor]);
+            let hval = blosclz_hash(input, ip, hash_log);
+            rf = htab[hval] as usize;
+            distance = anchor - rf;
+            if distance & accel as usize == 0 {
+                htab[hval] = anchor as u16;
+            }
+            if distance == 0
+                || distance >= BLOSCLZ_MAX_FARDISTANCE
+                || input[rf..rf + 3] != input[ip..ip + 3]
+            {
+                literal = true;
+            } else if opt_level >= 5 && distance >= BLOSCLZ_MAX_DISTANCE {
+                // far, needs at least 5 bytes
+                if input[rf + 3..rf + 5] != input[ip + 3..ip + 5] {
+                    literal = true;
+                } else {
+                    len += 2;
+                }
+            }
+            rf += len;
+        }
+
+        if literal {
+            if op + 2 > op_limit {
+                return 0;
+            }
+            output[op] = input[anchor];
+            op += 1;
             ip = anchor + 1;
             copy += 1;
             if copy == BLOSCLZ_MAX_COPY {
                 copy = 0;
-                if out.len() + 1 > op_limit {
-                    return Vec::new();
-                }
-                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+                output[op] = (BLOSCLZ_MAX_COPY - 1) as u8;
+                op += 1;
             }
             continue;
         }
 
-        // Extend match
-        let mut ref_pos = r + 4;
-        ip = anchor + 4;
-        let dist_biased = distance - 1;
+        // last matched byte
+        ip = anchor + len;
+        distance -= 1;
 
-        if dist_biased == 0 {
-            // RLE run
+        if distance == 0 {
+            // a run: compare against the repeated byte
             let x = input[ip - 1];
-            while ip < ip_bound && ref_pos < length && input[ref_pos] == x {
-                ip += 1;
-                ref_pos += 1;
+            while ip + 8 < length {
+                if input[rf..rf + 8].iter().any(|&b| b != x) {
+                    while ip < ip_bound {
+                        let b = input[rf];
+                        rf += 1;
+                        if b != x {
+                            break;
+                        }
+                        ip += 1;
+                    }
+                    break;
+                }
+                ip += 8;
+                rf += 8;
             }
         } else {
-            while ip < ip_bound && ref_pos < length && input[ref_pos] == input[ip] {
-                ip += 1;
-                ref_pos += 1;
-            }
-        }
-
-        // Bias length
-        if ip > ipshift {
-            ip -= ipshift;
-        } else {
-            ip = anchor + 1;
-            out.push(input[anchor]);
-            copy += 1;
-            if copy == BLOSCLZ_MAX_COPY {
-                copy = 0;
-                if out.len() + 1 > op_limit {
-                    return Vec::new();
+            while ip + 8 < length {
+                if input[rf..rf + 8] != input[ip..ip + 8] {
+                    while ip < ip_bound {
+                        let (a, b) = (input[rf], input[ip]);
+                        rf += 1;
+                        ip += 1;
+                        if a != b {
+                            break;
+                        }
+                    }
+                    break;
                 }
-                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+                ip += 8;
+                rf += 8;
             }
-            continue;
         }
+        ip = ip.min(ip_bound);
 
-        let len = ip - anchor;
-        if len < minlen || (len <= 5 && dist_biased >= BLOSCLZ_MAX_DISTANCE) {
-            ip = anchor + 1;
-            out.push(input[anchor]);
-            copy += 1;
-            if copy == BLOSCLZ_MAX_COPY {
-                copy = 0;
-                if out.len() + 1 > op_limit {
-                    return Vec::new();
-                }
-                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
-            }
-            continue;
-        }
-
-        // Adjust copy count
+        // close the literal run, or take back its unused count byte
         if copy > 0 {
-            let idx = out.len() - copy - 1;
-            out[idx] = (copy - 1) as u8;
+            output[op - copy - 1] = (copy - 1) as u8;
         } else {
-            out.pop();
+            op -= 1;
         }
         copy = 0;
 
-        // Encode match
-        if dist_biased < BLOSCLZ_MAX_DISTANCE {
+        // length is biased, '1' means a match of 3 bytes
+        ip -= 3;
+        let mut len = ip - anchor;
+        if op + len / 255 + 6 > op_limit {
+            return 0;
+        }
+
+        if distance < BLOSCLZ_MAX_DISTANCE {
             if len < 7 {
-                if out.len() + 2 > op_limit {
-                    return Vec::new();
-                }
-                out.push(((len << 5) + (dist_biased >> 8)) as u8);
-                out.push((dist_biased & 255) as u8);
+                output[op] = ((len << 5) + (distance >> 8)) as u8;
+                output[op + 1] = (distance & 255) as u8;
+                op += 2;
             } else {
-                if out.len() + 1 > op_limit {
-                    return Vec::new();
+                output[op] = ((7 << 5) + (distance >> 8)) as u8;
+                op += 1;
+                len -= 7;
+                while len >= 255 {
+                    output[op] = 255;
+                    op += 1;
+                    len -= 255;
                 }
-                out.push(((7 << 5) + (dist_biased >> 8)) as u8);
-                let mut remaining = len - 7;
-                while remaining >= 255 {
-                    if out.len() + 1 > op_limit {
-                        return Vec::new();
-                    }
-                    out.push(255);
-                    remaining -= 255;
-                }
-                if out.len() + 2 > op_limit {
-                    return Vec::new();
-                }
-                out.push(remaining as u8);
-                out.push((dist_biased & 255) as u8);
+                output[op] = len as u8;
+                output[op + 1] = (distance & 255) as u8;
+                op += 2;
             }
         } else {
-            // Far distance
-            let far_dist = dist_biased - BLOSCLZ_MAX_DISTANCE;
+            distance -= BLOSCLZ_MAX_DISTANCE;
             if len < 7 {
-                if out.len() + 4 > op_limit {
-                    return Vec::new();
-                }
-                out.push(((len << 5) + 31) as u8);
-                out.push(255);
-                out.push((far_dist >> 8) as u8);
-                out.push((far_dist & 255) as u8);
+                output[op] = ((len << 5) + 31) as u8;
+                op += 1;
             } else {
-                if out.len() + 1 > op_limit {
-                    return Vec::new();
+                output[op] = (7 << 5) + 31;
+                op += 1;
+                len -= 7;
+                while len >= 255 {
+                    output[op] = 255;
+                    op += 1;
+                    len -= 255;
                 }
-                out.push((7 << 5) + 31);
-                let mut remaining = len - 7;
-                while remaining >= 255 {
-                    if out.len() + 1 > op_limit {
-                        return Vec::new();
-                    }
-                    out.push(255);
-                    remaining -= 255;
-                }
-                if out.len() + 4 > op_limit {
-                    return Vec::new();
-                }
-                out.push(remaining as u8);
-                out.push(255);
-                out.push((far_dist >> 8) as u8);
-                out.push((far_dist & 255) as u8);
+                output[op] = len as u8;
+                op += 1;
             }
+            output[op] = 255;
+            output[op + 1] = (distance >> 8) as u8;
+            output[op + 2] = (distance & 255) as u8;
+            op += 3;
         }
 
-        // Update hash at match boundary
-        if ip + 3 < length {
-            let seq = u32::from_le_bytes([input[ip], input[ip + 1], input[ip + 2], input[ip + 3]]);
-            let hval = blosclz_hash(seq, hashlog) as usize;
-            htab[hval] = ip as u32;
-        }
+        // update the hash at the match boundary
+        htab[blosclz_hash(input, ip, hash_log)] = ip as u16;
         ip += 1;
-        if clevel == 9 && ip + 3 < length {
-            let seq = u32::from_le_bytes([input[ip], input[ip + 1], input[ip + 2], input[ip + 3]]);
-            let hval = blosclz_hash(seq, hashlog) as usize;
-            htab[hval] = ip as u32;
-        }
+        htab[blosclz_hash(input, ip, hash_log)] = ip as u16;
         ip += 1;
 
-        if out.len() + 1 > op_limit {
-            return Vec::new();
-        }
-        out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+        // assuming literal copy
+        output[op] = (BLOSCLZ_MAX_COPY - 1) as u8;
+        op += 1;
     }
 
-    // Left-over as literal copy
-    while ip <= ip_bound {
-        if out.len() + 2 > op_limit {
-            return Vec::new();
+    // left-over as literal copy
+    while ip < length {
+        if op + 2 > op_limit {
+            return 0;
         }
-        out.push(input[ip]);
+        output[op] = input[ip];
+        op += 1;
         ip += 1;
         copy += 1;
         if copy == BLOSCLZ_MAX_COPY {
             copy = 0;
-            if out.len() + 1 > op_limit {
-                return Vec::new();
-            }
-            out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+            output[op] = (BLOSCLZ_MAX_COPY - 1) as u8;
+            op += 1;
         }
     }
-
-    // Finalize
     if copy > 0 {
-        let idx = out.len() - copy - 1;
-        out[idx] = (copy - 1) as u8;
+        output[op - copy - 1] = (copy - 1) as u8;
     } else {
-        out.pop();
+        op -= 1;
     }
 
-    // Set BloscLZ marker (bit 5 of first byte)
-    if !out.is_empty() {
-        out[0] |= 1 << 5;
-    }
-
-    out
+    // marker for blosclz
+    output[0] |= 1 << 5;
+    op
 }
 
+/// `blosclz_decompress(input, length, output, maxout = output.len())`: the
+/// bytes written, or `None` where C returns 0 or would read past `input`.
 #[cfg(feature = "blosc")]
-fn blosclz_decompress(input: &[u8], maxout: usize) -> FormatResult<Vec<u8>> {
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut out = Vec::with_capacity(maxout);
+fn blosclz_decompress(input: &[u8], output: &mut [u8]) -> Option<usize> {
     let mut ip = 0usize;
-    let ip_limit = input.len();
-
-    // First byte: strip BloscLZ marker (bit 5)
-    let mut ctrl = (input[ip] & 31) as u32;
+    let mut op = 0usize;
+    // the first byte is a literal run, its top bits the BloscLZ marker
+    let mut ctrl = (*input.first()? & 31) as usize;
     ip += 1;
-
     loop {
         if ctrl >= 32 {
-            // Match
-            let mut len = ((ctrl >> 5) - 1) as usize;
-            let ofs = ((ctrl & 31) << 8) as usize;
-
-            if len == 6 {
+            let mut len = (ctrl >> 5) - 1;
+            let ofs = (ctrl & 31) << 8;
+            if len == 7 - 1 {
                 loop {
-                    if ip >= ip_limit {
-                        return Err(FormatError::InvalidData("blosclz: truncated".into()));
-                    }
-                    let code = input[ip] as usize;
+                    let code = *input.get(ip)? as usize;
                     ip += 1;
                     len += code;
                     if code != 255 {
@@ -2491,78 +3584,50 @@ fn blosclz_decompress(input: &[u8], maxout: usize) -> FormatResult<Vec<u8>> {
                     }
                 }
             }
-
-            if ip >= ip_limit {
-                return Err(FormatError::InvalidData("blosclz: truncated".into()));
-            }
-            let code = input[ip] as usize;
+            let code = *input.get(ip)? as usize;
             ip += 1;
-            len += 3;
-
-            let mut ref_offset = ofs + code; // distance from current output pos
-
-            // Far distance
-            if code == 255 && ofs == (31 << 8) {
-                if ip + 1 >= ip_limit {
-                    return Err(FormatError::InvalidData("blosclz: truncated far".into()));
-                }
-                let far_ofs = ((input[ip] as usize) << 8) + input[ip + 1] as usize;
+            // distance back to the byte before the match source
+            let mut back = ofs + code;
+            if code == 255 && ofs == 31 << 8 {
+                // match from a 16-bit distance
+                let far = ((*input.get(ip)? as usize) << 8) + *input.get(ip + 1)? as usize;
                 ip += 2;
-                ref_offset = far_ofs + BLOSCLZ_MAX_DISTANCE;
+                back = far + BLOSCLZ_MAX_DISTANCE;
             }
-
-            ref_offset += 1; // distance is biased by 1
-
-            if ref_offset > out.len() {
-                return Err(FormatError::InvalidData(
-                    "blosclz: bad back-reference".into(),
-                ));
+            let len = len + 3;
+            if op + len > output.len() || back + 1 > op {
+                return None;
             }
-            if out.len() + len > maxout {
-                return Err(FormatError::InvalidData("blosclz: output overflow".into()));
-            }
-
-            let ref_start = out.len() - ref_offset;
-            if ref_offset == 1 {
-                // RLE: repeat single byte
-                let b = out[ref_start];
-                out.resize(out.len() + len, b);
+            let from = op - back - 1;
+            let period = back + 1;
+            if period >= len {
+                output.copy_within(from..from + len, op);
             } else {
-                // Copy with possible overlap
-                for i in 0..len {
-                    let b = out[ref_start + i];
-                    out.push(b);
+                // overlapping: the source repeats with `period`; copy whole
+                // repeats of what is already written, doubling each time
+                let mut done = 0;
+                while done < len {
+                    let n = (len - done).min(period + done);
+                    output.copy_within(from..from + n, op + done);
+                    done += n;
                 }
             }
-
-            if ip >= ip_limit {
-                break;
-            }
-            ctrl = input[ip] as u32;
-            ip += 1;
+            op += len;
         } else {
-            // Literal
-            let count = (ctrl + 1) as usize;
-            if out.len() + count > maxout {
-                return Err(FormatError::InvalidData("blosclz: output overflow".into()));
+            let n = ctrl + 1;
+            if op + n > output.len() || ip + n > input.len() {
+                return None;
             }
-            if ip + count > ip_limit {
-                return Err(FormatError::InvalidData(
-                    "blosclz: truncated literal".into(),
-                ));
-            }
-            out.extend_from_slice(&input[ip..ip + count]);
-            ip += count;
-
-            if ip >= ip_limit {
-                break;
-            }
-            ctrl = input[ip] as u32;
-            ip += 1;
+            output[op..op + n].copy_from_slice(&input[ip..ip + n]);
+            op += n;
+            ip += n;
         }
+        if ip >= input.len() {
+            return Some(op);
+        }
+        ctrl = input[ip] as usize;
+        ip += 1;
     }
-
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -2966,34 +4031,23 @@ mod tests {
         }
     }
 
-    /// The returned length is the image the pipeline produced, not what fitted:
-    /// a destination shorter than the image keeps its first bytes and reports
-    /// the whole length, a longer one is written only as far as the image goes.
-    /// Both are what a caller copying out of a materialized image would see.
+    /// The destination is the image: a stored chunk decoding to less than
+    /// it fails as one decoding to more does, filtered or masked off.
     #[cfg(feature = "deflate")]
     #[test]
-    fn reverse_into_reports_the_image_length_not_the_destination() {
+    fn reverse_into_refuses_an_image_of_another_length() {
         let pipeline = FilterPipeline::deflate(6);
         let original: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
         let compressed = apply_filters(&pipeline, &original).unwrap();
-
-        let mut short = vec![0u8; 1000];
-        assert_eq!(
-            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut short).unwrap(),
-            original.len()
-        );
-        assert_eq!(short, original[..1000]);
-
-        // A destination outlasting the image keeps the image; what the slack
-        // past it holds is unspecified (the inflate's last output block can
-        // reach past the byte the stream ends on), which is why a caller that
-        // sees a short image owns the whole destination, not just that tail.
-        let mut long = vec![0xCDu8; original.len() + 4096];
-        assert_eq!(
-            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut long).unwrap(),
-            original.len()
-        );
-        assert_eq!(&long[..original.len()], &original[..]);
+        for (stored, mask) in [(&compressed, 0), (&original, 1)] {
+            for len in [original.len() - 1, original.len() + 1] {
+                let mut out = vec![0u8; len];
+                assert!(
+                    reverse_filters_masked_into(&pipeline, stored, mask, &mut out).is_err(),
+                    "mask {mask}, {len} bytes"
+                );
+            }
+        }
     }
 
     /// A stream that is malformed past the destination still fails: the
@@ -3263,7 +4317,7 @@ mod tests {
         let data = vec![0u8; 1024];
         let compressed = lzf_compress(&data);
         assert!(compressed.len() < data.len());
-        let decompressed = lzf_decompress(&compressed, data.len()).unwrap();
+        let decompressed = lzf_decompress(&compressed, data.len(), usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -3273,16 +4327,19 @@ mod tests {
     /// decodes, as h5py's filter does.
     #[test]
     fn lzf_declared_size_is_a_hint_not_a_reservation() {
-        assert_eq!(lzf_decompress(&[], usize::MAX).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            lzf_decompress(&[], usize::MAX, usize::MAX).unwrap(),
+            Vec::<u8>::new()
+        );
         // One literal byte under a declaration of 2^60 bytes.
-        let out = lzf_decompress(&[0x00, 0x41], 1 << 60).unwrap();
+        let out = lzf_decompress(&[0x00, 0x41], 1 << 60, usize::MAX).unwrap();
         assert_eq!(out, b"A");
         assert!(out.capacity() <= 88 * 2);
 
         let data = vec![7u8; 4096];
         let compressed = lzf_compress(&data);
-        assert_eq!(lzf_decompress(&compressed, 16).unwrap(), data);
-        assert_eq!(lzf_decompress(&compressed, 0).unwrap(), data);
+        assert_eq!(lzf_decompress(&compressed, 16, usize::MAX).unwrap(), data);
+        assert_eq!(lzf_decompress(&compressed, 0, usize::MAX).unwrap(), data);
     }
 
     #[test]
@@ -3293,7 +4350,7 @@ mod tests {
         let decompressed = if compressed == data {
             data.clone() // returned unchanged
         } else {
-            lzf_decompress(&compressed, data.len()).unwrap()
+            lzf_decompress(&compressed, data.len(), usize::MAX).unwrap()
         };
         assert_eq!(decompressed, data);
     }
@@ -3471,7 +4528,7 @@ mod tests {
                 got, expected,
                 "shuffle mismatch in case {i} (es={elem_size}, block={block})"
             );
-            let back = bitshuffle_decompress(&got, elem_size, block, 0).unwrap();
+            let back = bitshuffle_decompress(&got, elem_size, block, 0, usize::MAX).unwrap();
             assert_eq!(back, input, "roundtrip mismatch in case {i}");
         }
     }
@@ -3566,8 +4623,14 @@ mod tests {
             ),
         ];
         for (i, &(elem_size, block, input, filter_bytes)) in cases.iter().enumerate() {
-            let back =
-                bitshuffle_decompress(filter_bytes, elem_size, block, BSHUF_COMPRESS_LZ4).unwrap();
+            let back = bitshuffle_decompress(
+                filter_bytes,
+                elem_size,
+                block,
+                BSHUF_COMPRESS_LZ4,
+                usize::MAX,
+            )
+            .unwrap();
             assert_eq!(back, input, "canonical BSLZ4 decode mismatch in case {i}");
         }
     }
@@ -3591,7 +4654,9 @@ mod tests {
                 .collect();
             let comp =
                 bitshuffle_compress(&data, elem_size, block, BSHUF_COMPRESS_LZ4, &filter).unwrap();
-            let back = bitshuffle_decompress(&comp, elem_size, block, BSHUF_COMPRESS_LZ4).unwrap();
+            let back =
+                bitshuffle_decompress(&comp, elem_size, block, BSHUF_COMPRESS_LZ4, usize::MAX)
+                    .unwrap();
             assert_eq!(
                 back, data,
                 "lz4 framing roundtrip failed for es={elem_size} block={block} n={n_elems}"
@@ -4019,9 +5084,14 @@ mod tests {
     #[test]
     fn blosclz_pure_roundtrip() {
         let data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
-        let compressed = blosclz_compress(&data, 5);
-        assert!(!compressed.is_empty());
-        let decompressed = blosclz_decompress(&compressed, data.len()).unwrap();
+        let mut compressed = vec![0u8; data.len()];
+        let n = blosclz_compress(5, &data, &mut compressed, 1, &mut Vec::new());
+        assert!(n > 0);
+        let mut decompressed = vec![0u8; data.len()];
+        assert_eq!(
+            blosclz_decompress(&compressed[..n], &mut decompressed),
+            Some(data.len())
+        );
         assert_eq!(decompressed, data);
     }
 
@@ -4030,10 +5100,14 @@ mod tests {
     #[test]
     fn blosclz_repeated_data() {
         let data = vec![42u8; 8192];
-        let compressed = blosclz_compress(&data, 5);
-        assert!(!compressed.is_empty());
-        assert!(compressed.len() < data.len());
-        let decompressed = blosclz_decompress(&compressed, data.len()).unwrap();
+        let mut compressed = vec![0u8; data.len()];
+        let n = blosclz_compress(5, &data, &mut compressed, 1, &mut Vec::new());
+        assert!(n > 0 && n < data.len());
+        let mut decompressed = vec![0u8; data.len()];
+        assert_eq!(
+            blosclz_decompress(&compressed[..n], &mut decompressed),
+            Some(data.len())
+        );
         assert_eq!(decompressed, data);
     }
 
@@ -4046,7 +5120,8 @@ mod tests {
             0x23, 0x42, 0x42, 0x42, 0x42, 0xe0, 0xff, 0xf2, 0x03, 0x01, 0x42, 0x42,
         ];
         let expected = vec![0x42u8; 512];
-        let decompressed = blosclz_decompress(compressed, 512).unwrap();
+        let mut decompressed = vec![0u8; 512];
+        assert_eq!(blosclz_decompress(compressed, &mut decompressed), Some(512));
         assert_eq!(decompressed, expected);
     }
 
@@ -4059,7 +5134,11 @@ mod tests {
             0x0d, 0x0e, 0x0f, 0xe0, 0xff, 0xff, 0xff, 0xe8, 0x0f, 0x01, 0x0e, 0x0f,
         ];
         let expected: Vec<u8> = (0..1024).map(|i| (i % 16) as u8).collect();
-        let decompressed = blosclz_decompress(compressed, 1024).unwrap();
+        let mut decompressed = vec![0u8; 1024];
+        assert_eq!(
+            blosclz_decompress(compressed, &mut decompressed),
+            Some(1024)
+        );
         assert_eq!(decompressed, expected);
     }
 
@@ -4071,7 +5150,11 @@ mod tests {
             0x23, 0x00, 0x01, 0x02, 0x03, 0xe0, 0xff, 0xff, 0xff, 0xf4, 0x03, 0x01, 0x02, 0x03,
         ];
         let expected: Vec<u8> = (0..1024).map(|i| (i % 4) as u8).collect();
-        let decompressed = blosclz_decompress(compressed, 1024).unwrap();
+        let mut decompressed = vec![0u8; 1024];
+        assert_eq!(
+            blosclz_decompress(compressed, &mut decompressed),
+            Some(1024)
+        );
         assert_eq!(decompressed, expected);
     }
 
@@ -4093,8 +5176,280 @@ mod tests {
         for (i, v) in expected[1536..2048].iter_mut().enumerate() {
             *v = ((1536 + i) % 4) as u8;
         }
-        let decompressed = blosclz_decompress(compressed, 2048).unwrap();
+        let mut decompressed = vec![0u8; 2048];
+        assert_eq!(
+            blosclz_decompress(compressed, &mut decompressed),
+            Some(2048)
+        );
         assert_eq!(decompressed, expected);
+    }
+
+    // --- c-blosc 1.12.0 frames (tests/fixtures/gen_blosc.py) ---
+
+    /// `make_input` of gen_blosc.py: kind 0 smooth, 1 random, 2 smooth with
+    /// a random tail.
+    #[cfg(feature = "blosc")]
+    fn blosc_fixture_input(kind: u8, nbytes: usize, typesize: usize) -> Vec<u8> {
+        let mut x = 0x9E37_79B9 ^ nbytes as u32 ^ ((typesize as u32) << 20) ^ ((kind as u32) << 28);
+        let mut step = || {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            x >> 16
+        };
+        let mut out = vec![0u8; nbytes];
+        if kind == 1 {
+            out.iter_mut().for_each(|b| *b = step() as u8);
+            return out;
+        }
+        let w = typesize.min(8);
+        let n = nbytes / w;
+        for i in 0..n {
+            let v = ((i / 7) % 50) as u64 * 3 + u64::from((step() & 1023) == 0);
+            out[i * w..(i + 1) * w].copy_from_slice(&v.to_le_bytes()[..w]);
+        }
+        out[n * w..].fill(0xA5);
+        if kind == 2 {
+            out[nbytes - 1500..]
+                .iter_mut()
+                .for_each(|b| *b = step() as u8);
+        }
+        out
+    }
+
+    /// The records of a gen_blosc.py container: (cd_values, kind, nbytes,
+    /// frame).
+    #[cfg(feature = "blosc")]
+    fn blosc_fixture_records(blob: &[u8]) -> Vec<(Vec<u32>, u8, usize, &[u8])> {
+        assert_eq!(&blob[..8], b"BLOSCFX1");
+        let mut pos = 8;
+        let mut records = Vec::new();
+        while pos < blob.len() {
+            let h = &blob[pos..pos + 16];
+            let u16_at = |at: usize| u16::from_le_bytes([h[at], h[at + 1]]) as u32;
+            let u32_at = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
+            let (compcode, shuffle, typesize, clevel, kind) =
+                (h[0] as u32, h[1] as u32, u16_at(2), h[4] as u32, h[5]);
+            let (nbytes, len) = (u32_at(8), u32_at(12) as usize);
+            let cd = vec![2, 2, typesize, nbytes, clevel, shuffle, compcode];
+            records.push((cd, kind, nbytes as usize, &blob[pos + 16..pos + 16 + len]));
+            pos += 16 + len;
+        }
+        records
+    }
+
+    /// Every c-blosc frame decodes, whole and into a short window; BloscLZ
+    /// frames, and every MEMCPYED frame, are what this crate writes too.
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosc_frames_from_c_blosc_1_12() {
+        let blob = include_bytes!("../../../tests/fixtures/blosc_c1120.bin");
+        let mut decoded = [0usize; 6];
+        for (cd, kind, nbytes, frame) in blosc_fixture_records(blob) {
+            let compcode = cd[6];
+            if blosc_compformat(compcode).is_err() {
+                continue; // a sub-codec feature is off
+            }
+            let ctx = format!("cd {cd:?} kind {kind}");
+            let input = blosc_fixture_input(kind, nbytes, cd[2] as usize);
+            let pipeline = FilterPipeline {
+                filters: vec![Filter {
+                    id: FILTER_BLOSC,
+                    flags: 0,
+                    cd_values: cd.clone(),
+                }],
+            };
+            assert_eq!(reverse_filters(&pipeline, frame).unwrap(), input, "{ctx}");
+            let mut out = vec![0u8; nbytes];
+            let n = reverse_filters_masked_into(&pipeline, frame, 0, &mut out).unwrap();
+            assert_eq!((n, &out), (nbytes, &input), "{ctx} into");
+            let mut short = vec![0u8; nbytes / 3];
+            assert!(
+                reverse_filters_masked_into(&pipeline, frame, 0, &mut short).is_err(),
+                "{ctx} short"
+            );
+            // Only the frame's last stream is past its end.
+            assert!(
+                reverse_filters(&pipeline, &frame[..frame.len() - 1]).is_err(),
+                "{ctx}"
+            );
+
+            let ours = apply_filters(&pipeline, &input).unwrap();
+            if compcode == BLOSC_BLOSCLZ || frame[2] & BLOSC_MEMCPYED != 0 {
+                assert_eq!(ours, frame, "{ctx} encode");
+            }
+            for f in [frame, &ours[..]] {
+                assert!(
+                    matches!(blosc_frame(f, &cd), Ok(BloscStored::Frame(_))),
+                    "{ctx} read as 0.7.8's"
+                );
+            }
+            assert_eq!(
+                reverse_filters(&pipeline, &ours).unwrap(),
+                input,
+                "{ctx} ours"
+            );
+            decoded[compcode as usize] += 1;
+        }
+        // blosclz, lz4 and lz4hc, snappy; zlib and zstd with their features
+        assert_eq!(decoded[..4], [49, 37, 37, 37]);
+        #[cfg(feature = "deflate")]
+        assert_eq!(decoded[4], 37);
+        #[cfg(feature = "zstd")]
+        assert_eq!(decoded[5], 37);
+    }
+
+    /// The pool's waves write the frame the serial loop writes: from
+    /// compressible blocks; from blocks stored raw until the room left is
+    /// short of a worst case and the serial loop fits the compressible last
+    /// one; and from input that ends up MEMCPYED.
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosc_pooled_waves_write_the_serial_frame() {
+        let nbytes = 1_050_000;
+        let mut x = 1u32;
+        let random: Vec<u8> = (0..nbytes)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (x >> 16) as u8
+            })
+            .collect();
+        // 32 or 16 whole blocks of noise, the leftover block zeros.
+        let mut tail = random.clone();
+        tail[nbytes - nbytes % (32 * 1024)..].fill(0);
+        let smooth = blosc_fixture_input(0, nbytes, 4);
+        let codes = [
+            BLOSC_BLOSCLZ,
+            BLOSC_LZ4,
+            BLOSC_LZ4HC,
+            BLOSC_SNAPPY,
+            BLOSC_ZLIB,
+            BLOSC_ZSTD,
+        ];
+        for compcode in codes {
+            if blosc_compformat(compcode).is_err() {
+                continue;
+            }
+            for (name, input) in [("smooth", &smooth), ("tail", &tail), ("random", &random)] {
+                let filter = Filter {
+                    id: FILTER_BLOSC,
+                    flags: 0,
+                    cd_values: vec![2, 2, 4, nbytes as u32, 5, 1, compcode],
+                };
+                let ours = blosc_compress(input, &filter).unwrap();
+                let blocksize = u32::from_le_bytes(ours[8..12].try_into().unwrap()) as usize;
+                let frame = BloscFrame::new(ours[2] & !BLOSC_MEMCPYED, 4, nbytes, blocksize);
+                let mut serial = vec![0u8; nbytes + BLOSC_MAX_OVERHEAD];
+                let start = BLOSC_MAX_OVERHEAD + 4 * frame.nblocks;
+                let p = BloscParams::new(frame, 5, compcode);
+                let n = blosc_compress_serial(&p, input, &mut serial, 0, start).unwrap();
+                let ctx = format!("compcode {compcode} {name}");
+                if n == 0 {
+                    assert!(ours[2] & BLOSC_MEMCPYED != 0, "{ctx}");
+                } else {
+                    assert_eq!(ours.len(), n, "{ctx}");
+                    assert!(ours[16..] == serial[16..n], "{ctx}");
+                }
+                // Snappy expands noise: its tail frame overflows too.
+                let memcpyed = name == "random" || name == "tail" && compcode == BLOSC_SNAPPY;
+                assert_eq!(n == 0, memcpyed, "{ctx}");
+            }
+        }
+    }
+
+    /// `apply_filters_into` writes what `apply_filters` returns and refuses a
+    /// destination one byte short of it, blosc last or not.
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn apply_filters_into_matches_apply_filters() {
+        let blob = include_bytes!("../../../tests/fixtures/blosc_c1120.bin");
+        let shuffle = Filter {
+            id: FILTER_SHUFFLE,
+            flags: 0,
+            cd_values: vec![4],
+        };
+        for (cd, kind, nbytes, _) in blosc_fixture_records(blob) {
+            if blosc_compformat(cd[6]).is_err() {
+                continue;
+            }
+            let input = blosc_fixture_input(kind, nbytes, cd[2] as usize);
+            let blosc = Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: cd.clone(),
+            };
+            for filters in [vec![blosc.clone()], vec![shuffle.clone(), blosc.clone()]] {
+                let pipeline = FilterPipeline { filters };
+                let want = apply_filters(&pipeline, &input).unwrap();
+                let mut out = vec![0u8; nbytes + 16];
+                let n = apply_filters_into(&pipeline, &input, &mut out).unwrap();
+                assert_eq!(&out[..n], &want[..], "cd {cd:?}");
+                let mut short = vec![0u8; want.len() - 1];
+                assert!(
+                    matches!(
+                        apply_filters_into(&pipeline, &input, &mut short),
+                        Err(FormatError::BufferTooShort { .. })
+                    ),
+                    "cd {cd:?}"
+                );
+            }
+        }
+        // Not even the header fits.
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 4, 0, 5, 1, BLOSC_BLOSCLZ],
+            }],
+        };
+        assert!(apply_filters_into(&pipeline, &[], &mut [0u8; 15]).is_err());
+        assert_eq!(
+            apply_filters_into(&pipeline, &[], &mut [0u8; 16]).unwrap(),
+            16
+        );
+
+        // A last stage without its own encoder-into is copied in whole.
+        let pipeline = FilterPipeline {
+            filters: vec![shuffle],
+        };
+        let data = golden_f32_data();
+        let mut out = vec![0u8; data.len()];
+        let n = apply_filters_into(&pipeline, &data, &mut out).unwrap();
+        assert_eq!(out[..n], apply_filters(&pipeline, &data).unwrap()[..]);
+        assert!(apply_filters_into(&pipeline, &data, &mut out[1..]).is_err());
+        let empty = FilterPipeline { filters: vec![] };
+        assert_eq!(
+            apply_filters_into(&empty, &data, &mut out).unwrap(),
+            data.len()
+        );
+        assert_eq!(out, data);
+    }
+
+    /// Corrupt frames fail without a panic.
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosc_corrupt_frames_fail() {
+        let blob = include_bytes!("../../../tests/fixtures/blosc_c1120.bin");
+        for (cd, _, nbytes, frame) in blosc_fixture_records(blob) {
+            if blosc_compformat(cd[6]).is_err() {
+                continue;
+            }
+            let mut out = vec![0u8; nbytes];
+            for cut in [0, 15, 16, 17, frame.len() / 2] {
+                let cut = cut.min(frame.len() - 1);
+                assert!(
+                    blosc_decompress_into(&frame[..cut], &cd, &mut out).is_err(),
+                    "cut {cut}"
+                );
+            }
+            if nbytes > 100_000 {
+                continue; // the flips below are slow on the 1 MB frames
+            }
+            let mut bad = frame.to_vec();
+            for at in 16..bad.len().min(16 + 4 * 8 + 32) {
+                bad[at] ^= 0x5A;
+                let _ = blosc_decompress_into(&bad, &cd, &mut out);
+                bad[at] ^= 0x5A;
+            }
+        }
     }
 
     // --- Shuffle + BZIP2 combined golden test ---

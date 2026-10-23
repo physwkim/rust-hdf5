@@ -13966,7 +13966,7 @@ impl Hdf5Writer {
                 }
             }
         };
-        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
+        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask, chunk_bytes)
     }
 
     /// Read one stored chunk block and undo its filters.
@@ -13975,19 +13975,30 @@ impl Hdf5Writer {
     /// a chunk written by a direct chunk write with a skipped filter is
     /// reversed correctly. `Ok(None)` means the chunk has no block yet — the
     /// single place that judgement is made, shared by every chunk index.
+    /// `image_bytes`, the chunk's shape, is what the filters must decode to.
     fn read_chunk_block(
         &self,
         pipeline: Option<&FilterPipeline>,
         addr: u64,
         nbytes: u64,
         mask: u32,
+        image_bytes: u64,
     ) -> IoResult<Option<Vec<u8>>> {
         if addr == UNDEF_ADDR || nbytes == 0 {
             return Ok(None);
         }
         let raw = self.handle.read_at(addr, nbytes as usize)?;
         match pipeline {
-            Some(pl) => Ok(Some(filter::reverse_filters_masked(pl, &raw, mask)?)),
+            Some(pl) => {
+                let image = usize::try_from(image_bytes).map_err(|_| {
+                    crate::format::FormatError::InvalidData(
+                        "chunk image size is not addressable".into(),
+                    )
+                })?;
+                let mut out = vec![0u8; image];
+                filter::reverse_filters_masked_into(pl, &raw, mask, &mut out)?;
+                Ok(Some(out))
+            }
             None => Ok(Some(raw)),
         }
     }
@@ -14033,7 +14044,7 @@ impl Hdf5Writer {
                     }
                 };
                 drop(m);
-                self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
+                self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask, geo.chunk_bytes())
             }
             ChunkIndexKind::BtreeV2 => {
                 let ds = self.ds(ds_index);
@@ -14054,9 +14065,13 @@ impl Hdf5Writer {
                 };
                 drop(m);
                 match found {
-                    Some((addr, nbytes, mask)) => {
-                        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
-                    }
+                    Some((addr, nbytes, mask)) => self.read_chunk_block(
+                        pipeline.as_ref(),
+                        addr,
+                        nbytes,
+                        mask,
+                        geo.chunk_bytes(),
+                    ),
                     None => Ok(None),
                 }
             }
@@ -14066,7 +14081,7 @@ impl Hdf5Writer {
             // create wrote there.
             ChunkIndexKind::Implicit => {
                 let (grid, offset) = self.implicit_chunk_slot(ds_index, &geo, chunk_coords)?;
-                self.read_chunk_block(None, grid + offset, geo.chunk_bytes(), 0)
+                self.read_chunk_block(None, grid + offset, geo.chunk_bytes(), 0, geo.chunk_bytes())
             }
             // A single-chunk dataset's one chunk is never written until its
             // first write (unless the dataset was early-allocated and
@@ -14086,7 +14101,7 @@ impl Hdf5Writer {
                     (sc.data_addr, geo.chunk_bytes(), 0)
                 };
                 drop(m);
-                self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
+                self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask, geo.chunk_bytes())
             }
             ChunkIndexKind::BtreeV1 => {
                 let ds = self.ds(ds_index);
@@ -14100,9 +14115,13 @@ impl Hdf5Writer {
                     .map(|r| (r.address, r.nbytes as u64, r.filter_mask));
                 drop(m);
                 match found {
-                    Some((addr, nbytes, mask)) => {
-                        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
-                    }
+                    Some((addr, nbytes, mask)) => self.read_chunk_block(
+                        pipeline.as_ref(),
+                        addr,
+                        nbytes,
+                        mask,
+                        geo.chunk_bytes(),
+                    ),
                     None => Ok(None),
                 }
             }
@@ -16228,6 +16247,7 @@ impl Hdf5Writer {
                                     e.addr,
                                     e.nbytes,
                                     e.filter_mask,
+                                    chunk_bytes,
                                 )? {
                                     dead_refs.extend_from_slice(&bytes);
                                 }
@@ -16246,9 +16266,13 @@ impl Hdf5Writer {
                         let a = c.ea_iblk.elements[elem];
                         if a != UNDEF_ADDR {
                             if collect_refs {
-                                if let Some(bytes) =
-                                    self.read_chunk_block(pipeline.as_ref(), a, chunk_bytes, 0)?
-                                {
+                                if let Some(bytes) = self.read_chunk_block(
+                                    pipeline.as_ref(),
+                                    a,
+                                    chunk_bytes,
+                                    0,
+                                    chunk_bytes,
+                                )? {
                                     dead_refs.extend_from_slice(&bytes);
                                 }
                             }
@@ -16348,6 +16372,7 @@ impl Hdf5Writer {
                                         e.addr,
                                         e.nbytes,
                                         e.filter_mask,
+                                        chunk_bytes,
                                     )? {
                                         dead_refs.extend_from_slice(&bytes);
                                     }
@@ -16368,9 +16393,13 @@ impl Hdf5Writer {
                             let a = d.elements[l.offset_in_dblk as usize];
                             if a != UNDEF_ADDR {
                                 if collect_refs {
-                                    if let Some(bytes) =
-                                        self.read_chunk_block(pipeline.as_ref(), a, chunk_bytes, 0)?
-                                    {
+                                    if let Some(bytes) = self.read_chunk_block(
+                                        pipeline.as_ref(),
+                                        a,
+                                        chunk_bytes,
+                                        0,
+                                        chunk_bytes,
+                                    )? {
                                         dead_refs.extend_from_slice(&bytes);
                                     }
                                 }
@@ -16432,7 +16461,7 @@ impl Hdf5Writer {
             if chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
                 if collect_refs {
                     if let Some(bytes) =
-                        self.read_chunk_block(pipeline.as_ref(), addr, stored, mask)?
+                        self.read_chunk_block(pipeline.as_ref(), addr, stored, mask, chunk_bytes)?
                     {
                         dead_refs.extend_from_slice(&bytes);
                     }
@@ -16521,6 +16550,7 @@ impl Hdf5Writer {
                             r.chunk_address,
                             r.chunk_size,
                             r.filter_mask,
+                            chunk_bytes,
                         )? {
                             dead_refs.extend_from_slice(&bytes);
                         }
@@ -16548,6 +16578,7 @@ impl Hdf5Writer {
                             r.chunk_address,
                             chunk_bytes,
                             0,
+                            chunk_bytes,
                         )? {
                             dead_refs.extend_from_slice(&bytes);
                         }
@@ -16596,6 +16627,7 @@ impl Hdf5Writer {
                         r.address,
                         r.nbytes as u64,
                         r.filter_mask,
+                        geo.chunk_bytes(),
                     )? {
                         dead_refs.extend_from_slice(&bytes);
                     }

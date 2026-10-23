@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.7.9
+
+### Added
+
+- `apply_filters_into` runs a filter pipeline straight into the caller's
+  buffer and returns the length written; output that does not fit is
+  `FormatError::BufferTooShort`, and a blosc frame always fits the
+  input's length plus 16 bytes.
+- `reverse_filters_masked_bounded` is `reverse_filters_masked` for an
+  image of at most a given length: every stage decodes under the bound
+  that length sets for it, and a stream decoding past its bound fails
+  before more than about the bound is allocated.
+
+### Changed
+
+- The blosc filter writes and reads c-blosc 1.x frames, laid out as
+  blosc.c 1.12.0 lays them, so c-blosc reads what this crate writes and
+  this crate reads c-blosc's; BloscLZ frames are byte-identical to C's,
+  a frame is decoded with the codec its header names, and the default
+  codec is BloscLZ, as in `blosc_filter.c`, where 0.7.8's was LZ4. 0.7.8
+  wrote one codec stream after the header with no bstarts table, which
+  c-blosc cannot read, and decoded a compressed c-blosc frame as such a
+  stream. Chunks 0.7.8 wrote are still read, with the codec their
+  `cd_values[6]` names; a BloscLZ input under 16 bytes, which 0.7.8
+  stored as a header with no payload, is refused. A frame valid in both
+  layouts, which only a one-block c-blosc frame whose stream does not
+  follow its bstarts entry can be and no encoder writes, is read as
+  0.7.8's.
+- A stored chunk whose filters decode to more or fewer bytes than its
+  image is refused by every read and by the read-back of a partial write
+  or a shrink. `reverse_filters_masked_into` returns `Err` for such a
+  chunk where its 0.7.8 contract returned the length decoded, past
+  `out.len()` with the surplus discarded or short of it with the tail
+  unspecified; its `Ok` is now always `out.len()`, and with every filter
+  masked off the stored bytes must be the image's length. libhdf5
+  instead drops a long chunk's surplus and keeps what a short one
+  decoded; 0.7.8 read a short chunk as the fill value, or as what it
+  decoded where a read took only part of it.
+
 ## 0.7.8
 
 ### Added
