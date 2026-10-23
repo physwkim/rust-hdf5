@@ -7,11 +7,13 @@
 //! The pool runs one worker, so every block lands on a thread a warm-up
 //! frame already served. rayon allocates a block of its injector queue once
 //! every 63 jobs a thread outside the pool hands it, so of two measured
-//! calls the one with fewer allocations is the check.
+//! calls the one with fewer allocations is the check. The tests share the
+//! counter and the pool, so they run one at a time.
 #![cfg(feature = "blosc")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use rust_hdf5::format::messages::filter::{
     apply_filters_into, reverse_filters_masked_into, Filter, FilterPipeline, FILTER_BLOSC,
@@ -45,6 +47,15 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// This test's hold on the counter, with the pool of one worker.
+fn serial() -> MutexGuard<'static, ()> {
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RUST_HDF5_IO_THREADS", "1");
+    serial
+}
+
 /// `f`'s result and the allocations every thread made during it.
 fn allocs<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = ALLOCS.load(Ordering::Relaxed);
@@ -67,7 +78,7 @@ fn image(nbytes: usize) -> Vec<u8> {
 
 #[test]
 fn a_second_same_size_frame_allocates_nothing() {
-    std::env::set_var("RUST_HDF5_IO_THREADS", "1");
+    let _serial = serial();
     // (compressor code, name, allocations its crate makes per stream)
     let mut codecs = vec![
         (0, "blosclz", 0),
@@ -123,4 +134,37 @@ fn a_second_same_size_frame_allocates_nothing() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A zstd stream that ends part-way fails its frame and leaves the
+/// thread's decoder inside a zstd frame; the next frame still decodes.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_zstd_frame_decodes_after_one_cut_short() {
+    let _serial = serial();
+    let nbytes = 16 * 1024;
+    let data = image(nbytes);
+    let p = FilterPipeline {
+        filters: vec![Filter {
+            id: FILTER_BLOSC,
+            flags: 0,
+            cd_values: vec![2, 2, 2, nbytes as u32, 5, 0, 5],
+        }],
+    };
+    let mut out = vec![0u8; nbytes + 16];
+    let n = apply_filters_into(&p, &data, &mut out).unwrap();
+    let frame = &out[..n];
+    // One block: its stream follows its bstarts entry and length.
+    let csize = u32::from_le_bytes(frame[20..24].try_into().unwrap()) as usize;
+    assert_eq!(frame.len(), 24 + csize);
+    let mut cut = frame[..24 + csize / 2].to_vec();
+    cut[12..16].copy_from_slice(&(24 + csize as u32 / 2).to_le_bytes());
+    cut[20..24].copy_from_slice(&(csize as u32 / 2).to_le_bytes());
+    let mut back = vec![0u8; nbytes];
+    assert!(reverse_filters_masked_into(&p, &cut, 0, &mut back).is_err());
+    assert_eq!(
+        reverse_filters_masked_into(&p, frame, 0, &mut back).unwrap(),
+        nbytes
+    );
+    assert!(back == data);
 }
