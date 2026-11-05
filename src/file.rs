@@ -659,6 +659,14 @@ impl H5File {
         }
     }
 
+    /// Open a file-level (root group) attribute by name (read mode), the
+    /// counterpart of [`H5Dataset::attr`](crate::H5Dataset::attr): the
+    /// handle reads a numeric, array or string value through
+    /// [`H5Attribute`](crate::attribute::H5Attribute).
+    pub fn attr(&self, name: &str) -> Result<crate::attribute::H5Attribute> {
+        self.root_group().attr(name)
+    }
+
     /// Read a file-level string attribute.
     pub fn attr_string(&self, name: &str) -> Result<String> {
         let mut inner = borrow_inner_mut(&self.inner);

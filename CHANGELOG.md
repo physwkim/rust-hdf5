@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.10
+
+### Added
+
+- `H5Group::attr` and `H5File::attr` open an attribute as an
+  `H5Attribute`, as `H5Dataset::attr` does, so a numeric or array
+  attribute on a group or on the file reads back through `read_numeric`
+  and `read_numeric_as` instead of only as a string (#28).
+
 ## 0.7.9
 
 ### Added

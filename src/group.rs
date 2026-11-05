@@ -1162,17 +1162,48 @@ impl H5Group {
         }
     }
 
+    /// This group's attribute `name` as the reader holds it: the root
+    /// group's from the file-level list, any other group's from its own
+    /// header.
+    fn attr_message(
+        &self,
+        reader: &mut crate::io::reader::Hdf5Reader,
+        name: &str,
+    ) -> Result<AttributeMessage> {
+        Ok(if self.name == "/" {
+            reader.root_attr(name)
+        } else {
+            reader.group_attr(self.name.trim_start_matches('/'), name)
+        }?
+        .clone())
+    }
+
+    /// Open one of this group's attributes by name (read mode), the
+    /// counterpart of [`H5Dataset::attr`](crate::H5Dataset::attr): the
+    /// handle reads a numeric, array or string value through
+    /// [`H5Attribute`](crate::attribute::H5Attribute).
+    pub fn attr(&self, name: &str) -> Result<crate::attribute::H5Attribute> {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => {
+                let attr = self.attr_message(reader, name)?;
+                Ok(crate::attribute::H5Attribute::new_reader(
+                    clone_inner(&self.file_inner),
+                    attr,
+                ))
+            }
+            _ => Err(Hdf5Error::InvalidState(
+                "attr is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Read one of this group's attributes as a string (read mode).
     pub fn attr_string(&self, name: &str) -> Result<String> {
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
             H5FileInner::Reader(reader) => {
-                let attr = if self.name == "/" {
-                    reader.root_attr(name)
-                } else {
-                    reader.group_attr(self.name.trim_start_matches('/'), name)
-                }?
-                .clone();
+                let attr = self.attr_message(reader, name)?;
                 Ok(reader.attr_string_value(&attr)?)
             }
             _ => Err(Hdf5Error::InvalidState(
