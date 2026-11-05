@@ -6969,6 +6969,75 @@ mod tests {
     }
 
     #[test]
+    fn group_and_file_attr_read_numeric_roundtrip() {
+        // Issue #28: a u32 attribute written on a group or on the file
+        // reads back through `attr(name)` as the dataset one does, not
+        // only as a string.
+        let path = temp_path("group_file_attr_numeric");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.set_attr_numeric("version", &3u32).unwrap();
+            file.set_attr_array_numeric("shape", &[640u32, 480])
+                .unwrap();
+            let grp = file.create_group("lamino_pal").unwrap();
+            grp.set_attr_numeric("binning", &2u32).unwrap();
+            grp.set_attr_numeric("frames_per_angle", &5u32).unwrap();
+            grp.set_attr_array_numeric("roi", &[1.5f64, -2.0]).unwrap();
+            grp.set_attr_string("NX_class", "NXentry").unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            assert_eq!(
+                file.attr("version").unwrap().read_numeric::<u32>().unwrap(),
+                3
+            );
+            assert_eq!(
+                file.attr("shape")
+                    .unwrap()
+                    .read_numeric_as::<u32>()
+                    .unwrap(),
+                vec![640, 480]
+            );
+            let root = file.root_group();
+            assert_eq!(
+                root.attr("version").unwrap().read_numeric::<u32>().unwrap(),
+                3
+            );
+            let grp = root.group("lamino_pal").unwrap();
+            assert_eq!(
+                grp.attr("binning").unwrap().read_numeric::<u32>().unwrap(),
+                2
+            );
+            assert_eq!(
+                grp.attr("frames_per_angle")
+                    .unwrap()
+                    .read_numeric::<u32>()
+                    .unwrap(),
+                5
+            );
+            assert_eq!(
+                grp.attr("roi").unwrap().read_numeric_as::<f64>().unwrap(),
+                vec![1.5, -2.0]
+            );
+            assert_eq!(
+                grp.attr("NX_class").unwrap().read_string().unwrap(),
+                "NXentry"
+            );
+            assert!(grp.attr("binning").unwrap().read_numeric::<i32>().is_err());
+            assert!(grp.attr("missing").is_err());
+        }
+        {
+            let file = H5File::create(&path).unwrap();
+            let grp = file.create_group("g").unwrap();
+            grp.set_attr_numeric("n", &1u32).unwrap();
+            assert!(grp.attr("n").is_err());
+            assert!(file.attr("n").is_err());
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn ea_super_block_roundtrip() {
         // 2000 chunks span several extensible-array super blocks. Before
         // super-block support the writer errored at chunk index 228.
