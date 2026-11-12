@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.11
+
+### Added
+
+- `SwmrFileReader::read_chunk_raw` returns one chunk's stored bytes and
+  filter mask, or `None` when the writer has not put a chunk there as of
+  the last `refresh`, so a live reader can poll for the next frame without
+  reading an error as "not yet".
+- `SwmrFileReader::metadata_read_attempts` and
+  `set_metadata_read_attempts`: a SWMR reader reads a metadata image again
+  while its checksum fails, as `H5Pset_metadata_read_attempts` does,
+  defaulting to libhdf5's 100 for SWMR. The sleep between attempts doubles
+  from 1 ns as in libhdf5 but stops at about 1 ms, so 100 failed attempts
+  take about 84 ms.
+
+### Changed
+
+- Every chunk read, decoded or raw, finds its chunk by a point lookup that
+  reads only the index blocks on the way to it, where 0.7.10 decoded the
+  whole chunk index on a dataset's first read after an open or a refresh.
+  A SWMR reader's refresh and read of the newest of 30,000 frames takes
+  16 µs, 616 µs at 0.7.10. Fixed-array and extensible-array blocks stay
+  memoized between lookups; a B-tree walk through memoized nodes that
+  misses is walked again from the root, because an insert moves records
+  between nodes.
+
 ## 0.7.10
 
 ### Added
