@@ -1266,17 +1266,29 @@ impl EaImage {
 /// nor a whole-block checksum is paid per chunk.
 ///
 /// INVARIANT: a held block is what the file holds at its address, except
-/// for the held data block's `dirty` bytes. A super block, data block or
-/// page is written only by [`Hdf5Writer::ea_slot`],
-/// [`Hdf5Writer::write_ea_entries`] and [`Hdf5Writer::flush_ea_block`];
-/// the dirty bytes are written by `flush_ea_block` alone, which runs before
+/// for the held data block's `dirty` bytes and a held super block that is
+/// `dirty`. A block [`Hdf5Writer::ea_slot`] creates is held wholly dirty, so
+/// its first write already carries the entry it was created for. Data
+/// blocks and pages are written only by [`Hdf5Writer::write_ea_entries`]
+/// and [`Hdf5Writer::flush_ea_block`], super blocks only by
+/// [`Hdf5Writer::flush_ea`], after the held data block: a child reaches the
+/// file before the parent that leads a reader to it. `flush_ea` runs before
 /// [`Hdf5Writer::flush_dataset_synced`] writes the index block and before
+/// another super block replaces the held one; `flush_ea_block` before
 /// another block replaces the held one. Nothing frees these blocks while
 /// their dataset's [`ChunkedDatasetInfo`] lives.
 #[derive(Default)]
 struct EaCache {
-    sblk: Option<(u64, ExtensibleArraySuperBlock)>,
+    sblk: Option<HeldSblk>,
     block: Option<EaImage>,
+}
+
+/// An extensible-array super block as [`EaCache`] holds it.
+struct HeldSblk {
+    addr: u64,
+    sb: ExtensibleArraySuperBlock,
+    /// Changed since the file last got it, or never written.
+    dirty: bool,
 }
 
 /// What reading and writing one dataset's extensible-array blocks needs.
@@ -7423,7 +7435,15 @@ impl Hdf5Writer {
                     continue;
                 }
                 let u = k.geo.iblock_nsblks + off;
-                let sb = self.read_ea_sblk(&k, u, sa_addr)?;
+                // The held super block may be one the file never got.
+                let read;
+                let sb = match &c.ea_cache.sblk {
+                    Some(h) if h.addr == sa_addr => &h.sb,
+                    _ => {
+                        read = self.read_ea_sblk(&k, u, sa_addr)?;
+                        &read
+                    }
+                };
                 for &da in &sb.dblk_addrs {
                     if da != UNDEF_ADDR {
                         self.allocator
@@ -11338,45 +11358,56 @@ impl Hdf5Writer {
                 sblk_block_offset,
                 ..
             } => {
-                let mut sblk_addr = c.iblk_addrs().1[sblk_off];
-                let mut sb = if sblk_addr == UNDEF_ADDR {
-                    if !extend {
-                        return Ok(EaSlot::Absent {
-                            end: k.geo.idx_blk_elmts + s.start_idx + s.ndblks * s.dblk_nelmts,
-                        });
-                    }
-                    let sb = ExtensibleArraySuperBlock::new(
-                        k.class_id(),
-                        k.header_addr,
-                        sblk_block_offset,
-                        s.ndblks as usize,
-                        k.geo.sblk_page_init_len(u),
-                    );
-                    let enc = sb.encode(&self.ctx, k.max_nelmts_bits);
-                    sblk_addr = self
-                        .allocator
-                        .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
-                    self.handle.write_at(sblk_addr, &enc)?;
-                    c.iblk_addrs_mut().1[sblk_off] = sblk_addr;
-                    c.ea_header.num_sblks_created += 1;
-                    c.ea_header.size_sblks_created += enc.len() as u64;
-                    sb
-                } else {
-                    match c.ea_cache.sblk.take_if(|(a, _)| *a == sblk_addr) {
-                        Some((_, sb)) => sb,
-                        None => self.read_ea_sblk(k, u, sblk_addr)?,
+                let sblk_addr = c.iblk_addrs().1[sblk_off];
+                if sblk_addr == UNDEF_ADDR && !extend {
+                    return Ok(EaSlot::Absent {
+                        end: k.geo.idx_blk_elmts + s.start_idx + s.ndblks * s.dblk_nelmts,
+                    });
+                }
+                let mut held = match c.ea_cache.sblk.take_if(|h| h.addr == sblk_addr) {
+                    Some(h) => h,
+                    None => {
+                        // The super block held so far, and its children
+                        // first, reach the file before it is let go.
+                        self.flush_ea(c)?;
+                        if sblk_addr == UNDEF_ADDR {
+                            let sb = ExtensibleArraySuperBlock::new(
+                                k.class_id(),
+                                k.header_addr,
+                                sblk_block_offset,
+                                s.ndblks as usize,
+                                k.geo.sblk_page_init_len(u),
+                            );
+                            let len = k.geo.sblk_size(u, self.ctx.sizeof_addr, k.max_nelmts_bits);
+                            let addr = self
+                                .allocator
+                                .allocate(len as u64, FreeSpaceClass::Metadata);
+                            c.iblk_addrs_mut().1[sblk_off] = addr;
+                            c.ea_header.num_sblks_created += 1;
+                            c.ea_header.size_sblks_created += len as u64;
+                            HeldSblk {
+                                addr,
+                                sb,
+                                dirty: true,
+                            }
+                        } else {
+                            HeldSblk {
+                                addr: sblk_addr,
+                                sb: self.read_ea_sblk(k, u, sblk_addr)?,
+                                dirty: false,
+                            }
+                        }
                     }
                 };
-                let mut sb_dirty = false;
-                let mut dblk_addr = sb.dblk_addrs[local_dblk];
+                let mut dblk_addr = held.sb.dblk_addrs[local_dblk];
                 if dblk_addr == UNDEF_ADDR {
                     if !extend {
-                        c.ea_cache.sblk = Some((sblk_addr, sb));
+                        c.ea_cache.sblk = Some(held);
                         return Ok(EaSlot::Absent { end: dblk_end });
                     }
                     dblk_addr = self.create_ea_dblk(c, k, u, loc.dblk_block_offset)?;
-                    sb.dblk_addrs[local_dblk] = dblk_addr;
-                    sb_dirty = true;
+                    held.sb.dblk_addrs[local_dblk] = dblk_addr;
+                    held.dirty = true;
                 }
                 let slot = if loc.paged {
                     // The page-init bitmap is one MSB-first bit string over
@@ -11391,9 +11422,9 @@ impl Hdf5Writer {
                             .dblk_prefix_size(self.ctx.sizeof_addr, k.max_nelmts_bits)
                             as u64
                         + page * page_size as u64;
-                    if sb.page_init[byte] & mask == 0 {
+                    if held.sb.page_init[byte] & mask == 0 {
                         if !extend {
-                            c.ea_cache.sblk = Some((sblk_addr, sb));
+                            c.ea_cache.sblk = Some(held);
                             return Ok(EaSlot::Absent {
                                 end: dblk_start + (page + 1) * page_nelmts,
                             });
@@ -11401,9 +11432,9 @@ impl Hdf5Writer {
                         // H5EA__dblk_page_create: a page of undefined entries,
                         // and no statistic counts it.
                         let undef = vec![FilteredChunkEntry::undef(); page_nelmts as usize];
-                        self.write_ea_entries(c, k, addr, EaEntryBlock::Page, &undef)?;
-                        sb.page_init[byte] |= mask;
-                        sb_dirty = true;
+                        self.hold_new_ea_block(c, k, addr, EaEntryBlock::Page, &undef)?;
+                        held.sb.page_init[byte] |= mask;
+                        held.dirty = true;
                     }
                     EaSlot::Block {
                         addr,
@@ -11414,20 +11445,16 @@ impl Hdf5Writer {
                 } else {
                     unpaged(dblk_addr)
                 };
-                if sb_dirty {
-                    self.handle
-                        .write_at(sblk_addr, &sb.encode(&self.ctx, k.max_nelmts_bits))?;
-                }
-                c.ea_cache.sblk = Some((sblk_addr, sb));
+                c.ea_cache.sblk = Some(held);
                 Ok(slot)
             }
         }
     }
 
-    /// Allocate and write a data block of super block `u`
-    /// (`H5EA__dblock_create`) and count it in the header's statistics. The
-    /// allocation covers a paged block's pages too, but only its prefix is
-    /// written: a page is written when its first entry is.
+    /// Allocate a data block of super block `u` (`H5EA__dblock_create`),
+    /// hold it, and count it in the header's statistics. The allocation
+    /// covers a paged block's pages too, but only its prefix is held: a page
+    /// is held when its first entry is set.
     fn create_ea_dblk(
         &self,
         c: &mut ChunkedDatasetInfo,
@@ -11449,7 +11476,7 @@ impl Hdf5Writer {
             s.dblk_nelmts as usize
         };
         let undef = vec![FilteredChunkEntry::undef(); nelmts];
-        self.write_ea_entries(c, k, addr, EaEntryBlock::Dblk { block_offset }, &undef)?;
+        self.hold_new_ea_block(c, k, addr, EaEntryBlock::Dblk { block_offset }, &undef)?;
         c.ea_header.num_dblks_created += 1;
         c.ea_header.size_dblks_created += size;
         c.ea_header.num_elmts_realized += s.dblk_nelmts;
@@ -11555,7 +11582,51 @@ impl Hdf5Writer {
         block: EaEntryBlock,
         entries: &[FilteredChunkEntry],
     ) -> IoResult<()> {
-        let enc = match (block, k.filtered) {
+        let enc = self.encode_ea_entries(k, block, entries);
+        let (entries_at, _) = k.extent(block, entries.len(), self.ctx.sizeof_addr);
+        // Before the write, which may be over the held block itself.
+        self.flush_ea_block(c)?;
+        self.handle.write_at(addr, &enc)?;
+        c.ea_cache.block = Some(EaImage {
+            addr,
+            entries_at,
+            bytes: enc,
+            dirty: None,
+        });
+        Ok(())
+    }
+
+    /// Hold `entries` as the block at `addr`, which the file does not have
+    /// yet: the block is wholly dirty, and its one write is
+    /// [`flush_ea_block`](Self::flush_ea_block)'s.
+    fn hold_new_ea_block(
+        &self,
+        c: &mut ChunkedDatasetInfo,
+        k: &EaCodec,
+        addr: u64,
+        block: EaEntryBlock,
+        entries: &[FilteredChunkEntry],
+    ) -> IoResult<()> {
+        let enc = self.encode_ea_entries(k, block, entries);
+        let (entries_at, _) = k.extent(block, entries.len(), self.ctx.sizeof_addr);
+        self.flush_ea_block(c)?;
+        c.ea_cache.block = Some(EaImage {
+            addr,
+            entries_at,
+            dirty: Some(0..enc.len()),
+            bytes: enc,
+        });
+        Ok(())
+    }
+
+    /// `entries` as the image of `block`, its checksum last.
+    fn encode_ea_entries(
+        &self,
+        k: &EaCodec,
+        block: EaEntryBlock,
+        entries: &[FilteredChunkEntry],
+    ) -> Vec<u8> {
+        match (block, k.filtered) {
             (EaEntryBlock::Dblk { block_offset }, true) => FilteredDataBlock {
                 class_id: EA_CLS_FILT_CHUNK,
                 header_addr: k.header_addr,
@@ -11585,18 +11656,7 @@ impl Hdf5Writer {
                 let addrs: Vec<u64> = entries.iter().map(|e| e.addr).collect();
                 encode_unfiltered_page(&addrs, &self.ctx)
             }
-        };
-        let (entries_at, _) = k.extent(block, entries.len(), self.ctx.sizeof_addr);
-        // Before the write, which may be over the held block itself.
-        self.flush_ea_block(c)?;
-        self.handle.write_at(addr, &enc)?;
-        c.ea_cache.block = Some(EaImage {
-            addr,
-            entries_at,
-            bytes: enc,
-            dirty: None,
-        });
-        Ok(())
+        }
     }
 
     /// Write the entries set in `c`'s held data block since the file last got
@@ -11611,10 +11671,28 @@ impl Hdf5Writer {
         let ck = img.bytes.len() - 4;
         let sum = crate::format::checksum::checksum_metadata(&img.bytes[..ck]).to_le_bytes();
         img.bytes[ck..].copy_from_slice(&sum);
-        self.handle
-            .write_at(img.addr + dirty.start as u64, &img.bytes[dirty])?;
-        self.handle.write_at(img.addr + ck as u64, &sum)?;
+        if dirty.end >= ck {
+            self.handle
+                .write_at(img.addr + dirty.start as u64, &img.bytes[dirty.start..])?;
+        } else {
+            self.handle
+                .write_at(img.addr + dirty.start as u64, &img.bytes[dirty])?;
+            self.handle.write_at(img.addr + ck as u64, &sum)?;
+        }
         img.dirty = None;
+        Ok(())
+    }
+
+    /// [`flush_ea_block`](Self::flush_ea_block), then the held super block
+    /// if it changed: the blocks it leads to are in the file by then.
+    fn flush_ea(&self, c: &mut ChunkedDatasetInfo) -> IoResult<()> {
+        self.flush_ea_block(c)?;
+        if let Some(h) = c.ea_cache.sblk.as_mut().filter(|h| h.dirty) {
+            let bits = c.earray_params.max_nelmts_bits;
+            self.handle
+                .write_at(h.addr, &h.sb.encode(&self.ctx, bits))?;
+            h.dirty = false;
+        }
         Ok(())
     }
 
@@ -16788,9 +16866,9 @@ impl Hdf5Writer {
 
         // EA-indexed dataset
         if let Some(ref mut chunked) = m.chunked {
-            // Children before parents: the data block's entries before the
-            // index block that leads a reader to them.
-            self.flush_ea_block(chunked)?;
+            // Children before parents: the data block's entries and the
+            // super block before the index block that leads a reader to them.
+            self.flush_ea(chunked)?;
             if let Some(ref fiblk) = chunked.filt_iblk {
                 // Filtered EA
                 let iblk_encoded = fiblk.encode(&self.ctx, chunked.chunk_size_len);
@@ -19921,6 +19999,114 @@ mod tests {
         let raw = reader.read_dataset_raw("frames").unwrap();
         assert!(raw.chunks(5).enumerate().all(|(i, f)| f == [i as u8; 5]));
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A block the extensible array creates is held, and written once, at
+    /// flush, with the entry it was created for: a data block off the index
+    /// block, a super block with its first data block, and a page of the
+    /// first paged data block. Until then the file has nothing at either
+    /// address, so neither is written a first time all undefined.
+    #[test]
+    fn a_new_extensible_array_block_is_written_once_at_flush() {
+        let path = temp_path("ea_new_block_once");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_chunked_dataset(
+                "frames",
+                DatatypeMessage::u8_type(),
+                &[0, 1],
+                &[u64::MAX, 1],
+                &[1, 1],
+            )
+            .unwrap();
+        // The block at `addr` whose checksum checks, if the file has it.
+        let on_file = |addr: u64, len: usize| {
+            let buf = writer.handle.read_at_most(addr, len).unwrap();
+            let ck = len - 4;
+            (buf.len() == len
+                && buf[ck..]
+                    == crate::format::checksum::checksum_metadata(&buf[..ck]).to_le_bytes())
+            .then_some(buf)
+        };
+        // Under the default parameters: past the index block's 4 entries,
+        // past its direct data blocks' 240, and past super blocks 0 to 12.
+        let chunks = [4u64, 244, 131_060];
+        for (i, &chunk) in chunks.iter().enumerate() {
+            writer.write_chunk(idx, chunk, &[i as u8 + 1]).unwrap();
+            let (block, page, sblk) = {
+                let ds = writer.ds(idx);
+                let m = ds.lock();
+                let c = m.chunked.as_ref().unwrap();
+                let k = EaCodec::new(c, 1).unwrap();
+                let img = c.ea_cache.block.as_ref().unwrap();
+                let sblks = c.iblk_addrs().1;
+                let sblk = sblks.iter().rposition(|&a| a != UNDEF_ADDR).map(|off| {
+                    let u = k.geo.iblock_nsblks + off;
+                    let len = k
+                        .geo
+                        .sblk_size(u, writer.ctx.sizeof_addr, k.max_nelmts_bits);
+                    (sblks[off], len)
+                });
+                ((img.addr, img.bytes.len()), img.entries_at == 0, sblk)
+            };
+            assert_eq!(page, i == 2, "chunk {chunk}");
+            assert_eq!(sblk.is_some(), i > 0, "chunk {chunk}");
+            assert!(on_file(block.0, block.1).is_none(), "chunk {chunk}: block");
+            if let Some(s) = sblk {
+                assert!(on_file(s.0, s.1).is_none(), "chunk {chunk}: super block");
+            }
+            writer.flush_dataset(idx).unwrap();
+            let held = {
+                let ds = writer.ds(idx);
+                let m = ds.lock();
+                let img = m.chunked.as_ref().unwrap().ea_cache.block.as_ref().unwrap();
+                assert!(img.dirty.is_none());
+                img.bytes.clone()
+            };
+            assert_eq!(
+                on_file(block.0, block.1),
+                Some(held),
+                "chunk {chunk}: block"
+            );
+            if let Some(s) = sblk {
+                assert!(on_file(s.0, s.1).is_some(), "chunk {chunk}: super block");
+            }
+        }
+        writer.extend_dataset(idx, &[chunks[2] + 1, 1]).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let raw = reader.read_dataset_raw("frames").unwrap();
+        for (i, &chunk) in chunks.iter().enumerate() {
+            assert_eq!(raw[chunk as usize], i as u8 + 1, "chunk {chunk}");
+        }
+        assert_eq!(raw.iter().filter(|&&b| b != 0).count(), chunks.len());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A dataset deleted before its index is flushed frees a super block
+    /// the file never got from the copy the writer holds.
+    #[test]
+    fn deleting_a_dataset_frees_a_super_block_never_flushed() {
+        let path = temp_path("ea_delete_held_sblk");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_chunked_dataset(
+                "frames",
+                DatatypeMessage::u8_type(),
+                &[0, 1],
+                &[u64::MAX, 1],
+                &[1, 1],
+            )
+            .unwrap();
+        writer.write_chunk(idx, 244, &[7]).unwrap();
+        writer.extend_dataset(idx, &[245, 1]).unwrap();
+        writer.delete_dataset("frames").unwrap();
+        writer.close().unwrap();
+
+        let reader = Hdf5Reader::open(&path).unwrap();
+        assert!(reader.dataset_names().is_empty());
         std::fs::remove_file(&path).ok();
     }
 
