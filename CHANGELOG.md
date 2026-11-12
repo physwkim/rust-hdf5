@@ -2,6 +2,13 @@
 
 ## 0.7.12
 
+### Added
+
+- `SwmrFileReader::dataset_filters` returns a dataset's filter pipeline in
+  application order, each filter's id, flags and client data, as
+  `H5Dataset::filters` does on a closed file, so a live reader can undo
+  the bytes `read_chunk_raw` returns under their filter mask.
+
 ### Fixed
 
 - A dataset whose chunks an extensible array indexes takes chunks past
@@ -18,9 +25,14 @@
   starts on an eight-byte boundary, for mapped views. Aligning every
   allocation left a free-list fragment per chunk whose size was not a
   multiple of eight, and every later allocation scanned the list: a SWMR
-  append of a 4-byte frame took 230 µs by frame 300,000. It now holds at
-  16–23 µs from frame 32,768 on, where the index block each append
-  rewrites reaches its 1024-entry page.
+  append of a 4-byte frame took 230 µs by frame 300,000.
+- An append into an extensible-array data block or page sets its entry in
+  the block the writer holds; a flush writes the entries changed since the
+  last one and the block's checksum, before the index block that
+  publishes them. The append used to read, re-encode and rewrite the whole
+  block, which cost 6 µs at frame 0 and up to 23 µs past frame 32,768. A SWMR
+  append of a 4- or 5-byte frame now takes 0.3–0.5 µs from frame 0 to
+  300,000, and 0.6–0.7 µs with a flush every 1000 frames.
 
 ## 0.7.11
 
