@@ -94,33 +94,25 @@ fn single_unlimited_dim(max_dims: Option<&[u64]>, ndims: usize) -> IoResult<Opti
     Ok(found)
 }
 
-/// Row-major linear index of the chunk at grid `coords` — the slot an
-/// extensible or fixed array records the chunk under.
-///
-/// Bounds every coordinate by the index grid (an unlimited dimension is
-/// unbounded); an out-of-grid coordinate on a bounded dimension would
-/// otherwise silently alias another chunk's slot.
-pub(crate) fn linear_index(
-    dims: &[u64],
-    max_dims: Option<&[u64]>,
-    chunk_dims: &[u64],
-    coords: &[u64],
-) -> IoResult<u64> {
-    let ndims = dims.len();
+/// Reject chunk-grid `coords` that do not have one entry per dimension of an
+/// `ndims`-dimensional dataset.
+pub(crate) fn check_rank(ndims: usize, coords: &[u64]) -> IoResult<()> {
     if coords.len() != ndims {
         return Err(IoError::InvalidState(format!(
-            "chunk_coords has {} entries but the dataset has {} dimensions",
-            coords.len(),
-            ndims
+            "chunk_coords has {} entries but the dataset has {ndims} dimensions",
+            coords.len()
         )));
     }
-    let grid = index_grid(dims, max_dims, chunk_dims)?;
-    // The unlimited dimension (if any) is the slot that grows without a
-    // multiplier; a fixed dataset has none, so dimension 0 fills that slot
-    // instead — the same convention libhdf5 reaches via an identity swizzle.
-    let seed_dim = single_unlimited_dim(max_dims, ndims)?.unwrap_or(0);
+    Ok(())
+}
 
-    for d in 0..ndims {
+/// Reject chunk-grid `coords` of the wrong rank, or outside `grid` along a
+/// bounded dimension (an unlimited one is unbounded). The one bounds rule every
+/// chunk index answers by: an out-of-grid coordinate on a bounded dimension
+/// would otherwise alias another chunk's slot.
+pub(crate) fn check_coords(grid: &[u64], max_dims: Option<&[u64]>, coords: &[u64]) -> IoResult<()> {
+    check_rank(grid.len(), coords)?;
+    for d in 0..grid.len() {
         if !is_unlimited(max_dims, d) && coords[d] >= grid[d] {
             return Err(IoError::InvalidState(format!(
                 "chunk coordinate {} in dimension {} is outside the chunk grid (0..{})",
@@ -128,6 +120,34 @@ pub(crate) fn linear_index(
             )));
         }
     }
+    Ok(())
+}
+
+/// Row-major linear index of the chunk at grid `coords` — the slot an
+/// extensible or fixed array records the chunk under.
+pub(crate) fn linear_index(
+    dims: &[u64],
+    max_dims: Option<&[u64]>,
+    chunk_dims: &[u64],
+    coords: &[u64],
+) -> IoResult<u64> {
+    let grid = index_grid(dims, max_dims, chunk_dims)?;
+    check_coords(&grid, max_dims, coords)?;
+    grid_linear_index(&grid, max_dims, coords)
+}
+
+/// [`linear_index`] against an [`index_grid`] already resolved, for `coords`
+/// [`check_coords`] already accepted.
+pub(crate) fn grid_linear_index(
+    grid: &[u64],
+    max_dims: Option<&[u64]>,
+    coords: &[u64],
+) -> IoResult<u64> {
+    let ndims = grid.len();
+    // The unlimited dimension (if any) is the slot that grows without a
+    // multiplier; a fixed dataset has none, so dimension 0 fills that slot
+    // instead — the same convention libhdf5 reaches via an identity swizzle.
+    let seed_dim = single_unlimited_dim(max_dims, ndims)?.unwrap_or(0);
 
     // Horner's method over every dimension but the seed: the seed's own
     // extent is never a multiplier, which is what lets it grow (or be
@@ -166,33 +186,8 @@ pub(crate) fn coords_of(
     Ok(coords)
 }
 
-/// Grid coordinates of every chunk slot `0..count`, packed row-major as
-/// `count * dims.len()` values — [`coords_of`] for a whole index at once,
-/// resolving the grid and the seed dimension once for the lot.
-///
-/// A chunked read decodes the position of every slot its index records, so
-/// what `coords_of` spends per slot is what the read spends per chunk; the
-/// packed table is one allocation for all of them.
-pub(crate) fn coords_table(
-    dims: &[u64],
-    max_dims: Option<&[u64]>,
-    chunk_dims: &[u64],
-    count: usize,
-) -> IoResult<Vec<u64>> {
-    let ndims = dims.len();
-    let grid = index_grid(dims, max_dims, chunk_dims)?;
-    let unlim_dim = single_unlimited_dim(max_dims, ndims)?;
-    let mut table = vec![0u64; count.saturating_mul(ndims)];
-    for (linear, coords) in table.chunks_mut(ndims.max(1)).enumerate() {
-        coords_into(&grid, unlim_dim, linear as u64, &mut coords[..ndims])?;
-    }
-    Ok(table)
-}
-
 /// Write the grid coordinates of chunk slot `linear` into `coords`, against a
-/// grid and unlimited dimension already resolved. The arithmetic both
-/// [`coords_of`] and [`coords_table`] read through, so a slot decodes the same
-/// way however many of them a caller asks for at once.
+/// grid and unlimited dimension already resolved.
 fn coords_into(
     grid: &[u64],
     unlim_dim: Option<usize>,
@@ -316,7 +311,7 @@ mod tests {
     }
 
     /// Two unlimited dimensions have no finite grid at all — that shape
-    /// belongs to a v2 B-tree index, which never calls into this module.
+    /// belongs to a v2 B-tree index, which never asks for a linear index.
     #[test]
     fn two_unlimited_dimensions_are_rejected() {
         let dims = [4, 5];

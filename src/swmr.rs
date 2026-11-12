@@ -3,6 +3,7 @@
 //! Provides a high-level wrapper around the SWMR protocol for streaming
 //! frame-based data (e.g., area detector images).
 
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use crate::format::messages::attribute::AttributeMessage;
@@ -951,6 +952,25 @@ impl SwmrFileReader {
         Ok(())
     }
 
+    /// How many times a metadata read whose checksum fails is attempted
+    /// before [`refresh`](Self::refresh) or a read fails. 100 unless set, the
+    /// default libhdf5 gives a SWMR reader.
+    pub fn metadata_read_attempts(&self) -> NonZeroU32 {
+        self.reader.metadata_read_attempts()
+    }
+
+    /// Set how many times a metadata read whose checksum fails is attempted
+    /// (`H5Pset_metadata_read_attempts`).
+    ///
+    /// The writer rewrites metadata in place, so a read can catch an image it
+    /// is part way through; the checksum fails, and reading again after a
+    /// short sleep gets the finished image. Each sleep doubles from 1 ns up
+    /// to about 1 ms. A checksum that still fails on the last attempt is
+    /// returned as the error.
+    pub fn set_metadata_read_attempts(&mut self, attempts: NonZeroU32) {
+        self.reader.set_metadata_read_attempts(attempts);
+    }
+
     /// Return the names of all datasets.
     pub fn dataset_names(&self) -> Vec<String> {
         self.reader
@@ -1013,6 +1033,26 @@ impl SwmrFileReader {
         counts: &[u64],
     ) -> Result<Vec<u8>> {
         Ok(self.reader.read_slice(name, starts, counts)?)
+    }
+
+    /// Read one chunk's stored bytes and filter mask, with no filter undone
+    /// — `H5Dread_chunk` (h5py: `Dataset.id.read_direct_chunk`).
+    ///
+    /// `chunk_coords` counts chunks, not elements, one per dimension. The
+    /// lookup decodes only the index blocks on the way to that chunk, so the
+    /// cost does not grow with the number of chunks written.
+    ///
+    /// `Ok(None)` when the writer has not put a chunk there as of the last
+    /// [`refresh`](Self::refresh): none is indexed at those coordinates, or
+    /// they lie beyond the extent read then but inside the maximum shape.
+    /// `Err` when the dataset is not chunked or `chunk_coords` has the wrong
+    /// rank or lies outside the maximum shape's chunk grid.
+    pub fn read_chunk_raw(
+        &mut self,
+        name: &str,
+        chunk_coords: &[u64],
+    ) -> Result<Option<(Vec<u8>, u32)>> {
+        Ok(self.reader.read_chunk_raw(name, chunk_coords)?)
     }
 
     /// Read a slice (hyperslab) of a dataset as a typed vector.

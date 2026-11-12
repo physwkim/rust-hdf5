@@ -236,6 +236,43 @@ fn bench_compressed_write_raw_fixed(c: &mut Criterion) {
     group.finish();
 }
 
+// A live reader's step: refresh, then read the newest frame, raw or decoded.
+// The chunk lookup reads only the index blocks on that frame's path, so the
+// cost should not grow from 1k frames to 30k.
+fn bench_swmr_latest_frame(c: &mut Criterion) {
+    use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
+    use rust_hdf5::FileLocking;
+
+    let mut group = c.benchmark_group("swmr_latest_frame");
+    for &n in &[1_000u64, 30_000] {
+        let path = std::env::temp_dir().join(format!("bench_swmr_latest_{n}.h5"));
+        {
+            let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+            let ds = w.create_streaming_dataset::<u8>("frames", &[64]).unwrap();
+            w.start_swmr().unwrap();
+            for i in 0..n {
+                w.append_frame(ds, &[i as u8; 64]).unwrap();
+            }
+            w.close().unwrap();
+        }
+        let mut r = SwmrFileReader::open_with_locking(&path, FileLocking::Disabled).unwrap();
+        group.bench_with_input(BenchmarkId::new("raw", n), &n, |b, &n| {
+            b.iter(|| {
+                r.refresh().unwrap();
+                r.read_chunk_raw("frames", &[n - 1, 0]).unwrap().unwrap()
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("slice", n), &n, |b, &n| {
+            b.iter(|| {
+                r.refresh().unwrap();
+                r.read_slice_raw("frames", &[n - 1, 0], &[1, 64]).unwrap()
+            });
+        });
+        std::fs::remove_file(&path).ok();
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_contiguous_write,
@@ -245,5 +282,6 @@ criterion_group!(
     bench_compressed_read,
     bench_compressed_write_raw,
     bench_compressed_write_raw_fixed,
+    bench_swmr_latest_frame,
 );
 criterion_main!(benches);

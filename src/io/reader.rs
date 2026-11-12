@@ -6,10 +6,11 @@
 //! Supports both legacy (v0/v1 superblock, v1 object headers, symbol tables)
 //! and modern (v2/v3 superblock, v2 object headers, link messages) formats.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use crate::dataset::{DatasetAccess, VirtualView};
-use crate::format::btree_v1::{BTreeV1Config, BTreeV1Node, ChunkBTreeV1Node};
+use crate::format::btree_v1::{BTreeV1Config, BTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::creation_order::CreationOrder;
 use crate::format::fractal_heap::{self, FractalHeapHeader};
@@ -19,7 +20,7 @@ use crate::format::global_heap::{
 use crate::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
-use crate::format::messages::data_layout::{self, DataLayoutMessage};
+use crate::format::messages::data_layout::DataLayoutMessage;
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::{DatatypeMessage, OldReferenceKind, ReferenceEncoding};
 use crate::format::messages::external_file_list::ExternalFileListMessage;
@@ -55,41 +56,20 @@ use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
 use crate::format::selection::check_hyperslab;
+use crate::io::chunk_lookup::{self, BlockCache, ChunkIndexView, ChunkRecord, IndexKind};
 use crate::io::file_handle::{FileHandle, ReadDst};
 use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::locking::FileLocking;
 use crate::io::{FileMeta, IoResult};
 
-/// The version-4 chunk-index descriptor pulled from a data-layout message:
-/// the index kind, its address, and the per-kind parameters the reader needs
-/// to walk it. Bundled so the chunked read entry point takes one descriptor
-/// instead of a long parameter list.
-struct ChunkIndexDesc<'a> {
-    /// The kind of chunk index (single chunk, fixed/extensible array, …).
-    index_type: data_layout::ChunkIndexType,
-    /// Address of the chunk index structure (or the chunk itself, for a
-    /// single chunk). `UNDEF_ADDR` when unallocated.
-    index_address: u64,
-    /// Extensible-array parameters (present iff `index_type == ExtensibleArray`).
-    earray_params: Option<&'a data_layout::EarrayParams>,
-    /// Filtered single-chunk parameters (present iff `index_type ==
-    /// SingleChunk` and the layout's filtered flag is set): the chunk's exact
-    /// on-disk size and per-chunk filter mask.
-    single_chunk_filter: Option<data_layout::SingleChunkFilter>,
-}
-
-/// One v2-B-tree chunk-index record, resolved to `(chunk address, on-disk
-/// read size, scaled chunk-grid offsets, filter mask)` — see
-/// [`Hdf5Reader::collect_bt2_chunk_entries`].
-type Bt2ChunkEntry = (u64, usize, Vec<u64>, u32);
-
 /// What a chunked read should produce: the whole dataset, or one hyperslab.
 ///
-/// Threaded through every chunked reader so the index walk, raw read, and
+/// Threaded through the chunked read so the index lookup, raw read, and
 /// filter pipeline are shared between full reads and slice reads. For a
-/// `Slice`, the reader allocates a `counts`-shaped buffer, skips reading any
-/// chunk that does not overlap the selection (the I/O win), and scatters only
-/// the chunk∩selection intersection. `Full` reads and places every chunk.
+/// `Slice`, the reader allocates a `counts`-shaped buffer, never looks up or
+/// reads a chunk that does not overlap the selection (the I/O win), and
+/// scatters only the chunk∩selection intersection. `Full` reads and places
+/// every chunk.
 #[derive(Clone, Copy)]
 enum ChunkTarget<'a> {
     Full,
@@ -100,20 +80,26 @@ enum ChunkTarget<'a> {
 }
 
 impl<'a> ChunkTarget<'a> {
-    /// Whether a chunk at chunk-grid `coords` (extent `chunk_dims`) intersects
-    /// the target. `Full` always intersects; a `Slice` intersects iff every
-    /// dimension's chunk span `[origin, origin+chunk_dims)` overlaps the
-    /// selection span `[start, start+count)`.
-    fn overlaps(&self, coords: &[u64], chunk_dims: &[u64]) -> bool {
-        match self {
-            ChunkTarget::Full => true,
-            ChunkTarget::Slice { starts, counts } => coords.iter().enumerate().all(|(d, &c)| {
-                let origin = c.saturating_mul(chunk_dims[d]);
-                let chunk_end = origin.saturating_add(chunk_dims[d]);
-                let sel_end = starts[d].saturating_add(counts[d]);
-                origin < sel_end && starts[d] < chunk_end
-            }),
-        }
+    /// Per dimension, the chunk-grid positions whose chunks intersect the
+    /// target inside the extent `dims`: every chunk for `Full`; for a `Slice`
+    /// those whose span `[origin, origin + chunk)` meets the selection span
+    /// `[start, start + count)`. `chunk_dims` holds no zero (the index grid
+    /// refuses one).
+    fn chunk_ranges(&self, dims: &[u64], chunk_dims: &[u64]) -> Vec<std::ops::Range<u64>> {
+        dims.iter()
+            .zip(chunk_dims)
+            .enumerate()
+            .map(|(d, (&n, &cd))| {
+                let end = n.div_ceil(cd);
+                match self {
+                    ChunkTarget::Full => 0..end,
+                    ChunkTarget::Slice { starts, counts } if counts[d] == 0 => 0..0,
+                    ChunkTarget::Slice { starts, counts } => {
+                        starts[d] / cd..starts[d].saturating_add(counts[d]).div_ceil(cd).min(end)
+                    }
+                }
+            })
+            .collect()
     }
 }
 
@@ -453,6 +439,17 @@ struct Origin {
 /// link to each other form a cycle whose every hop opens a fresh target, so it
 /// is this count, not target identity, that terminates the walk.
 const MAX_EXTERNAL_HOPS: usize = 16;
+
+/// The metadata read attempts a SWMR reader starts with: libhdf5's
+/// `H5F_SWMR_METADATA_READ_ATTEMPTS`, used when `H5Pset_metadata_read_attempts`
+/// was not called.
+pub(crate) const SWMR_METADATA_READ_ATTEMPTS: NonZeroU32 = NonZeroU32::new(100).unwrap();
+
+/// The v2/v3 superblock at the start of the address space, read and decoded
+/// as one load so a torn read is retried whole.
+fn load_superblock_v2v3(handle: &FileHandle) -> IoResult<SuperblockV2V3> {
+    handle.load_metadata(|| Ok(SuperblockV2V3::decode(&handle.read_at_most(0, 256)?)?))
+}
 
 /// What path traversal produced.
 enum Traversal {
@@ -1012,44 +1009,16 @@ pub struct SuperblockExtension {
     pub file_space_info: Option<FileSpaceInfoMessage>,
 }
 
-/// The datasets the discovery walk found, in the order it found them, with
-/// an index from canonical path to position.
+/// One dataset's caches against its chunk index: the index blocks lookups
+/// decoded, and the chunk images reads decoded from what those blocks named.
 ///
-/// Every open and every read resolves a dataset by name, so a plain `Vec` a
-/// lookup scans made each of them cost a pass over the whole catalog — a file
-/// holding thousands of datasets paid that per access. The index is derived
-/// in [`DatasetTable::new`], which is the only way to build one, so it cannot
-/// fall out of step with the list it indexes.
-/// One dataset's chunk index, as decoded from the file: `(chunk address,
-/// on-disk byte count, filter mask)` per chunk the index records, in the
-/// order the index walks them, alongside each chunk's chunk-grid coordinates
-/// (`coords[i * rank .. (i + 1) * rank]`).
-///
-/// What the file decides is `entries` and `coords`; what a read then does with
-/// an entry is that read's own business — a chunk outside the selection is
-/// never fetched, a filtered chunk is read to its recorded size — so nothing
-/// about one call is recorded here. `images` is the exception the rest of this
-/// file is built around: decompressed chunk images, which say nothing about
-/// one call either (an image is the decode of stored bytes this index names)
-/// and which live here precisely so that they cannot outlive the index that
-/// named them — see [`ChunkImageCache`].
-struct DecodedChunkIndex {
-    entries: Vec<(u64, u64, u32)>,
-    coords: Vec<u64>,
+/// Both answer only for the index they were read through, so they hang under
+/// the catalog entry beside that index's address ([`DatasetTable`]) and go
+/// with it.
+#[derive(Default)]
+struct ChunkIndexCache {
+    blocks: BlockCache,
     images: ChunkImageCache,
-}
-
-impl DecodedChunkIndex {
-    /// A freshly decoded index, with an empty image cache. The only way to
-    /// build one, so no decode site can forget the cache or hand one index's
-    /// images to another.
-    fn new(entries: Vec<(u64, u64, u32)>, coords: Vec<u64>) -> Self {
-        Self {
-            entries,
-            coords,
-            images: ChunkImageCache::default(),
-        }
-    }
 }
 
 /// The stored bytes one cached chunk image was decoded from: the chunk's file
@@ -1088,11 +1057,11 @@ const CHUNK_CACHE_SLOTS: usize = 521;
 /// this (`H5D__chunk_lock`, `rdcc`), which is why a row-at-a-time walk of a
 /// compressed dataset costs it one inflate per chunk rather than one per row.
 ///
-/// MUST NOT outlive the [`DecodedChunkIndex`] the images were named by, and is
-/// therefore a field of it: an image is reachable only through the index it
-/// was decoded under, so everything that drops a decoded index —
-/// `DatasetTable::entry_mut`, and the table rebuild a SWMR refresh does —
-/// drops the images with it. There is no second lifetime to keep in step.
+/// MUST NOT outlive the index the images were named by, and is therefore a
+/// field of [`ChunkIndexCache`], beside that index's decoded blocks:
+/// everything that drops them — `DatasetTable::entry_mut`, a change of index
+/// address, and the table rebuild a SWMR refresh does — drops the images
+/// with them. There is no second lifetime to keep in step.
 ///
 /// A read hands over an image only for a chunk it did not consume
 /// ([`ChunkPlacement::leaves_chunk_unconsumed`]), so a whole-dataset read,
@@ -1102,7 +1071,8 @@ const CHUNK_CACHE_SLOTS: usize = 521;
 /// fitting. Everything above it may offer an image; only it decides.
 #[derive(Default)]
 struct ChunkImageCache {
-    /// Interior mutability because a read reaches the index through an `Arc`.
+    /// Interior mutability because placement offers images through a shared
+    /// borrow of it.
     /// A poisoned lock degrades to "no cache", never a failed read.
     state: std::sync::Mutex<ChunkImageCacheState>,
 }
@@ -1178,30 +1148,37 @@ impl ChunkImageCacheState {
     }
 }
 
-/// The reader's dataset catalog, and the one place a decoded chunk index
-/// lives.
+/// The reader's dataset catalog, and the one place a dataset's chunk-index
+/// cache lives.
 ///
-/// A cached [`DecodedChunkIndex`] MUST describe the file exactly as the
-/// catalog entry beside it does, and MUST NOT be handed out for an index
-/// address other than the one it was decoded from. The fields are private to
-/// the module, so an entry is reachable read-only (`get`, `iter`, `Index`) or
-/// through [`DatasetTable::entry_mut`], which drops that entry's cached index
-/// before handing out the reference: changing what an entry says about the
-/// file cannot leave a stale index behind it. Rebuilding the table — what a
-/// SWMR refresh does — drops every cached index with it.
+/// A [`ChunkIndexCache`] MUST describe the file exactly as the catalog entry
+/// beside it does, and MUST NOT be handed out for an index address other than
+/// the one it was read through. The fields are private to the module, so an
+/// entry is reachable read-only (`get`, `iter`, `Index`) or through
+/// [`DatasetTable::entry_mut`], which drops that entry's cache before handing
+/// out the reference: changing what an entry says about the file cannot leave
+/// a stale cache behind it. Rebuilding the table — what a SWMR refresh does —
+/// drops every cache with it.
 mod dataset_table {
-    use super::{DatasetReadInfo, DecodedChunkIndex};
-    use std::sync::Arc;
+    use super::{ChunkIndexCache, DatasetReadInfo};
 
+    /// The datasets the discovery walk found, in the order it found them, with
+    /// an index from canonical path to position.
+    ///
+    /// Every open and every read resolves a dataset by name, so a plain `Vec` a
+    /// lookup scans made each of them cost a pass over the whole catalog — a file
+    /// holding thousands of datasets paid that per access. The index is derived
+    /// in [`DatasetTable::new`], which is the only way to build one, so it cannot
+    /// fall out of step with the list it indexes.
     pub(super) struct DatasetTable {
         list: Vec<DatasetReadInfo>,
         /// Canonical path (no leading `/`) → position in `list`. A name the
         /// walk recorded twice keeps its first position, which is the entry a
         /// scan from the front would have found.
         by_name: std::collections::HashMap<String, usize>,
-        /// Per entry, the index address a chunk index was decoded from and
-        /// what it decoded to. Parallel to `list`.
-        chunk_index: Vec<Option<(u64, Arc<DecodedChunkIndex>)>>,
+        /// Per entry, the index address its chunk-index cache was read
+        /// through, and the cache. Parallel to `list`.
+        chunk_cache: Vec<Option<(u64, ChunkIndexCache)>>,
     }
 
     impl DatasetTable {
@@ -1210,11 +1187,11 @@ mod dataset_table {
             for (i, ds) in list.iter().enumerate() {
                 by_name.entry(ds.name.clone()).or_insert(i);
             }
-            let chunk_index = list.iter().map(|_| None).collect();
+            let chunk_cache = list.iter().map(|_| None).collect();
             Self {
                 list,
                 by_name,
-                chunk_index,
+                chunk_cache,
             }
         }
 
@@ -1233,39 +1210,42 @@ mod dataset_table {
         }
 
         /// The entry at `i`, mutably. Whatever the caller changes about it may
-        /// be what a decoded chunk index was read against, so that index goes
+        /// be what the chunk-index cache was read against, so that cache goes
         /// first: this is the only way to a `&mut DatasetReadInfo`, which is
         /// what keeps the cache from outliving the entry it describes.
         pub(super) fn entry_mut(&mut self, i: usize) -> &mut DatasetReadInfo {
-            self.chunk_index[i] = None;
+            self.chunk_cache[i] = None;
             &mut self.list[i]
         }
 
-        /// The chunk index cached for entry `i`, if one was decoded from
-        /// `index_address`. A different address means the entry now points at
-        /// another structure, and the cached one does not answer for it.
-        pub(super) fn chunk_index(
-            &self,
-            i: usize,
-            index_address: u64,
-        ) -> Option<&Arc<DecodedChunkIndex>> {
-            match self.chunk_index.get(i)? {
-                Some((addr, index)) if *addr == index_address => Some(index),
-                _ => None,
-            }
-        }
-
-        /// Keep `index` as entry `i`'s decoded chunk index for
-        /// `index_address`, and hand it back.
-        pub(super) fn cache_chunk_index(
+        /// Entry `i`'s chunk-index cache for the index at `index_address`,
+        /// started empty when none is held for that address. A different
+        /// address means the entry now points at another structure, so what
+        /// was held for the old one goes.
+        pub(super) fn chunk_cache_mut(
             &mut self,
             i: usize,
             index_address: u64,
-            index: DecodedChunkIndex,
-        ) -> Arc<DecodedChunkIndex> {
-            let index = Arc::new(index);
-            self.chunk_index[i] = Some((index_address, Arc::clone(&index)));
-            index
+        ) -> &mut ChunkIndexCache {
+            let slot = &mut self.chunk_cache[i];
+            if slot
+                .as_ref()
+                .is_some_and(|(addr, _)| *addr != index_address)
+            {
+                *slot = None;
+            }
+            &mut slot
+                .get_or_insert_with(|| (index_address, ChunkIndexCache::default()))
+                .1
+        }
+
+        /// Entry `i`'s chunk-index cache, if one is held for `index_address`.
+        #[cfg(test)]
+        pub(super) fn chunk_cache(&self, i: usize, index_address: u64) -> Option<&ChunkIndexCache> {
+            match self.chunk_cache.get(i)? {
+                Some((addr, cache)) if *addr == index_address => Some(cache),
+                _ => None,
+            }
         }
     }
 
@@ -1968,7 +1948,7 @@ fn copy_matched_selections(
 /// and the static dataset-open path (which only has a `&mut FileHandle`, not
 /// a full `&mut Hdf5Reader`) share the one implementation.
 fn read_heap_collection_from(
-    handle: &mut FileHandle,
+    handle: &FileHandle,
     ctx: &FormatContext,
     addr: u64,
 ) -> IoResult<GlobalHeapCollection> {
@@ -2005,8 +1985,63 @@ struct ChunkReadJob {
     mask: u32,
 }
 
+/// How a read fetches the chunk `rec` names, `None` for one the index
+/// records as stored nowhere a read can take it from. `filtered` is whether
+/// the read runs a filter pipeline over it.
+///
+/// Each index type records sizes its own way: a filtered fixed-array entry
+/// may record no size, an unfiltered extensible-array chunk may end past the
+/// file's end, and a v1 B-tree records the stored size even unfiltered — which
+/// must then be a whole chunk, or the index is corrupt.
+fn chunk_read_job(
+    view: &ChunkIndexView,
+    rec: ChunkRecord,
+    filtered: bool,
+) -> IoResult<Option<ChunkReadJob>> {
+    let job = |len: u64, at_most: bool, mask: u32| ChunkReadJob {
+        addr: rec.addr,
+        len: len as usize,
+        at_most,
+        mask,
+    };
+    let file_size = view.file_size();
+    let in_file = rec.nbytes != 0 && rec.addr < file_size && rec.nbytes <= file_size;
+    Ok(match view.kind() {
+        // A filtered single chunk records its exact stored size and mask in
+        // the layout message; without them (older layouts) read generously
+        // and let the decoder find the end.
+        IndexKind::SingleChunk(_) if !filtered => Some(job(view.whole_bytes(), false, 0)),
+        IndexKind::SingleChunk(Some(_)) => Some(job(rec.nbytes, false, rec.mask)),
+        IndexKind::SingleChunk(None) => Some(job(view.whole_bytes().saturating_mul(2), true, 0)),
+        IndexKind::Implicit => Some(job(view.chunk_bytes(), false, 0)),
+        IndexKind::FixedArray if filtered => {
+            let len = match rec.nbytes {
+                0 => view.chunk_bytes().saturating_mul(2),
+                n => n,
+            };
+            Some(job(len, true, rec.mask))
+        }
+        IndexKind::FixedArray => Some(job(view.chunk_bytes(), false, rec.mask)),
+        IndexKind::ExtensibleArray(_) if filtered => {
+            in_file.then(|| job(rec.nbytes, false, rec.mask))
+        }
+        IndexKind::ExtensibleArray(_) => Some(job(view.chunk_bytes(), true, 0)),
+        IndexKind::BTreeV2 => (rec.nbytes != 0).then(|| job(rec.nbytes, false, rec.mask)),
+        IndexKind::BTreeV1 => {
+            if !filtered && rec.nbytes != 0 && rec.nbytes != view.chunk_bytes() {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk B-tree v1: unfiltered chunk size {} != expected {}",
+                    rec.nbytes,
+                    view.chunk_bytes()
+                )));
+            }
+            in_file.then(|| job(rec.nbytes, false, rec.mask))
+        }
+    })
+}
+
 /// Read one chunk's raw bytes according to its job.
-fn read_chunk_raw(handle: &FileHandle, j: &ChunkReadJob) -> IoResult<Vec<u8>> {
+fn read_job_bytes(handle: &FileHandle, j: &ChunkReadJob) -> IoResult<Vec<u8>> {
     if j.at_most {
         Ok(handle.read_at_most(j.addr, j.len)?)
     } else {
@@ -2280,15 +2315,14 @@ fn read_chunk_runs_into(
 
 /// Place every chunk a chunked read planned into `output`.
 ///
-/// The single owner of "planned chunk → output bytes" for all five chunk index
-/// types: each read path walks its own index and builds the jobs, and this
-/// decides, per chunk, whether the read box's byte runs come straight out of
+/// The single owner of "planned chunk → output bytes" for every chunk index
+/// type: [`Hdf5Reader::read_chunked`] looks the chunks up and builds the jobs,
+/// and this decides, per chunk, whether the read box's byte runs come straight out of
 /// the file ([`read_chunk_runs_into`]) or whether the chunk has to be read and
 /// decoded whole first ([`copy_chunk_runs`]). A filtered chunk's stored bytes
 /// have no byte-range correspondence to the dataset's, so it always reads
-/// whole. `coords` is the packed chunk-grid position table
-/// ([`crate::io::chunk_grid::coords_table`]): job `i` sits at rank-many values
-/// from `i * rank`.
+/// whole. `coords` packs the jobs' chunk-grid positions: job `i` sits at
+/// rank-many values from `i * rank`.
 ///
 /// It is also the single owner of the fill: every byte of `output` this
 /// returns `Ok` on is either a byte some chunk placed or a byte filled with
@@ -2301,7 +2335,7 @@ fn read_chunk_runs_into(
 /// afterwards.
 ///
 /// `cache` is the dataset's [`ChunkImageCache`] — present for every read that
-/// reached its chunks through a decoded index. It is consulted only for a
+/// looked its chunks up through an index. It is consulted only for a
 /// filtered chunk this read leaves partly unconsumed: an unfiltered chunk's
 /// selected runs come straight out of the file below and never materialize an
 /// image there is anything to keep, and a chunk this read takes entire is one
@@ -2664,7 +2698,7 @@ fn read_and_decompress_chunks(
         let decode =
             |(job, sink): (Option<ChunkReadJob>, ChunkSink<'_>)| -> IoResult<ChunkDecoded> {
                 match job {
-                    Some(j) => deliver(read_chunk_raw(handle, &j)?, j.mask, sink),
+                    Some(j) => deliver(read_job_bytes(handle, &j)?, j.mask, sink),
                     None => Ok(ChunkDecoded::Absent),
                 }
             };
@@ -2692,7 +2726,7 @@ fn read_and_decompress_chunks(
         let raws: Vec<Option<(Vec<u8>, u32)>> = jobs
             .into_iter()
             .map(|job| match job {
-                Some(j) => Ok(Some((read_chunk_raw(handle, &j)?, j.mask))),
+                Some(j) => Ok(Some((read_job_bytes(handle, &j)?, j.mask))),
                 None => Ok(None),
             })
             .collect::<IoResult<Vec<_>>>()?;
@@ -2720,7 +2754,7 @@ fn read_and_decompress_chunks(
         jobs.into_iter()
             .zip(sinks)
             .map(|(job, sink)| match job {
-                Some(j) => deliver(read_chunk_raw(handle, &j)?, j.mask, sink),
+                Some(j) => deliver(read_job_bytes(handle, &j)?, j.mask, sink),
                 None => Ok(ChunkDecoded::Absent),
             })
             .collect()
@@ -2731,10 +2765,14 @@ impl Hdf5Reader {
     /// Open an existing HDF5 file in SWMR read mode using the env-var-derived
     /// locking policy.
     ///
-    /// Currently identical to `open()`, but indicates intent to use
-    /// `refresh()` for re-reading metadata written by a concurrent SWMR writer.
+    /// Unlike `open()`, a metadata load whose checksum fails is attempted
+    /// [`SWMR_METADATA_READ_ATTEMPTS`] times before the open or a later
+    /// `refresh()` fails, since a concurrent SWMR writer may be rewriting it.
     pub fn open_swmr(path: &Path) -> IoResult<Self> {
-        Self::open(path)
+        Self::open_swmr_with_locking(
+            path,
+            crate::io::locking::FileLocking::from_env_or(Default::default()),
+        )
     }
 
     /// Open an existing HDF5 file in SWMR read mode with an explicit locking
@@ -2743,7 +2781,7 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        Self::open_with_locking(path, locking)
+        Self::open_with_attempts(path, locking, SWMR_METADATA_READ_ATTEMPTS)
     }
 
     /// Open an existing HDF5 file for reading using the env-var-derived
@@ -2764,7 +2802,18 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
+        Self::open_with_attempts(path, locking, NonZeroU32::MIN)
+    }
+
+    /// Open with `attempts` as the metadata read attempts, in force before
+    /// the superblock is read.
+    fn open_with_attempts(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+        attempts: NonZeroU32,
+    ) -> IoResult<Self> {
         let mut handle = FileHandle::open_read_with_locking(path, locking)?;
+        handle.set_metadata_read_attempts(attempts);
 
         // The superblock is not necessarily at the start of the file: a
         // userblock precedes it, and `H5FD_locate_signature` finds it by
@@ -2787,7 +2836,7 @@ impl Hdf5Reader {
         };
         let mut reader = match version {
             0 | 1 => Self::open_v0v1(handle, &sb_buf, origin)?,
-            2 | 3 => Self::open_v2v3(handle, &sb_buf, origin)?,
+            2 | 3 => Self::open_v2v3(handle, origin)?,
             v => {
                 return Err(crate::io::IoError::Format(
                     crate::format::FormatError::InvalidVersion(v),
@@ -2808,8 +2857,8 @@ impl Hdf5Reader {
     }
 
     /// Open a file with v2/v3 superblock (existing code path).
-    fn open_v2v3(mut handle: FileHandle, sb_buf: &[u8], origin: Origin) -> IoResult<Self> {
-        let sb = SuperblockV2V3::decode(sb_buf)?;
+    fn open_v2v3(mut handle: FileHandle, origin: Origin) -> IoResult<Self> {
+        let sb = load_superblock_v2v3(&handle)?;
 
         let ctx = FormatContext {
             sizeof_addr: sb.sizeof_offsets,
@@ -3073,7 +3122,7 @@ impl Hdf5Reader {
     /// the message, exactly as `H5SM__cache_table_get_final_load_size` takes it
     /// from `H5F_SOHM_NINDEXES`.
     fn read_sohm_table(
-        handle: &mut FileHandle,
+        handle: &FileHandle,
         ctx: &FormatContext,
         smt: &SharedMessageTableMessage,
     ) -> IoResult<SohmMasterTable> {
@@ -3081,8 +3130,10 @@ impl Hdf5Reader {
             return Ok(SohmMasterTable::default());
         }
         let size = SohmMasterTable::encoded_size(ctx, smt.nindexes);
-        let buf = handle.read_at(smt.table_address, size)?;
-        Ok(SohmMasterTable::decode(&buf, ctx, smt.nindexes)?)
+        handle.load_metadata(|| {
+            let buf = handle.read_at(smt.table_address, size)?;
+            Ok(SohmMasterTable::decode(&buf, ctx, smt.nindexes)?)
+        })
     }
 
     /// Extract the symbol-table message (btree_addr, heap_addr) from an
@@ -3122,56 +3173,58 @@ impl Hdf5Reader {
     /// object in the heap is an encoded `Link` message. Returns the decoded
     /// links (hard and soft).
     pub(crate) fn read_dense_links(
-        handle: &mut FileHandle,
+        handle: &FileHandle,
         ctx: &FormatContext,
         fractal_heap_addr: u64,
     ) -> IoResult<Vec<LinkMessage>> {
-        // Read the fractal heap header. Its on-disk size depends only on the
-        // address/length widths, so a generous prefix read covers it.
-        let hdr_buf = handle.read_at_most(fractal_heap_addr, 512)?;
-        let fh_header = FractalHeapHeader::decode(&hdr_buf, ctx)?;
+        handle.load_metadata(|| {
+            // Read the fractal heap header. Its on-disk size depends only on the
+            // address/length widths, so a generous prefix read covers it.
+            let hdr_buf = handle.read_at_most(fractal_heap_addr, 512)?;
+            let fh_header = FractalHeapHeader::decode(&hdr_buf, ctx)?;
 
-        // Walk the heap's managed blocks; each block hands back a payload
-        // region holding one or more packed encoded `Link` messages.
-        let mut br = HandleBlockReader { handle };
-        let payloads = fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br)?;
+            // Walk the heap's managed blocks; each block hands back a payload
+            // region holding one or more packed encoded `Link` messages.
+            let mut br = HandleBlockReader { handle };
+            let payloads = fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br)?;
 
-        let mut links = Vec::new();
-        for payload in payloads {
-            // Decode packed `Link` messages sequentially. Each decode reports
-            // its consumed length; stop at the first byte that is not a valid
-            // link (trailing free space or an unrelated managed object).
-            let mut pos = 0;
-            while pos < payload.len() {
-                // A v1 link message starts with version byte 1.
-                if payload[pos] != 1 {
-                    break;
-                }
-                match LinkMessage::decode(&payload[pos..], ctx) {
-                    Ok((link, consumed)) if consumed > 0 => {
-                        links.push(link);
-                        pos += consumed;
+            let mut links = Vec::new();
+            for payload in payloads {
+                // Decode packed `Link` messages sequentially. Each decode reports
+                // its consumed length; stop at the first byte that is not a valid
+                // link (trailing free space or an unrelated managed object).
+                let mut pos = 0;
+                while pos < payload.len() {
+                    // A v1 link message starts with version byte 1.
+                    if payload[pos] != 1 {
+                        break;
                     }
-                    _ => break,
+                    match LinkMessage::decode(&payload[pos..], ctx) {
+                        Ok((link, consumed)) if consumed > 0 => {
+                            links.push(link);
+                            pos += consumed;
+                        }
+                        _ => break,
+                    }
                 }
             }
-        }
 
-        // That scan stops at the first byte that does not begin a link, which
-        // is how trailing free space in a direct block ends it — and would
-        // equally swallow a link the scan could not read. The heap header
-        // counts its managed objects, so a short scan is detectable, and a
-        // group listing that is short is the loss this guards against.
-        if links.len() < fh_header.man_nobjs as usize {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "dense link storage at address {fractal_heap_addr:#x} holds {} managed \
-                 objects but only {} decoded as links",
-                fh_header.man_nobjs,
-                links.len()
-            )));
-        }
+            // That scan stops at the first byte that does not begin a link, which
+            // is how trailing free space in a direct block ends it — and would
+            // equally swallow a link the scan could not read. The heap header
+            // counts its managed objects, so a short scan is detectable, and a
+            // group listing that is short is the loss this guards against.
+            if links.len() < fh_header.man_nobjs as usize {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dense link storage at address {fractal_heap_addr:#x} holds {} managed \
+                     objects but only {} decoded as links",
+                    fh_header.man_nobjs,
+                    links.len()
+                )));
+            }
 
-        Ok(links)
+            Ok(links)
+        })
     }
 
     /// Recursively walk a B-tree v1 to collect leaf-level SNOD addresses.
@@ -3504,30 +3557,45 @@ impl Hdf5Reader {
     /// no data: a `Virtual` layout carries no data address of its own, so a
     /// dropped mapping list would read back as all-fill with no error.
     fn resolve_virtual_mappings(
-        handle: &mut FileHandle,
+        handle: &FileHandle,
         ctx: &FormatContext,
         heap_address: u64,
         heap_index: u32,
         name: &str,
     ) -> IoResult<VirtualMappingList> {
-        let coll = read_heap_collection_from(handle, ctx, heap_address)?;
+        let malformed = |e: crate::format::FormatError| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} has a malformed virtual dataset mapping list: {e}"
+            ))
+        };
         let idx = u16::try_from(heap_index).map_err(|_| {
             crate::io::IoError::InvalidState(format!(
                 "dataset {name:?} virtual mapping heap index {heap_index} does not fit \
                  the 16-bit on-disk field"
             ))
         })?;
-        let obj = coll.get_object(idx).ok_or_else(|| {
-            crate::io::IoError::InvalidState(format!(
-                "dataset {name:?} virtual mapping list object {idx} not found in the \
-                 global heap collection at address {heap_address:#x}"
-            ))
-        })?;
-        VirtualMappingList::decode(obj, ctx).map_err(|e| {
-            crate::io::IoError::InvalidState(format!(
-                "dataset {name:?} has a malformed virtual dataset mapping list: {e}"
-            ))
-        })
+        // A checksum failure leaves the gate as `Format` so it can be
+        // retried, and takes the dataset's context only once it is final.
+        handle
+            .load_metadata(|| {
+                let coll = read_heap_collection_from(handle, ctx, heap_address)?;
+                let obj = coll.get_object(idx).ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?} virtual mapping list object {idx} not found in the \
+                         global heap collection at address {heap_address:#x}"
+                    ))
+                })?;
+                VirtualMappingList::decode(obj, ctx).map_err(|e| match e {
+                    e @ crate::format::FormatError::ChecksumMismatch { .. } => e.into(),
+                    e => malformed(e),
+                })
+            })
+            .map_err(|e| match e {
+                crate::io::IoError::Format(
+                    e @ crate::format::FormatError::ChecksumMismatch { .. },
+                ) => malformed(e),
+                e => e,
+            })
     }
 
     /// Resolve every external-file slot's name through the local heap the
@@ -3963,6 +4031,7 @@ impl Hdf5Reader {
         owner: CrossFileOwner,
     ) -> IoResult<&mut Hdf5Reader> {
         let locking = self.locking;
+        let attempts = self.handle.metadata_read_attempts();
         let elink_prefix = self.elink_prefix.clone();
         match self.external.entry(resolved) {
             std::collections::btree_map::Entry::Occupied(e) => {
@@ -3971,7 +4040,9 @@ impl Hdf5Reader {
                 Ok(&mut *e.reader)
             }
             std::collections::btree_map::Entry::Vacant(e) => {
-                let mut reader = Hdf5Reader::open_with_locking(e.key(), locking)?;
+                // Opened under the opener's access properties, as libhdf5
+                // opens a link target with the parent file's fapl.
+                let mut reader = Hdf5Reader::open_with_attempts(e.key(), locking, attempts)?;
                 reader.elink_prefix.clone_from(&elink_prefix);
                 Ok(&mut *e
                     .insert(CrossFileEntry {
@@ -4459,7 +4530,7 @@ impl Hdf5Reader {
     /// has none, and this crate's writers put a whole write call's strings
     /// into one collection, which a cap would turn into silent data loss.
     fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
-        read_heap_collection_from(&mut self.handle, &self.meta.ctx, addr)
+        read_heap_collection_from(&self.handle, &self.meta.ctx, addr)
     }
 
     /// Decode an attribute's value as a string, resolving a variable-length
@@ -4957,46 +5028,11 @@ impl Hdf5Reader {
                     fill_tiled_into(&mut out[n..], fill_value.as_deref());
                 }
             }
-            DataLayoutMessage::ChunkedV3 {
-                chunk_dims,
-                b_tree_address,
-            } => {
-                // The layout's chunk_dims include the element size as the
-                // trailing dimension. Strip it for chunk indexing. The chunk
-                // read defines every byte of `out`, filling whatever no chunk
-                // covers.
-                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
-                self.read_chunked_btree_v1(
+            DataLayoutMessage::ChunkedV3 { .. } | DataLayoutMessage::ChunkedV4 { .. } => {
+                // The chunk read defines every byte of `out`, filling whatever
+                // no chunk covers.
+                self.read_chunked(
                     name,
-                    real_chunk_dims,
-                    *b_tree_address,
-                    ChunkReadRequest {
-                        pipeline: pipeline.as_ref(),
-                        target: ChunkTarget::Full,
-                        fill_value: fill_value.as_deref(),
-                        dst,
-                    },
-                    out,
-                )?;
-            }
-            DataLayoutMessage::ChunkedV4 {
-                chunk_dims,
-                index_address,
-                index_type,
-                earray_params,
-                single_chunk_filter,
-                ..
-            } => {
-                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
-                self.read_chunked_v4(
-                    name,
-                    real_chunk_dims,
-                    ChunkIndexDesc {
-                        index_type: *index_type,
-                        index_address: *index_address,
-                        earray_params: earray_params.as_ref(),
-                        single_chunk_filter: *single_chunk_filter,
-                    },
                     ChunkReadRequest {
                         pipeline: pipeline.as_ref(),
                         target: ChunkTarget::Full,
@@ -5535,6 +5571,27 @@ impl Hdf5Reader {
         Ok(())
     }
 
+    /// How many times a metadata load whose checksum fails is attempted
+    /// before the read fails: 1, or [`SWMR_METADATA_READ_ATTEMPTS`] for a
+    /// reader opened with `open_swmr`.
+    pub fn metadata_read_attempts(&self) -> NonZeroU32 {
+        self.handle.metadata_read_attempts()
+    }
+
+    /// Set how many times a metadata load whose checksum fails is attempted
+    /// (`H5Pset_metadata_read_attempts`), here and in every file this reader
+    /// has opened or will open through an external link or virtual source.
+    ///
+    /// A SWMR writer rewrites metadata in place, so a reader can read an
+    /// image the writer is part way through; reading it again is what tells
+    /// a torn image from a corrupt one.
+    pub fn set_metadata_read_attempts(&mut self, attempts: NonZeroU32) {
+        self.handle.set_metadata_read_attempts(attempts);
+        for entry in self.external.values_mut() {
+            entry.reader.set_metadata_read_attempts(attempts);
+        }
+    }
+
     /// Re-read the superblock and dataset metadata for SWMR.
     ///
     /// Call this periodically to pick up new data written by a concurrent
@@ -5549,10 +5606,8 @@ impl Hdf5Reader {
         self.handle.refresh_read_source();
 
         // Re-read superblock to get latest EOF and root group address.
-        let sb_buf = self.handle.read_at_most(0, 256)?;
-
-        // Only v2/v3 superblocks support SWMR refresh
-        let sb = SuperblockV2V3::decode(&sb_buf)?;
+        // Only v2/v3 superblocks support SWMR refresh.
+        let sb = load_superblock_v2v3(&self.handle)?;
 
         let ctx = FormatContext {
             sizeof_addr: sb.sizeof_offsets,
@@ -5610,1020 +5665,98 @@ impl Hdf5Reader {
         Ok(())
     }
 
-    /// The dataset at `pos`'s chunk index, from the cache when it already
-    /// holds one decoded from `index_address`, otherwise by running `decode`
-    /// once and keeping what it returns.
+    /// Read the chunks of dataset `name` that `req.target` overlaps into
+    /// `output`, looking each one up in the dataset's chunk index
+    /// ([`chunk_lookup::find`]).
     ///
-    /// The single owner of the chunk-index cache: nothing else reads or
-    /// writes it. Every chunked read of a dataset asks the same question of
-    /// the same on-disk structure — a thousand small slice reads re-walked
-    /// the fixed array a thousand times — and only a change to the catalog
-    /// entry can change the answer, which drops the entry's cache
-    /// (`DatasetTable::entry_mut`, and a SWMR refresh rebuilding the table).
-    fn decoded_chunk_index<F>(
-        &mut self,
-        pos: usize,
-        index_address: u64,
-        decode: F,
-    ) -> IoResult<std::sync::Arc<DecodedChunkIndex>>
-    where
-        F: FnOnce(&mut Self) -> IoResult<DecodedChunkIndex>,
-    {
-        if let Some(hit) = self.datasets.chunk_index(pos, index_address) {
-            return Ok(std::sync::Arc::clone(hit));
-        }
-        let decoded = decode(self)?;
-        Ok(self.datasets.cache_chunk_index(pos, index_address, decoded))
-    }
-
-    /// Read chunked dataset data by walking the chunk index.
-    ///
-    /// `desc` bundles the version-4 chunk-index descriptor extracted from the
-    /// data-layout message (kind, address, and per-kind parameters), so this
-    /// entry point takes one descriptor rather than a long parameter list.
-    ///
-    /// Scatters only; `output` must already be sized to the target extent.
-    /// Every byte of it is defined before this returns `Ok`: what no chunk
-    /// covers is filled with the tiled fill value by
-    /// [`place_chunk_jobs`], the one exit every branch here takes.
-    fn read_chunked_v4(
+    /// Only the overlapping chunks are looked up, so a read of one frame of a
+    /// growing dataset decodes the index blocks on the way to that frame's
+    /// chunks and nothing else. Scatters only; `output` must already be sized
+    /// to the target extent. Every byte of it is defined before this returns
+    /// `Ok`: what no chunk covers is filled with the tiled fill value by
+    /// [`place_chunk_jobs`].
+    fn read_chunked(
         &mut self,
         name: &str,
-        chunk_dims: &[u64],
-        desc: ChunkIndexDesc<'_>,
         req: ChunkReadRequest,
         output: &mut [u8],
     ) -> IoResult<()> {
-        let ChunkReadRequest {
-            pipeline, target, ..
-        } = req;
-        let ChunkIndexDesc {
-            index_type,
-            index_address,
-            earray_params,
-            single_chunk_filter,
-        } = desc;
         let pos = self.dataset_position(name)?;
-        let info = &self.datasets[pos];
-        let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-
-        match index_type {
-            data_layout::ChunkIndexType::SingleChunk => {
-                // Single chunk: the index_address IS the chunk address
-                let total_size: u64 = saturating_byte_len(&dims, element_size);
-                let geo = ChunkOutputGeometry {
-                    dims: &dims,
-                    chunk_dims,
-                    element_size,
-                };
-                if index_address == UNDEF_ADDR || total_size == 0 {
-                    // Unallocated single chunk: nothing to read, so the empty
-                    // plan makes the whole output fill.
-                    return place_chunk_jobs(
-                        &self.handle,
-                        Vec::new(),
-                        &[],
-                        req,
-                        &geo,
-                        None,
-                        output,
-                    );
-                }
-                // A filtered single chunk records its exact on-disk size and
-                // per-chunk filter mask in the layout message. Use them to
-                // read precisely the stored bytes and to skip the filters the
-                // mask marks as not applied. Without those params
-                // (older/edge layouts) fall back to the read-extra-and-inflate
-                // heuristic with the full pipeline.
-                let job = match (pipeline, single_chunk_filter) {
-                    (Some(_), Some(scf)) => ChunkReadJob {
-                        addr: index_address,
-                        len: scf.nbytes as usize,
-                        at_most: false,
-                        mask: scf.filter_mask,
-                    },
-                    (Some(_), None) => ChunkReadJob {
-                        addr: index_address,
-                        len: total_size.saturating_mul(2) as usize,
-                        at_most: true,
-                        mask: 0,
-                    },
-                    (None, _) => ChunkReadJob {
-                        addr: index_address,
-                        len: total_size as usize,
-                        at_most: false,
-                        mask: 0,
-                    },
-                };
-                // The lone chunk spans the whole dataset; place it respecting
-                // the dataset extent (Full) or the selection (Slice). This
-                // index type has no on-disk structure to decode — the layout
-                // message is the index — but it is still recorded through the
-                // one owner, so that its chunk's image reaches the cache by
-                // the same route every other index type's chunks do.
-                let index = self.decoded_chunk_index(pos, index_address, |_| {
-                    Ok(DecodedChunkIndex::new(
-                        vec![(job.addr, job.len as u64, job.mask)],
-                        vec![0u64; dims.len()],
-                    ))
-                })?;
-                place_chunk_jobs(
-                    &self.handle,
-                    vec![Some(job)],
-                    &index.coords,
-                    req,
-                    &geo,
-                    Some(&index.images),
-                    output,
-                )
-            }
-            data_layout::ChunkIndexType::Implicit => {
-                self.read_chunked_implicit(name, chunk_dims, index_address, req, output)
-            }
-            data_layout::ChunkIndexType::FixedArray => {
-                self.read_chunked_fixed_array(name, chunk_dims, index_address, req, output)
-            }
-            data_layout::ChunkIndexType::BTreeV2 => {
-                self.read_chunked_btree_v2(name, chunk_dims, index_address, req, output)
-            }
-            data_layout::ChunkIndexType::ExtensibleArray => {
-                let params = earray_params.ok_or_else(|| {
-                    crate::io::IoError::InvalidState("missing earray params".into())
-                })?;
-
-                if index_address == UNDEF_ADDR {
-                    // Unallocated: the empty plan makes the whole output fill.
-                    let geo = ChunkOutputGeometry {
-                        dims: &dims,
-                        chunk_dims,
-                        element_size,
-                    };
-                    return place_chunk_jobs(
-                        &self.handle,
-                        Vec::new(),
-                        &[],
-                        req,
-                        &geo,
-                        None,
-                        output,
-                    );
-                }
-
-                // Total slot count of the index grid. The maximum extent
-                // decides the multipliers (libhdf5 max_down_chunks); an
-                // unlimited dimension 0 is bounded by the current extent for
-                // this read — a slot beyond it (written before a shrink) is
-                // not visible.
-                let max_dims = self.datasets[pos].dataspace.max_dims.clone();
-
-                // Chunks are placed N-dimensionally: each slot decodes
-                // (row-major, against the index grid) to chunk-grid
-                // coordinates, so sub-frame chunks (a chunk smaller than a
-                // full frame) land correctly.
-                let rank = dims.len();
-                let index = self.decoded_chunk_index(pos, index_address, |reader| {
-                    let grid =
-                        crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
-                    let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
-                    let mut entries = reader.collect_ea_chunk_entries(
-                        index_address,
-                        params,
-                        &dims,
-                        max_dims.as_deref(),
-                        chunk_dims,
-                        element_size,
-                    )?;
-                    entries.truncate(std::cmp::min(chunks_total as usize, entries.len()));
-                    let coords = crate::io::chunk_grid::coords_table(
-                        &dims,
-                        max_dims.as_deref(),
-                        chunk_dims,
-                        entries.len(),
-                    )?;
-                    Ok(DecodedChunkIndex::new(entries, coords))
-                })?;
-                let chunk_entries = &index.entries;
-                let slot_coords = &index.coords;
-                let chunk_coords = |i: usize| -> &[u64] { &slot_coords[i * rank..(i + 1) * rank] };
-
-                // Build one read job per chunk (no I/O yet), then read +
-                // decompress them together (in parallel where positioned reads
-                // are race-free), then scatter serially. Filtered chunks record
-                // their exact on-disk size, so read exactly that; unfiltered
-                // chunks read at-most since the entry size can exceed the file
-                // tail. Skip conditions differ between the two, so build jobs
-                // per branch.
-                let jobs: Vec<Option<ChunkReadJob>> = if pipeline.is_some() {
-                    let file_size = self.handle.file_size()?;
-                    chunk_entries
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &(addr, nbytes, mask))| {
-                            if addr == UNDEF_ADDR
-                                || nbytes == 0
-                                || addr >= file_size
-                                || nbytes > file_size
-                                || !target.overlaps(chunk_coords(i), chunk_dims)
-                            {
-                                None
-                            } else {
-                                Some(ChunkReadJob {
-                                    addr,
-                                    len: nbytes as usize,
-                                    at_most: false,
-                                    mask,
-                                })
-                            }
-                        })
-                        .collect()
-                } else {
-                    chunk_entries
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &(addr, nbytes, _))| {
-                            if addr == UNDEF_ADDR || !target.overlaps(chunk_coords(i), chunk_dims) {
-                                None
-                            } else {
-                                Some(ChunkReadJob {
-                                    addr,
-                                    len: nbytes as usize,
-                                    at_most: true,
-                                    mask: 0,
-                                })
-                            }
-                        })
-                        .collect()
-                };
-
-                let geo = ChunkOutputGeometry {
-                    dims: &dims,
-                    chunk_dims,
-                    element_size,
-                };
-                place_chunk_jobs(
-                    &self.handle,
-                    jobs,
-                    slot_coords,
-                    req,
-                    &geo,
-                    Some(&index.images),
-                    output,
-                )
-            }
-        }
-    }
-
-    /// Collect a fixed-array dataset's per-chunk `(address, on-disk byte
-    /// count, filter mask)` entries, indexed by index-grid linear slot
-    /// ([`crate::io::chunk_grid`]). Empty when the index or its data block is
-    /// unallocated.
-    ///
-    /// Shared by the full/slice chunked reader
-    /// ([`read_chunked_fixed_array`](Self::read_chunked_fixed_array)) and the
-    /// direct single-chunk read
-    /// ([`read_chunk_raw_at`](Self::read_chunk_raw_at)), so the fixed-array
-    /// wire format has one decoder.
-    fn collect_fa_chunk_entries(
-        &mut self,
-        chunk_dims: &[u64],
-        ndims: usize,
-        element_size: u64,
-        index_address: u64,
-    ) -> IoResult<Vec<(u64, u64, u32)>> {
-        use crate::format::chunk_index::fixed_array::*;
-
-        if index_address == UNDEF_ADDR {
-            // Unallocated: no chunks recorded.
-            return Ok(Vec::new());
-        }
-
-        // Read FA header
-        let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.meta.ctx)?;
-
-        if fa_hdr.data_blk_addr == UNDEF_ADDR {
-            // Unallocated data block: no chunks recorded.
-            return Ok(Vec::new());
-        }
-
-        // The chunk shape (from the layout message) must match the
-        // dataspace rank; otherwise the chunk-grid indexing panics.
-        if chunk_dims.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "fixed-array dataset rank {} does not match chunk rank {}",
-                ndims,
-                chunk_dims.len()
-            )));
-        }
-
-        let is_filtered = fa_hdr.client_id == FA_CLIENT_FILT_CHUNK;
-        let sizeof_addr = self.meta.ctx.sizeof_addr as usize;
-        // chunk_size_len = element_size - sizeof_addr - filter_mask(4)
-        let chunk_size_len = if is_filtered {
-            (fa_hdr.element_size as usize)
-                .checked_sub(sizeof_addr + 4)
-                .ok_or_else(|| {
-                    crate::io::IoError::InvalidState(
-                        "fixed array filtered element_size too small".into(),
-                    )
-                })?
-        } else {
-            0
-        };
-        // The compressed-size field is read into a u64; reject a width that
-        // would overflow the read_size helper.
-        if chunk_size_len > 8 {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "fixed array filtered chunk-size width {chunk_size_len} exceeds 8 bytes"
-            )));
-        }
-
-        // Compute chunk byte size
-        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
-
-        // Bytes one element takes in the data block (or a page of it).
-        let elem_size = if is_filtered {
-            sizeof_addr + chunk_size_len + 4
-        } else {
-            sizeof_addr
-        };
-        // The element count is the header's claim, and everything below is
-        // sized from it: refuse one whose elements could not all be in the
-        // file before it sizes a reservation, a read, or a page count.
-        let file_size = self.handle.file_size()?;
-        let num_elmts = usize::try_from(fa_hdr.num_elmts)
-            .ok()
-            .filter(|&n| {
-                (n as u64)
-                    .checked_mul(elem_size as u64)
-                    .is_some_and(|bytes| bytes <= file_size)
-            })
-            .ok_or_else(|| {
-                crate::io::IoError::InvalidState(format!(
-                    "fixed array declares {} elements of {elem_size} bytes, more than the \
-                     {file_size}-byte file holds",
-                    fa_hdr.num_elmts
-                ))
-            })?;
-
-        // Collect per-chunk (address, compressed_size). compressed_size is the
-        // exact on-disk byte count for filtered chunks, or chunk_bytes when
-        // unfiltered.
-        // (chunk address, on-disk byte count, filter mask). The mask is the
-        // per-chunk filter mask for filtered chunks, 0 when unfiltered.
-        let mut chunk_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(num_elmts);
-
-        if fa_hdr.is_paged() {
-            // Paged data block: prefix (with page-init bitmap) followed by pages.
-            let npages = fa_hdr.npages();
-            let dblk_page_nelmts = fa_hdr.dblk_page_nelmts();
-            let prefix_len = 4 + 1 + 1 + sizeof_addr + (npages as usize).div_ceil(8) + 4;
-            let prefix_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, prefix_len)?;
-            let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.meta.ctx, npages)?;
-
-            // All pages have the same on-disk stride; only the last page holds
-            // fewer elements (libhdf5: dblk_page_size is constant).
-            let page_stride = dblk_page_nelmts as usize * elem_size + 4;
-            let pages_base = fa_hdr.data_blk_addr + prefix.prefix_size as u64;
-
-            for p in 0..npages as usize {
-                // Elements on this page (last page may be short).
-                let page_nelmts = if p + 1 == npages as usize {
-                    let rem = fa_hdr.num_elmts % dblk_page_nelmts;
-                    if rem == 0 {
-                        dblk_page_nelmts
-                    } else {
-                        rem
-                    }
-                } else {
-                    dblk_page_nelmts
-                } as usize;
-
-                if !prefix.page_initialized(p) {
-                    // Uninitialized page: all chunk entries are undefined.
-                    chunk_entries
-                        .extend(std::iter::repeat_n((UNDEF_ADDR, 0u64, 0u32), page_nelmts));
-                    continue;
-                }
-
-                let page_addr = pages_base + (p as u64) * page_stride as u64;
-                let page_size = page_nelmts * elem_size + 4;
-                let page_buf = self.handle.read_at_most(page_addr, page_size)?;
-
-                if is_filtered {
-                    let elems = decode_filtered_page(
-                        &page_buf,
-                        &self.meta.ctx,
-                        page_nelmts,
-                        chunk_size_len,
-                    )?;
-                    for e in elems {
-                        chunk_entries.push((e.address, e.chunk_size, e.filter_mask));
-                    }
-                } else {
-                    let addrs = decode_unfiltered_page(&page_buf, &self.meta.ctx, page_nelmts)?;
-                    for addr in addrs {
-                        chunk_entries.push((addr, chunk_bytes, 0));
-                    }
-                }
-            }
-        } else {
-            // Non-paged data block: all elements live inline in the data block.
-            let dblk_size = 4 + 1 + 1 + sizeof_addr + num_elmts * elem_size + 4;
-            let dblk_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, dblk_size)?;
-
-            if is_filtered {
-                let fa_dblk = FixedArrayDataBlock::decode_filtered(
-                    &dblk_buf,
-                    &self.meta.ctx,
-                    num_elmts,
-                    chunk_size_len,
-                )?;
-                for e in &fa_dblk.filtered_elements {
-                    chunk_entries.push((e.address, e.chunk_size, e.filter_mask));
-                }
-            } else {
-                let fa_dblk =
-                    FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &self.meta.ctx, num_elmts)?;
-                for &addr in &fa_dblk.elements {
-                    chunk_entries.push((addr, chunk_bytes, 0));
-                }
-            }
-        }
-
-        Ok(chunk_entries)
-    }
-
-    /// Read a dataset indexed by a fixed array.
-    ///
-    /// Scatters only; `output` must already be sized to the target extent.
-    /// Every byte of it is defined before this returns `Ok`: what no chunk
-    /// covers is filled with the tiled fill value by
-    /// [`place_chunk_jobs`], the one exit every branch here takes.
-    fn read_chunked_fixed_array(
-        &mut self,
-        name: &str,
-        chunk_dims: &[u64],
-        index_address: u64,
-        req: ChunkReadRequest,
-        output: &mut [u8],
-    ) -> IoResult<()> {
-        let ChunkReadRequest {
-            pipeline, target, ..
-        } = req;
-        let pos = self.dataset_position(name)?;
-        let info = &self.datasets[pos];
-        let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-        let max_dims = info.dataspace.max_dims.clone();
-        let ndims = dims.len();
-        let geo = ChunkOutputGeometry {
-            dims: &dims,
-            chunk_dims,
-            element_size,
-        };
-
-        // Index-grid slot -> chunk-grid coordinates (row-major, against the
-        // maximum extent — the array was sized from its chunk grid, so a slot
-        // beyond the current extent still decodes to its true position and
-        // then simply falls outside the read target). A zero chunk dimension
-        // from a malformed layout message is rejected inside.
-        let index = self.decoded_chunk_index(pos, index_address, |reader| {
-            let entries =
-                reader.collect_fa_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
-            let coords = crate::io::chunk_grid::coords_table(
-                &dims,
-                max_dims.as_deref(),
-                chunk_dims,
-                entries.len(),
-            )?;
-            Ok(DecodedChunkIndex::new(entries, coords))
+        let view = self.chunk_index_view(pos)?.ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!("dataset '{name}' is not chunked"))
         })?;
-        if index.entries.is_empty() {
-            // Unallocated index/data block: the empty plan makes the whole
-            // output fill.
-            return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, None, output);
-        }
-        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
-        let chunk_coords = |i: usize| -> &[u64] { &index.coords[i * ndims..(i + 1) * ndims] };
-
-        // Build one read job per chunk (no I/O yet). Filtered chunks carry
-        // their exact compressed size (read at-most, since a zero size means
-        // "unknown" and falls back to a generous estimate); unfiltered chunks
-        // read the exact chunk byte count. For a slice, chunks outside the
-        // selection become None and are never read.
-        let jobs: Vec<Option<ChunkReadJob>> = index
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(linear_idx, &(addr, comp_size, mask))| {
-                if addr == UNDEF_ADDR || !target.overlaps(chunk_coords(linear_idx), chunk_dims) {
-                    None
-                } else if pipeline.is_some() {
-                    let read_len = if comp_size > 0 {
-                        comp_size as usize
-                    } else {
-                        chunk_bytes as usize * 2
-                    };
-                    Some(ChunkReadJob {
-                        addr,
-                        len: read_len,
-                        at_most: true,
-                        mask,
-                    })
-                } else {
-                    Some(ChunkReadJob {
-                        addr,
-                        len: chunk_bytes as usize,
-                        at_most: false,
-                        mask,
-                    })
-                }
-            })
-            .collect();
-
-        // Read and place each chunk: the selected byte runs straight out of
-        // the file where that beats reading the chunk whole.
-        place_chunk_jobs(
-            &self.handle,
-            jobs,
-            &index.coords,
-            req,
-            &geo,
-            Some(&index.images),
-            output,
-        )
-    }
-
-    /// Read a dataset indexed by the implicit ("none") chunk index.
-    ///
-    /// There is no on-disk index structure at all (`H5Dnone.c`): every chunk
-    /// slot in the maximum-extent grid is allocated in one block at dataset
-    /// creation, so a chunk's address is purely arithmetic — `index_address +
-    /// slot * chunk_bytes`, where `slot` is its row-major position in the
-    /// same maximum-extent grid the fixed/extensible-array/v2-B-tree indexes
-    /// use (`H5D__chunk_set_info_real`'s `max_down_chunks`). This index type
-    /// is only ever selected for a fixed (non-unlimited) chunked dataset with
-    /// early allocation and no filters, so there is no per-chunk allocation
-    /// flag, compressed size, or filter mask to track.
-    ///
-    /// Scatters only; `output` must already be sized to the target extent.
-    /// Every byte of it is defined before this returns `Ok`: what no chunk
-    /// covers is filled with the tiled fill value by
-    /// [`place_chunk_jobs`], the one exit every branch here takes.
-    fn read_chunked_implicit(
-        &mut self,
-        name: &str,
-        chunk_dims: &[u64],
-        index_address: u64,
-        req: ChunkReadRequest,
-        output: &mut [u8],
-    ) -> IoResult<()> {
-        let target = req.target;
-        let pos = self.dataset_position(name)?;
-        let info = &self.datasets[pos];
-        let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-        let ndims = dims.len();
-
-        if index_address == UNDEF_ADDR {
-            // Unallocated: the empty plan makes the whole output fill.
-            let geo = ChunkOutputGeometry {
-                dims: &dims,
-                chunk_dims,
-                element_size,
-            };
-            return place_chunk_jobs(
-                &self.handle,
-                Vec::new(),
-                &[],
-                ChunkReadRequest {
-                    pipeline: None,
-                    ..req
-                },
-                &geo,
-                None,
-                output,
-            );
-        }
-
-        if chunk_dims.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "implicit-index dataset rank {} does not match chunk rank {}",
-                ndims,
-                chunk_dims.len()
-            )));
-        }
-
-        let max_dims = self.datasets[pos].dataspace.max_dims.clone();
-        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
-
-        // Every slot's coordinates and address are computed directly, not
-        // read from disk, so there is no "unallocated chunk" case here the
-        // way a sparse index has one: `at_most: false` because
-        // `H5D__none_idx_create` guarantees the whole block is present.
-        let index = self.decoded_chunk_index(pos, index_address, |_| {
-            let grid = crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
-            let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
-            let coords = crate::io::chunk_grid::coords_table(
-                &dims,
-                max_dims.as_deref(),
-                chunk_dims,
-                chunks_total as usize,
-            )?;
-            let entries = (0..chunks_total)
-                .map(|i| (index_address + i * chunk_bytes, chunk_bytes, 0))
-                .collect();
-            Ok(DecodedChunkIndex::new(entries, coords))
-        })?;
-        let slot_coords = &index.coords;
-
-        let jobs: Vec<Option<ChunkReadJob>> = index
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, &(addr, len, _))| {
-                let coords = &slot_coords[i * ndims..(i + 1) * ndims];
-                if !target.overlaps(coords, chunk_dims) {
-                    None
-                } else {
-                    Some(ChunkReadJob {
-                        addr,
-                        len: len as usize,
-                        at_most: false,
-                        mask: 0,
-                    })
-                }
-            })
-            .collect();
-
-        let geo = ChunkOutputGeometry {
-            dims: &dims,
-            chunk_dims,
-            element_size,
-        };
-        place_chunk_jobs(
-            &self.handle,
-            jobs,
-            slot_coords,
-            ChunkReadRequest {
+        // The implicit index is only ever chosen for an unfiltered dataset
+        // (`H5D__none_idx_create`): its chunks are raw whatever else the
+        // header claims.
+        let req = match view.kind() {
+            IndexKind::Implicit => ChunkReadRequest {
                 pipeline: None,
                 ..req
             },
+            _ => req,
+        };
+        let element_size = self.datasets[pos].datatype.element_size() as u64;
+        let dims = self.datasets[pos].dataspace.dims.clone();
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims: view.chunk_dims(),
+            element_size,
+        };
+        if view.index_address() == UNDEF_ADDR || output.is_empty() {
+            // Nothing stored or nothing wanted: the empty plan makes the
+            // whole output fill.
+            return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, None, output);
+        }
+
+        let cache = self.datasets.chunk_cache_mut(pos, view.index_address());
+        let ranges = req.target.chunk_ranges(&dims, view.chunk_dims());
+        let mut jobs = Vec::new();
+        let mut coords = Vec::new();
+        if ranges.iter().all(|r| !r.is_empty()) {
+            // Row-major over the overlapping chunks, the order a full read
+            // would meet them in the file.
+            let mut at: Vec<u64> = ranges.iter().map(|r| r.start).collect();
+            'chunks: loop {
+                if let Some(rec) = chunk_lookup::find(&self.handle, &view, &mut cache.blocks, &at)?
+                {
+                    if let Some(job) = chunk_read_job(&view, rec, req.pipeline.is_some())? {
+                        jobs.push(Some(job));
+                        coords.extend_from_slice(&at);
+                    }
+                }
+                for d in (0..at.len()).rev() {
+                    at[d] += 1;
+                    if at[d] < ranges[d].end {
+                        continue 'chunks;
+                    }
+                    at[d] = ranges[d].start;
+                }
+                break;
+            }
+        }
+        place_chunk_jobs(
+            &self.handle,
+            jobs,
+            &coords,
+            req,
             &geo,
-            Some(&index.images),
+            Some(&cache.images),
             output,
         )
     }
 
-    /// Collect a v2-B-tree-indexed dataset's per-chunk `(address, read
-    /// size, scaled chunk-grid offsets, filter mask)` entries, walking the
-    /// tree once. `read_size` is the compressed size for a filtered chunk,
-    /// the full chunk size otherwise. Empty when the index has no records.
-    ///
-    /// Shared by the full/slice chunked reader
-    /// ([`read_chunked_btree_v2`](Self::read_chunked_btree_v2)) and the
-    /// direct single-chunk read
-    /// ([`read_chunk_raw_at`](Self::read_chunk_raw_at)), so the v2 B-tree
-    /// record format has one decoder.
-    fn collect_bt2_chunk_entries(
-        &mut self,
-        chunk_dims: &[u64],
-        ndims: usize,
-        element_size: u64,
-        index_address: u64,
-    ) -> IoResult<Vec<Bt2ChunkEntry>> {
-        use crate::format::chunk_index::btree_v2::*;
-
-        if index_address == UNDEF_ADDR {
-            // Unallocated: no chunks recorded.
-            return Ok(Vec::new());
-        }
-
-        // Read BT2 header
-        let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.meta.ctx)?;
-
-        if bt2_hdr.root_node_addr == UNDEF_ADDR || bt2_hdr.total_num_records == 0 {
-            // No records.
-            return Ok(Vec::new());
-        }
-
-        // Walk the B-tree to any depth, collecting every record's raw bytes
-        // from the internal nodes and leaves.
-        let ctx = self.meta.ctx;
-        let record_bytes = collect_btree_v2_records(
-            &bt2_hdr,
-            &ctx,
-            &mut HandleBlockReader {
-                handle: &mut self.handle,
-            },
-        )?;
-        let total_records = if bt2_hdr.record_size > 0 {
-            record_bytes.len() / bt2_hdr.record_size as usize
-        } else {
-            0
-        };
-
-        // Decode records
-        // Compute chunk byte size
-        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
-
-        // Unify filtered and unfiltered records into (address, read_size,
-        // scaled offsets, filter mask). read_size is the compressed size for
-        // filtered chunks, the full chunk size otherwise; the mask is 0 for
-        // unfiltered records.
-        let entries: Vec<Bt2ChunkEntry> = if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
-            Bt2ChunkIndex::decode_unfiltered_records(
-                &record_bytes,
-                total_records,
-                ndims,
-                &self.meta.ctx,
-            )?
-            .into_iter()
-            .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets, 0))
-            .collect()
-        } else {
-            Bt2ChunkIndex::decode_filtered_records(
-                &record_bytes,
-                total_records,
-                ndims,
-                bt2_hdr.record_size,
-                &self.meta.ctx,
-            )?
-            .into_iter()
-            .map(|r| {
-                (
-                    r.chunk_address,
-                    r.chunk_size as usize,
-                    r.scaled_offsets,
-                    r.filter_mask,
-                )
-            })
-            .collect()
-        };
-
-        Ok(entries)
-    }
-
-    /// Read a dataset indexed by a B-tree v2.
-    ///
-    /// Scatters only; `output` must already be sized to the target extent.
-    /// Every byte of it is defined before this returns `Ok`: what no chunk
-    /// covers is filled with the tiled fill value by
-    /// [`place_chunk_jobs`], the one exit every branch here takes.
-    fn read_chunked_btree_v2(
-        &mut self,
-        name: &str,
-        chunk_dims: &[u64],
-        index_address: u64,
-        req: ChunkReadRequest,
-        output: &mut [u8],
-    ) -> IoResult<()> {
-        let target = req.target;
-        let pos = self.dataset_position(name)?;
+    /// The chunk index of the dataset at `pos`, as its catalog entry describes
+    /// it; `None` when the dataset is not chunked.
+    fn chunk_index_view(&self, pos: usize) -> IoResult<Option<ChunkIndexView>> {
         let info = &self.datasets[pos];
-        let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-        let ndims = dims.len();
-        let geo = ChunkOutputGeometry {
-            dims: &dims,
-            chunk_dims,
-            element_size,
-        };
-
-        // A record carries its own scaled (chunk-grid) offsets, always `ndims`
-        // of them, so flattening them into the coordinate table loses nothing.
-        let index = self.decoded_chunk_index(pos, index_address, |reader| {
-            let records =
-                reader.collect_bt2_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
-            let mut entries = Vec::with_capacity(records.len());
-            let mut coords = Vec::with_capacity(records.len() * ndims);
-            for (addr, read_size, scaled, mask) in records {
-                entries.push((addr, read_size as u64, mask));
-                coords.extend_from_slice(&scaled);
-            }
-            Ok(DecodedChunkIndex::new(entries, coords))
-        })?;
-        if index.entries.is_empty() {
-            // Unallocated index or no records: the empty plan makes the whole
-            // output fill.
-            return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, None, output);
-        }
-
-        // Build one read job per chunk (no I/O yet), placing each by its
-        // scaled offsets. For a slice, chunks outside the selection become
-        // None and are never read.
-        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(index.entries.len());
-        for (i, &(addr, read_size, mask)) in index.entries.iter().enumerate() {
-            let scaled = &index.coords[i * ndims..(i + 1) * ndims];
-            if addr == UNDEF_ADDR || read_size == 0 || !target.overlaps(scaled, chunk_dims) {
-                jobs.push(None);
-            } else {
-                jobs.push(Some(ChunkReadJob {
-                    addr,
-                    len: read_size as usize,
-                    at_most: false,
-                    mask,
-                }));
-            }
-        }
-
-        // Read and place each chunk N-dimensionally by its scaled offsets.
-        place_chunk_jobs(
-            &self.handle,
-            jobs,
-            &index.coords,
-            req,
-            &geo,
-            Some(&index.images),
-            output,
+        ChunkIndexView::new(
+            &info.layout,
+            &info.dataspace.dims,
+            info.dataspace.max_dims.as_deref(),
+            info.datatype.element_size() as u64,
+            &self.meta,
+            self.handle.file_size()?,
         )
-    }
-
-    /// Read a chunked dataset indexed by a version-1 B-tree (layout
-    /// message version 3, class 2 "chunked").
-    ///
-    /// `chunk_dims` excludes the trailing element-size dimension.
-    ///
-    /// Scatters only; `output` must already be sized to the target extent.
-    /// Every byte of it is defined before this returns `Ok`: what no chunk
-    /// covers is filled with the tiled fill value by
-    /// [`place_chunk_jobs`], the one exit every branch here takes.
-    fn read_chunked_btree_v1(
-        &mut self,
-        name: &str,
-        chunk_dims: &[u64],
-        b_tree_address: u64,
-        req: ChunkReadRequest,
-        output: &mut [u8],
-    ) -> IoResult<()> {
-        let ChunkReadRequest {
-            pipeline, target, ..
-        } = req;
-        let pos = self.dataset_position(name)?;
-        let info = &self.datasets[pos];
-        let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-        let ndims = dims.len();
-
-        // The chunk shape must match the dataspace rank or the chunk-grid
-        // indexing below panics.
-        if chunk_dims.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "B-tree-v1 dataset rank {} does not match chunk rank {}",
-                ndims,
-                chunk_dims.len()
-            )));
-        }
-
-        let total_size: u64 = saturating_byte_len(&dims, element_size);
-        if b_tree_address == UNDEF_ADDR || total_size == 0 {
-            // Unallocated: the empty plan makes the whole output fill.
-            let geo = ChunkOutputGeometry {
-                dims: &dims,
-                chunk_dims,
-                element_size,
-            };
-            return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, None, output);
-        }
-
-        // Walk the B-tree, collecting every leaf entry as
-        // (element_offsets, chunk_address, chunk_size, filter_mask), and turn
-        // each key's element offsets into chunk-grid coordinates. The keys
-        // carry rank + 1 offsets; the trailing element-size dimension offset
-        // is always 0 and is dropped.
-        let file_size = self.handle.file_size()?;
-        let index = self.decoded_chunk_index(pos, b_tree_address, |reader| {
-            let mut leaves: Vec<(Vec<u64>, u64, u32, u32)> = Vec::new();
-            reader.collect_btree_v1_chunks(b_tree_address, ndims, file_size, 0, &mut leaves)?;
-            let mut entries = Vec::with_capacity(leaves.len());
-            let mut coords = Vec::with_capacity(leaves.len() * ndims);
-            for (offsets, addr, chunk_size, mask) in leaves {
-                for (d, &cd) in chunk_dims.iter().enumerate().take(ndims) {
-                    coords.push(offsets[d].checked_div(cd).unwrap_or(0));
-                }
-                entries.push((addr, chunk_size as u64, mask));
-            }
-            Ok(DecodedChunkIndex::new(entries, coords))
-        })?;
-
-        // The uncompressed byte size of a full chunk.
-        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
-
-        // Build one read job per chunk (no I/O yet), placing each by its
-        // scaled coordinates.
-        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(index.entries.len());
-        for (i, &(addr, chunk_size, mask)) in index.entries.iter().enumerate() {
-            let skip = addr == UNDEF_ADDR
-                || chunk_size == 0
-                || addr >= file_size
-                || chunk_size > file_size
-                || !target.overlaps(&index.coords[i * ndims..(i + 1) * ndims], chunk_dims);
-            jobs.push(if skip {
-                None
-            } else {
-                Some(ChunkReadJob {
-                    addr,
-                    len: chunk_size as usize,
-                    at_most: false,
-                    mask,
-                })
-            });
-        }
-
-        // Read and place each chunk N-dimensionally by its scaled offsets.
-        let geo = ChunkOutputGeometry {
-            dims: &dims,
-            chunk_dims,
-            element_size,
-        };
-        place_chunk_jobs(
-            &self.handle,
-            jobs,
-            &index.coords,
-            req,
-            &geo,
-            Some(&index.images),
-            output,
-        )?;
-
-        // libhdf5 stores raw byte sizes; verify the uncompressed chunk
-        // size is consistent for unfiltered datasets so a corrupt index
-        // surfaces instead of silently producing garbage.
-        if pipeline.is_none() {
-            for &(addr, chunk_size, _) in &index.entries {
-                if addr != UNDEF_ADDR && chunk_size != chunk_bytes && chunk_size != 0 {
-                    return Err(crate::io::IoError::InvalidState(format!(
-                        "chunk B-tree v1: unfiltered chunk size {} != expected {}",
-                        chunk_size, chunk_bytes
-                    )));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Recursively walk a version-1 raw-data-chunk B-tree, collecting every
-    /// leaf entry as `(element_offsets, chunk_address, chunk_size,
-    /// filter_mask)`.
-    ///
-    /// `rank` is the chunk rank excluding the trailing element-size
-    /// dimension. Recursion is bounded by the node level read from disk:
-    /// each recursive step descends to a strictly lower level, and the
-    /// `depth` counter caps the descent at the 1-byte level field's range.
-    fn collect_btree_v1_chunks(
-        &mut self,
-        addr: u64,
-        rank: usize,
-        file_size: u64,
-        depth: u32,
-        out: &mut Vec<(Vec<u64>, u64, u32, u32)>,
-    ) -> IoResult<()> {
-        // A v1 B-tree node level fits in one byte, so the tree can be at
-        // most 256 levels deep; this also stops cyclic/corrupt indices.
-        if depth > 256 {
-            return Err(crate::io::IoError::InvalidState(
-                "chunk B-tree v1 exceeds maximum depth".into(),
-            ));
-        }
-        if addr == UNDEF_ADDR || addr >= file_size {
-            return Ok(());
-        }
-
-        // A node is a fixed-size record: the header (8 + 2*sizeof_addr) plus
-        // `2 * chunk_internal_k` interleaved keys/children.
-        let sa = self.meta.ctx.sizeof_addr as usize;
-        let node_size = self.meta.btree.chunk_btree_node_size(sa, rank);
-        let buf = self.handle.read_at_most(addr, node_size)?;
-        let node = ChunkBTreeV1Node::decode(&buf, sa, rank, self.meta.btree.chunk_max_entries())?;
-
-        if node.level == 0 {
-            // Leaf node: each child points at chunk data.
-            for (i, &child_addr) in node.children.iter().enumerate() {
-                let key = &node.keys[i];
-                out.push((
-                    key.offsets[..rank].to_vec(),
-                    child_addr,
-                    key.chunk_size,
-                    key.filter_mask,
-                ));
-            }
-        } else {
-            // Internal node: each child points at a sub-TREE node one
-            // level below. `node.level` is read from disk and decreases on
-            // every descent, so it also bounds the recursion.
-            let children: Vec<u64> = node.children.clone();
-            for child_addr in children {
-                if child_addr == UNDEF_ADDR || child_addr >= file_size {
-                    continue;
-                }
-                self.collect_btree_v1_chunks(child_addr, rank, file_size, depth + 1, out)?;
-            }
-        }
-        Ok(())
     }
 
     /// Read variable-length string data from a dataset.
@@ -6748,215 +5881,6 @@ impl Hdf5Reader {
         }
 
         Ok(items)
-    }
-
-    /// Collect chunk (address, size) entries from an EA index.
-    /// Returns a vector indexed by chunk linear index.
-    fn collect_ea_chunk_entries(
-        &mut self,
-        index_address: u64,
-        params: &data_layout::EarrayParams,
-        dims: &[u64],
-        max_dims: Option<&[u64]>,
-        chunk_dims: &[u64],
-        element_size: u64,
-    ) -> IoResult<Vec<(u64, u64, u32)>> {
-        use crate::format::chunk_index::extensible_array::{self as ea, *};
-
-        if index_address == UNDEF_ADDR {
-            return Ok(vec![]);
-        }
-        let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.meta.ctx)?;
-        if ea_hdr.idx_blk_addr == UNDEF_ADDR {
-            return Ok(vec![]);
-        }
-
-        // Slot count of the index grid, bounding the collection walk. The
-        // maximum extent decides the multipliers (sub-frame chunks make this
-        // larger than the dim-0 chunk count alone); the unlimited dimension 0
-        // is bounded by the current extent.
-        let chunks_dim0: usize = crate::io::chunk_grid::index_grid(dims, max_dims, chunk_dims)?
-            .iter()
-            .fold(1usize, |acc, &n| acc.saturating_mul(n as usize));
-        let geo = EaGeometry::new(
-            params.idx_blk_elmts,
-            params.data_blk_min_elmts,
-            params.sup_blk_min_data_ptrs,
-            params.max_nelmts_bits,
-            params.max_dblk_page_nelmts_bits,
-        )?;
-        let chunk_bytes = saturating_byte_len(chunk_dims, element_size);
-        let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
-        let chunk_size_len = if is_filtered {
-            ea_hdr.raw_elmt_size - self.meta.ctx.sizeof_addr - 4
-        } else {
-            0
-        };
-        let max_nelmts_bits = params.max_nelmts_bits;
-        // Each entry is (chunk address, on-disk byte count, filter mask). The
-        // mask is the per-chunk filter mask for filtered datasets (0 for an
-        // unfiltered index, where it is meaningless).
-        let mut entries: Vec<(u64, u64, u32)> = Vec::new();
-
-        // Read the index block: direct elements + the data-block / super-block
-        // address arrays (the address arrays are filter-agnostic).
-        let (dblk_addrs, sblk_addrs): (Vec<u64>, Vec<u64>) = if is_filtered {
-            let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
-            let fiblk = ea::FilteredIndexBlock::decode(
-                &buf,
-                &self.meta.ctx,
-                params.idx_blk_elmts as usize,
-                geo.ndblk_addrs,
-                geo.nsblk_addrs,
-                chunk_size_len,
-            )?;
-            for e in &fiblk.elements {
-                entries.push((e.addr, e.nbytes, e.filter_mask));
-            }
-            (fiblk.dblk_addrs, fiblk.sblk_addrs)
-        } else {
-            let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
-            let iblk = ExtensibleArrayIndexBlock::decode(
-                &buf,
-                &self.meta.ctx,
-                params.idx_blk_elmts as usize,
-                geo.ndblk_addrs,
-                geo.nsblk_addrs,
-            )?;
-            for &addr in &iblk.elements {
-                entries.push((addr, chunk_bytes, 0));
-            }
-            (iblk.dblk_addrs, iblk.sblk_addrs)
-        };
-
-        // Walk super blocks in order, collecting each data block's entries.
-        let sa = self.meta.ctx.sizeof_addr as usize;
-        let raw_elmt_size = if is_filtered {
-            ea::FilteredChunkEntry::raw_size(self.meta.ctx.sizeof_addr, chunk_size_len) as usize
-        } else {
-            sa
-        };
-        'outer: for (u, s) in geo.sblk.iter().enumerate() {
-            if entries.len() >= chunks_dim0 {
-                break;
-            }
-            let dblk_nelmts = s.dblk_nelmts as usize;
-            let paged = geo.is_sblk_paged(u);
-
-            // This super block's data-block addresses, plus its page-init
-            // bitmap region (empty unless the super block is paged).
-            let (this_dblk_addrs, page_init): (Vec<u64>, Vec<u8>) = if u < geo.iblock_nsblks {
-                let start = s.start_dblk as usize;
-                (
-                    (0..s.ndblks as usize)
-                        .map(|d| dblk_addrs.get(start + d).copied().unwrap_or(UNDEF_ADDR))
-                        .collect(),
-                    Vec::new(),
-                )
-            } else {
-                let sblk_addr = sblk_addrs
-                    .get(u - geo.iblock_nsblks)
-                    .copied()
-                    .unwrap_or(UNDEF_ADDR);
-                if sblk_addr == UNDEF_ADDR {
-                    (vec![UNDEF_ADDR; s.ndblks as usize], Vec::new())
-                } else {
-                    let page_init_total = if paged {
-                        s.ndblks as usize * geo.dblk_page_init_size(u)
-                    } else {
-                        0
-                    };
-                    // Size the read from the super block's geometry rather
-                    // than a fixed cap: signature+version+class+header_addr
-                    // + block_offset(<=8) + page-init bitmaps
-                    // + ndblks data-block addresses + checksum.
-                    let sblk_size =
-                        4 + 1 + 1 + sa + 8 + page_init_total + s.ndblks as usize * sa + 4;
-                    let buf = self.handle.read_at_most(sblk_addr, sblk_size)?;
-                    let sb = ExtensibleArraySuperBlock::decode(
-                        &buf,
-                        &self.meta.ctx,
-                        max_nelmts_bits,
-                        s.ndblks as usize,
-                        page_init_total,
-                    )?;
-                    (sb.dblk_addrs, sb.page_init)
-                }
-            };
-
-            let npages = geo.npages(u) as usize;
-            let page_size = geo.dblk_page_size(raw_elmt_size);
-            let prefix = geo.dblk_prefix_size(self.meta.ctx.sizeof_addr, max_nelmts_bits);
-
-            for (d, &dblk_addr) in this_dblk_addrs.iter().enumerate() {
-                if dblk_addr == UNDEF_ADDR {
-                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0, 0), dblk_nelmts));
-                } else if paged {
-                    // Paged data block: only a prefix lives at `dblk_addr`;
-                    // the elements live in `npages` page structures that
-                    // follow it on disk. The super block's page-init bitmap
-                    // is one flat MSB-first bitmap (H5VM bit ops) indexed by
-                    // `dblk_idx * npages + page_idx` (H5EA.c), not a series
-                    // of per-data-block sub-bitmaps.
-                    for p in 0..npages {
-                        let bit = d * npages + p;
-                        let initialized = page_init[bit / 8] & (0x80u8 >> (bit % 8)) != 0;
-                        if !initialized {
-                            entries.extend(std::iter::repeat_n(
-                                (UNDEF_ADDR, 0, 0),
-                                geo.dblk_page_nelmts as usize,
-                            ));
-                            continue;
-                        }
-                        let page_addr = dblk_addr + prefix as u64 + (p as u64) * page_size as u64;
-                        let page = self.handle.read_at(page_addr, page_size)?;
-                        for k in 0..geo.dblk_page_nelmts as usize {
-                            let off = k * raw_elmt_size;
-                            if is_filtered {
-                                let e = ea::FilteredChunkEntry::decode(
-                                    &page[off..],
-                                    sa,
-                                    chunk_size_len as usize,
-                                );
-                                entries.push((e.addr, e.nbytes, e.filter_mask));
-                            } else {
-                                entries.push((read_addr(&page[off..], sa), chunk_bytes, 0));
-                            }
-                        }
-                    }
-                } else if is_filtered {
-                    let dblk_size = prefix + dblk_nelmts * raw_elmt_size;
-                    let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
-                    let dblk = ea::FilteredDataBlock::decode(
-                        &buf,
-                        &self.meta.ctx,
-                        max_nelmts_bits,
-                        dblk_nelmts,
-                        chunk_size_len,
-                    )?;
-                    for e in &dblk.elements {
-                        entries.push((e.addr, e.nbytes, e.filter_mask));
-                    }
-                } else {
-                    let dblk_size = prefix + dblk_nelmts * raw_elmt_size;
-                    let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
-                    let dblk = ExtensibleArrayDataBlock::decode(
-                        &buf,
-                        &self.meta.ctx,
-                        max_nelmts_bits,
-                        dblk_nelmts,
-                    )?;
-                    for &addr in &dblk.elements {
-                        entries.push((addr, chunk_bytes, 0));
-                    }
-                }
-                if entries.len() >= chunks_dim0 {
-                    break 'outer;
-                }
-            }
-        }
-        Ok(entries)
     }
 
     /// Read a slice (hyperslab) of a dataset, whatever its layout.
@@ -7164,51 +6088,14 @@ impl Hdf5Reader {
                     },
                 )?;
             }
-            DataLayoutMessage::ChunkedV3 {
-                chunk_dims,
-                b_tree_address,
-            } => {
-                // Walk the v1 B-tree index reading only chunks that overlap the
-                // selection, scattering each chunk∩selection into the slice
-                // buffer; whatever no chunk covers is filled there. The
-                // unconverted read keeps the post-filter conversion to exactly
-                // once, in the wrappers.
-                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
-                self.read_chunked_btree_v1(
+            DataLayoutMessage::ChunkedV3 { .. } | DataLayoutMessage::ChunkedV4 { .. } => {
+                // Only the chunks overlapping the selection are looked up and
+                // read, and only their intersection with it is scattered into
+                // the slice buffer; whatever no chunk covers is filled there.
+                // The unconverted read keeps the post-filter conversion to
+                // exactly once, in the wrappers.
+                self.read_chunked(
                     name,
-                    real_chunk_dims,
-                    *b_tree_address,
-                    ChunkReadRequest {
-                        pipeline: pipeline.as_ref(),
-                        target: ChunkTarget::Slice { starts, counts },
-                        fill_value: fill_value.as_deref(),
-                        dst,
-                    },
-                    out,
-                )?;
-            }
-            DataLayoutMessage::ChunkedV4 {
-                chunk_dims,
-                index_address,
-                index_type,
-                earray_params,
-                single_chunk_filter,
-                ..
-            } => {
-                // Same selection-aware chunk read for every v4 index kind
-                // (single chunk, fixed/extensible array, B-tree v2): only
-                // overlapping chunks are read and only their intersection with
-                // the selection is scattered into the slice output.
-                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
-                self.read_chunked_v4(
-                    name,
-                    real_chunk_dims,
-                    ChunkIndexDesc {
-                        index_type: *index_type,
-                        index_address: *index_address,
-                        earray_params: earray_params.as_ref(),
-                        single_chunk_filter: *single_chunk_filter,
-                    },
                     ChunkReadRequest {
                         pipeline: pipeline.as_ref(),
                         target: ChunkTarget::Slice { starts, counts },
@@ -7457,187 +6344,51 @@ impl Hdf5Reader {
     /// pipeline itself (honoring the returned mask, which marks any filter
     /// this particular chunk skipped) if it wants decoded data.
     ///
-    /// Resolved through whichever chunk index the dataset uses, reusing the
-    /// same per-index decoders the full/slice chunked reader walks
-    /// ([`collect_fa_chunk_entries`](Self::collect_fa_chunk_entries),
-    /// [`collect_ea_chunk_entries`](Self::collect_ea_chunk_entries),
-    /// [`collect_bt2_chunk_entries`](Self::collect_bt2_chunk_entries),
-    /// [`collect_btree_v1_chunks`](Self::collect_btree_v1_chunks)) rather
-    /// than a new index walker.
+    /// Resolved through the same per-chunk index lookup the decoded reads use
+    /// ([`chunk_lookup::find`]), so it decodes only the index blocks on the
+    /// way to this one chunk.
     ///
-    /// `Err` when the dataset is not chunked, `chunk_coords` has the wrong
-    /// rank, or the chunk at those coordinates has never been written.
+    /// `Ok(None)` when no chunk is there yet: the index holds none at those
+    /// coordinates, or they lie beyond the extent last read (a SWMR reader's
+    /// extent at its last refresh) though inside the maximum shape. `Err`
+    /// when the dataset is not chunked or `chunk_coords` has the wrong rank or
+    /// lies outside the maximum shape's chunk grid.
+    pub fn read_chunk_raw(
+        &mut self,
+        name: &str,
+        chunk_coords: &[u64],
+    ) -> IoResult<Option<(Vec<u8>, u32)>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_chunk_raw(&path, chunk_coords);
+        }
+        let pos = self.dataset_position(name)?;
+        let view = self.chunk_index_view(pos)?.ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!("dataset '{name}' is not chunked"))
+        })?;
+        let cache = self.datasets.chunk_cache_mut(pos, view.index_address());
+        let Some(rec) = chunk_lookup::find(&self.handle, &view, &mut cache.blocks, chunk_coords)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            self.handle.read_at(rec.addr, rec.nbytes as usize)?,
+            rec.mask,
+        )))
+    }
+
+    /// [`read_chunk_raw`](Self::read_chunk_raw), with a chunk that is not
+    /// there an `Err` rather than `None`.
     pub fn read_chunk_raw_at(
         &mut self,
         name: &str,
         chunk_coords: &[u64],
     ) -> IoResult<(Vec<u8>, u32)> {
-        if self.external_edge(name).is_some() {
-            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_chunk_raw_at(&path, chunk_coords);
-        }
-        let info = self
-            .dataset_info_local(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        let dims = info.dataspace.dims.clone();
-        let max_dims = info.dataspace.max_dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-        let layout = info.layout.clone();
-        let ndims = dims.len();
-
-        if chunk_coords.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "chunk_coords has {} entries but the dataset has {} dimensions",
-                chunk_coords.len(),
-                ndims
-            )));
-        }
-
-        let not_written = || {
+        self.read_chunk_raw(name, chunk_coords)?.ok_or_else(|| {
             crate::io::IoError::InvalidState(format!(
                 "chunk at coordinates {chunk_coords:?} has not been written"
             ))
-        };
-
-        match &layout {
-            DataLayoutMessage::ChunkedV3 {
-                chunk_dims,
-                b_tree_address,
-            } => {
-                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
-                if *b_tree_address == UNDEF_ADDR {
-                    return Err(not_written());
-                }
-                let file_size = self.handle.file_size()?;
-                let mut entries = Vec::new();
-                self.collect_btree_v1_chunks(*b_tree_address, ndims, file_size, 0, &mut entries)?;
-                for (offsets, addr, chunk_size, mask) in &entries {
-                    if *addr == UNDEF_ADDR {
-                        continue;
-                    }
-                    let mut scaled = Vec::with_capacity(ndims);
-                    for d in 0..ndims {
-                        scaled.push(offsets[d].checked_div(real_chunk_dims[d]).unwrap_or(0));
-                    }
-                    if scaled.as_slice() == chunk_coords {
-                        return Ok((self.handle.read_at(*addr, *chunk_size as usize)?, *mask));
-                    }
-                }
-                Err(not_written())
-            }
-            DataLayoutMessage::ChunkedV4 {
-                chunk_dims,
-                index_type,
-                index_address,
-                earray_params,
-                single_chunk_filter,
-                ..
-            } => {
-                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
-                match index_type {
-                    data_layout::ChunkIndexType::SingleChunk => {
-                        if chunk_coords.iter().any(|&c| c != 0) {
-                            return Err(crate::io::IoError::InvalidState(format!(
-                                "chunk coordinates {chunk_coords:?} are outside the chunk \
-                                 grid (0..1): this dataset has a single-chunk index"
-                            )));
-                        }
-                        if *index_address == UNDEF_ADDR {
-                            return Err(not_written());
-                        }
-                        match single_chunk_filter {
-                            Some(scf) => Ok((
-                                self.handle.read_at(*index_address, scf.nbytes as usize)?,
-                                scf.filter_mask,
-                            )),
-                            None => {
-                                let total = saturating_byte_len(&dims, element_size);
-                                Ok((self.handle.read_at(*index_address, total as usize)?, 0))
-                            }
-                        }
-                    }
-                    data_layout::ChunkIndexType::Implicit => {
-                        if *index_address == UNDEF_ADDR {
-                            return Err(not_written());
-                        }
-                        let linear = crate::io::chunk_grid::linear_index(
-                            &dims,
-                            max_dims.as_deref(),
-                            real_chunk_dims,
-                            chunk_coords,
-                        )?;
-                        let chunk_bytes = saturating_byte_len(real_chunk_dims, element_size);
-                        let addr = index_address.saturating_add(linear.saturating_mul(chunk_bytes));
-                        Ok((self.handle.read_at(addr, chunk_bytes as usize)?, 0))
-                    }
-                    data_layout::ChunkIndexType::FixedArray => {
-                        let linear = crate::io::chunk_grid::linear_index(
-                            &dims,
-                            max_dims.as_deref(),
-                            real_chunk_dims,
-                            chunk_coords,
-                        )?;
-                        let entries = self.collect_fa_chunk_entries(
-                            real_chunk_dims,
-                            ndims,
-                            element_size,
-                            *index_address,
-                        )?;
-                        match entries.get(linear as usize) {
-                            Some(&(addr, size, mask)) if addr != UNDEF_ADDR => {
-                                Ok((self.handle.read_at(addr, size as usize)?, mask))
-                            }
-                            _ => Err(not_written()),
-                        }
-                    }
-                    data_layout::ChunkIndexType::ExtensibleArray => {
-                        let params = earray_params.as_ref().ok_or_else(|| {
-                            crate::io::IoError::InvalidState("missing earray params".into())
-                        })?;
-                        let linear = crate::io::chunk_grid::linear_index(
-                            &dims,
-                            max_dims.as_deref(),
-                            real_chunk_dims,
-                            chunk_coords,
-                        )?;
-                        let entries = self.collect_ea_chunk_entries(
-                            *index_address,
-                            params,
-                            &dims,
-                            max_dims.as_deref(),
-                            real_chunk_dims,
-                            element_size,
-                        )?;
-                        match entries.get(linear as usize) {
-                            Some(&(addr, size, mask)) if addr != UNDEF_ADDR => {
-                                Ok((self.handle.read_at(addr, size as usize)?, mask))
-                            }
-                            _ => Err(not_written()),
-                        }
-                    }
-                    data_layout::ChunkIndexType::BTreeV2 => {
-                        let entries = self.collect_bt2_chunk_entries(
-                            real_chunk_dims,
-                            ndims,
-                            element_size,
-                            *index_address,
-                        )?;
-                        match entries
-                            .iter()
-                            .find(|(_, _, scaled, _)| scaled.as_slice() == chunk_coords)
-                        {
-                            Some(&(addr, size, _, mask)) if addr != UNDEF_ADDR => {
-                                Ok((self.handle.read_at(addr, size)?, mask))
-                            }
-                            _ => Err(not_written()),
-                        }
-                    }
-                }
-            }
-            _ => Err(crate::io::IoError::InvalidState(
-                "read_chunk_raw_at is only for chunked datasets".into(),
-            )),
-        }
+        })
     }
 }
 
@@ -7834,8 +6585,11 @@ pub(crate) fn collect_object_attributes(
                     } else {
                         AttributeStorage::Compact
                     };
-                    let mut br = HandleBlockReader { handle };
-                    match crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br) {
+                    let dense = handle.load_metadata(|| {
+                        let mut br = HandleBlockReader { handle };
+                        crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br)
+                    });
+                    match dense {
                         Ok(dense) => attrs.entries.extend(dense),
                         Err(e) => attrs
                             .mark_incomplete(format!("dense attribute storage is unreadable: {e}")),
@@ -7898,14 +6652,13 @@ mod tests {
         (path, handle)
     }
 
-    /// The chunk-index cache. A decoded index MUST describe the file exactly
-    /// as the catalog entry beside it does, and MUST NOT be served for an
-    /// index address other than the one it was decoded from.
-    /// [`Hdf5Reader::decoded_chunk_index`] is the single owner — the only
-    /// reader and writer of the cache — and `DatasetTable` is what keeps a
-    /// stale index unreachable: `entry_mut` is the one way to a mutable
-    /// entry and it drops that entry's index first, where the `IndexMut` it
-    /// replaced would have left it standing.
+    /// The chunk-index cache. Blocks decoded from an index MUST describe the
+    /// file exactly as the catalog entry beside them does, and MUST NOT be
+    /// served for an index address other than the one they were read from.
+    /// `DatasetTable::chunk_cache_mut` is the only way to the cache, and
+    /// `DatasetTable` is what keeps a stale one unreachable: `entry_mut` is
+    /// the one way to a mutable entry and it drops that entry's cache first,
+    /// where the `IndexMut` it replaced would have left it standing.
     mod chunk_index_cache {
         use super::*;
 
@@ -7937,25 +6690,29 @@ mod tests {
         }
 
         #[test]
-        fn a_read_leaves_its_decoded_index_for_the_next_read() {
+        fn a_read_leaves_the_blocks_it_decoded_for_the_next_read() {
             let (path, mut r) = chunked_file("index_cache_hit");
             let pos = r.dataset_position("d").unwrap();
             let addr = index_address(&r, pos);
             assert!(
-                r.datasets.chunk_index(pos, addr).is_none(),
-                "a reader that has read nothing holds a decoded index"
+                r.datasets.chunk_cache(pos, addr).is_none(),
+                "a reader that has read nothing holds a chunk-index cache"
             );
 
             assert_eq!(r.read_slice("d", &[0], &[4]).unwrap(), vec![0u8, 1, 2, 3]);
-            let cached = r
-                .datasets
-                .chunk_index(pos, addr)
-                .expect("the read did not keep the index it decoded");
-            assert_eq!(cached.entries.len(), 2, "one entry per chunk");
-            assert_eq!(cached.coords, vec![0, 1], "slot 0 and slot 1 of the grid");
+            let held = |r: &Hdf5Reader| {
+                r.datasets
+                    .chunk_cache(pos, addr)
+                    .expect("the read did not keep the blocks it decoded")
+                    .blocks
+                    .held()
+            };
+            assert_eq!(held(&r), 2, "the fixed-array header and its data block");
 
-            // The second read answers from it and reaches the same bytes.
+            // The second read answers from them, decoding nothing new, and
+            // reaches the same bytes.
             assert_eq!(r.read_slice("d", &[4], &[4]).unwrap(), vec![4u8, 5, 6, 7]);
+            assert_eq!(held(&r), 2);
             let _ = std::fs::remove_file(&path);
         }
 
@@ -7967,8 +6724,8 @@ mod tests {
             r.read_slice("d", &[0], &[4]).unwrap();
 
             assert!(
-                r.datasets.chunk_index(pos, addr.wrapping_add(1)).is_none(),
-                "an index decoded from {addr:#x} answered for another address"
+                r.datasets.chunk_cache(pos, addr.wrapping_add(1)).is_none(),
+                "blocks decoded from {addr:#x} answered for another address"
             );
             let _ = std::fs::remove_file(&path);
         }
@@ -7979,15 +6736,15 @@ mod tests {
             let pos = r.dataset_position("d").unwrap();
             let addr = index_address(&r, pos);
             r.read_slice("d", &[0], &[4]).unwrap();
-            assert!(r.datasets.chunk_index(pos, addr).is_some());
+            assert!(r.datasets.chunk_cache(pos, addr).is_some());
 
             // What a caller reaches an entry mutably for — the virtual extent
-            // resolution rewrites `dataspace.dims` — is what the coordinates
-            // in a decoded index were built against.
+            // resolution rewrites `dataspace.dims` — is what the lookups that
+            // decoded the cached blocks were made against.
             let _ = r.datasets.entry_mut(pos);
             assert!(
-                r.datasets.chunk_index(pos, addr).is_none(),
-                "a mutable entry left its decoded index behind"
+                r.datasets.chunk_cache(pos, addr).is_none(),
+                "a mutable entry left its chunk-index cache behind"
             );
             assert_eq!(r.read_slice("d", &[4], &[4]).unwrap(), vec![4u8, 5, 6, 7]);
             let _ = std::fs::remove_file(&path);
@@ -7996,10 +6753,10 @@ mod tests {
 
     /// The decompressed-chunk cache. An image MUST be served only for the
     /// stored bytes it was decoded from, MUST be kept only for a chunk the
-    /// read left partly unconsumed, and MUST NOT outlive the decoded index
-    /// that named its chunk — which it cannot, being a field of it, so the
-    /// invalidation these tests exercise is the index's own (`entry_mut`, and
-    /// the table rebuild a SWMR refresh does).
+    /// read left partly unconsumed, and MUST NOT outlive the index that
+    /// named its chunk — which it cannot, being a field of that index's
+    /// cache, so the invalidation these tests exercise is the cache's own
+    /// (`entry_mut`, and the table rebuild a SWMR refresh does).
     mod chunk_image_cache {
         use super::*;
 
@@ -8052,8 +6809,8 @@ mod tests {
             else {
                 panic!("expected a version-4 chunked layout");
             };
-            match reader.datasets.chunk_index(pos, *index_address) {
-                Some(index) => index.images.held(),
+            match reader.datasets.chunk_cache(pos, *index_address) {
+                Some(cache) => cache.images.held(),
                 None => 0,
             }
         }

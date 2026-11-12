@@ -5,6 +5,7 @@
 
 pub mod allocator;
 pub(crate) mod chunk_grid;
+pub(crate) mod chunk_lookup;
 pub mod file_handle;
 pub(crate) mod free_space_io;
 pub(crate) mod hyperslab;

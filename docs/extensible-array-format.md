@@ -246,16 +246,16 @@ Done:
    filter-agnostic — they hold data-block addresses only).
 3. `writer.rs::write_chunk` walks data blocks and super blocks via
    `EaGeometry`, creating super blocks on demand.
-4. `reader.rs::collect_ea_chunk_entries` walks the corrected geometry,
-   reading super blocks; `read_chunked_v4` delegates to it.
+4. `chunk_lookup.rs::find` locates one chunk through the corrected
+   geometry, reading only the index, super and data block on its path.
 5. Filtered EA and `open_append` both covered.
 6. Layout message version 5 is accepted (it is structurally identical to
    version 4; libhdf5 emits v5 for filtered datasets).
 
-7. `reader.rs::collect_ea_chunk_entries` reads paged data blocks: when a
-   super block's data blocks exceed the page size, it walks the per-super-
-   block page-init bitmap (one flat MSB-first bitmap indexed by
-   `dblk_idx * npages + page_idx`) and reads the element pages.
+7. `chunk_lookup.rs::find` reads paged data blocks: when a super block's
+   data blocks exceed the page size, it tests the chunk's page in the per-
+   super-block page-init bitmap (one flat MSB-first bitmap indexed by
+   `dblk_idx * npages + page_idx`) and reads only that element page.
 
 Verified round-trip with h5py 3.16 / libhdf5 2.0.0 in both directions,
 filtered and unfiltered, across super blocks (1500–2000 chunks) and across
