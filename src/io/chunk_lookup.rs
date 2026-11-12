@@ -212,39 +212,30 @@ pub(crate) fn find(
     if view.addr == UNDEF_ADDR || !view.within_extent(coords) {
         return Ok(None);
     }
-    let record = handle.load_metadata(|| {
-        let found = match &view.kind {
-            IndexKind::SingleChunk(filter) => Ok(Some(ChunkRecord {
-                addr: view.addr,
-                nbytes: filter.map_or(view.whole_bytes, |f| f.nbytes),
-                mask: filter.map_or(0, |f| f.filter_mask),
-            })),
-            IndexKind::Implicit => {
-                // `H5D__none_idx_create` allocates every slot of the maximum
-                // grid in one block, so the address is arithmetic.
-                let linear = view.linear(coords)?;
-                Ok(Some(ChunkRecord {
-                    addr: view
-                        .addr
-                        .saturating_add(linear.saturating_mul(view.chunk_bytes)),
-                    nbytes: view.chunk_bytes,
-                    mask: 0,
-                }))
-            }
-            IndexKind::FixedArray => find_fixed_array(handle, view, blocks, view.linear(coords)?),
-            IndexKind::ExtensibleArray(params) => {
-                find_extensible_array(handle, view, params, blocks, view.linear(coords)?)
-            }
-            IndexKind::BTreeV2 => find_btree_v2(handle, view, blocks, coords),
-            IndexKind::BTreeV1 => find_btree_v1(handle, view, blocks, coords),
-        };
-        // A failed walk leaves nothing memoized: a block's checksum is placed
-        // by its parent's image (a B-tree v2 child's record count), so a
-        // retry that kept the parent would check the same wrong range again.
-        if found.is_err() {
-            *blocks = BlockCache::default();
+    let record = handle.load_metadata(|| match &view.kind {
+        IndexKind::SingleChunk(filter) => Ok(Some(ChunkRecord {
+            addr: view.addr,
+            nbytes: filter.map_or(view.whole_bytes, |f| f.nbytes),
+            mask: filter.map_or(0, |f| f.filter_mask),
+        })),
+        IndexKind::Implicit => {
+            // `H5D__none_idx_create` allocates every slot of the maximum grid
+            // in one block, so the address is arithmetic.
+            let linear = view.linear(coords)?;
+            Ok(Some(ChunkRecord {
+                addr: view
+                    .addr
+                    .saturating_add(linear.saturating_mul(view.chunk_bytes)),
+                nbytes: view.chunk_bytes,
+                mask: 0,
+            }))
         }
-        found
+        IndexKind::FixedArray => find_fixed_array(handle, view, blocks, view.linear(coords)?),
+        IndexKind::ExtensibleArray(params) => {
+            find_extensible_array(handle, view, params, blocks, view.linear(coords)?)
+        }
+        IndexKind::BTreeV2 => walk_btree(blocks, |b| find_btree_v2(handle, view, b, coords)),
+        IndexKind::BTreeV1 => walk_btree(blocks, |b| find_btree_v1(handle, view, b, coords)),
     })?;
     Ok(record.filter(|r| r.addr != UNDEF_ADDR))
 }
@@ -255,9 +246,11 @@ pub(crate) fn find(
 /// MUST NOT outlive the catalog entry whose index it was read from: it hangs
 /// under that entry beside the index address it was decoded from, and goes
 /// when the entry changes or a SWMR refresh rebuilds the catalog. Within that
-/// lifetime a block is decoded once; a SWMR writer only ever adds chunks past
-/// the extent the reader last refreshed to, so a block decoded after the
-/// refresh answers for every chunk that extent covers.
+/// lifetime a block is decoded once. An array index block decoded after the
+/// refresh answers for every chunk that extent covers: a SWMR writer only adds
+/// chunks past it, and an array entry never moves. A B-tree node does not, as
+/// an insert moves records between nodes; [`walk_btree`] trusts it for a hit
+/// only.
 #[derive(Default)]
 pub(crate) struct BlockCache {
     fa_header: Option<Arc<FaInfo>>,
@@ -277,7 +270,6 @@ pub(crate) struct BlockCache {
 
 impl BlockCache {
     /// How many index blocks are held.
-    #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         usize::from(self.fa_header.is_some())
             + usize::from(self.fa_prefix.is_some())
@@ -891,6 +883,29 @@ fn find_btree_v2(
                 depth -= 1;
             }
         }
+    }
+}
+
+/// Walk a B-tree with `walk`, and again from no memo when a walk through
+/// memoized nodes finds nothing or fails; only a cold walk's miss or failure
+/// is final.
+///
+/// A writer inserting into a B-tree moves records between nodes and rewrites
+/// them in place, so a memoized node can route a lookup to a node that no
+/// longer holds its record, or size a child by a record count it no longer
+/// has. A record a walk does find is one the tree held for that chunk: only
+/// the chunk's own key matches.
+fn walk_btree(
+    blocks: &mut BlockCache,
+    mut walk: impl FnMut(&mut BlockCache) -> IoResult<Option<ChunkRecord>>,
+) -> IoResult<Option<ChunkRecord>> {
+    let warm = blocks.held() > 0;
+    match walk(blocks) {
+        Ok(None) | Err(_) if warm => {
+            *blocks = BlockCache::default();
+            walk(blocks)
+        }
+        found => found,
     }
 }
 
