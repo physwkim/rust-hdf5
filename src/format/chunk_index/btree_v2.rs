@@ -30,9 +30,8 @@ pub const BT2_VERSION: u8 = 0;
 /// `H5D_BT2_NODE_SIZE` (`H5Dpkg.h`).
 ///
 /// Every node — leaf or internal — occupies exactly this many bytes on disk.
-/// That is what makes a node block reusable: re-serializing a tree overwrites
-/// its nodes in place rather than relocating them, so a flush cannot orphan the
-/// block it replaced. libhdf5 reads a whole node-size block and checksums only
+/// That is what makes a node block reusable: a block one flush gives up fits
+/// whichever node a later flush needs ([`Bt2Tree::place`]). libhdf5 reads a whole node-size block and checksums only
 /// the used prefix, so the tail is padding that must nevertheless exist in the
 /// file.
 pub const BT2_NODE_SIZE: u32 = 2048;
@@ -846,18 +845,43 @@ pub struct Bt2TreeNode {
     pub total_records: u64,
 }
 
+/// One node block as the file holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bt2NodeBlock {
+    /// Height above the leaves; 0 for a leaf.
+    pub depth: u16,
+    /// File address of the block.
+    pub addr: u64,
+    /// The bytes written there (a full [`Bt2Tree::node_size`] block, or what a
+    /// reopen read back).
+    pub image: Vec<u8>,
+}
+
+/// Where [`Bt2Tree::place`] puts a tree, and what the tree it replaces leaves
+/// behind.
+#[derive(Debug, Clone)]
+pub struct Bt2Placement {
+    /// Every node's block, in [`Bt2Tree::nodes`] order: what the header
+    /// written after [`writes`](Self::writes) reaches. The root is last.
+    pub nodes: Vec<Bt2NodeBlock>,
+    /// Indices into [`nodes`](Self::nodes) of the blocks the file does not hold
+    /// yet, children before parents.
+    pub writes: Vec<usize>,
+    /// Published blocks the new tree does not reach once its header is written.
+    pub superseded: Vec<u64>,
+}
+
 /// A v2 B-tree bulk-loaded from an ordered record list.
 ///
-/// Nodes are laid out children-before-parents, so [`nodes`](Self::nodes)'s last
-/// entry is the root and every node's children have smaller indices — which is
-/// what lets [`encode`](Self::encode) resolve child addresses in one pass.
+/// Nodes are laid out level by level from the leaves up, left to right within
+/// a level, so [`nodes`](Self::nodes)'s last entry is the root and every node's
+/// children have smaller indices — which is what lets
+/// [`encode_node`](Self::encode_node) resolve child addresses in one pass.
 ///
-/// Every node is exactly [`node_size`](Self::node_size) bytes, so re-loading a
-/// grown index overwrites the nodes already on disk and only ever *appends*
-/// blocks. Sizing the root to its contents instead (one leaf that grows with
-/// the record count) would force a relocation on every flush, orphaning the
-/// block it replaced, and would cap the index at the 65535 records a node's
-/// record count can express.
+/// Every node is exactly [`node_size`](Self::node_size) bytes, so any freed node
+/// block fits any later node. Sizing the root to its contents instead (one leaf
+/// that grows with the record count) would cap the index at the 65535 records a
+/// node's record count can express.
 #[derive(Debug, Clone)]
 pub struct Bt2Tree {
     /// Every node, children before parents; the last entry is the root.
@@ -868,8 +892,8 @@ pub struct Bt2Tree {
     pub record_size: u16,
     /// Size of every node in bytes.
     pub node_size: u32,
-    /// Split percentage the header declares (pass-through; see
-    /// [`Bt2ChunkIndex::split_percent`]).
+    /// Split percentage the header declares, and the fill limit
+    /// [`build`](Self::build) packed every node to.
     pub split_percent: u8,
     /// Merge percentage the header declares (pass-through).
     pub merge_percent: u8,
@@ -880,18 +904,25 @@ pub struct Bt2Tree {
 impl Bt2Tree {
     /// Bulk-load a tree from `records` — the encoded records in key order.
     ///
-    /// Each level's records are spread evenly across that level's nodes, with
-    /// one record promoted to the parent between adjacent siblings. That is the
-    /// shape libhdf5 searches: `H5B2__locate_record` bisects a node's records
-    /// and, on a miss, descends into the child the record would fall between.
+    /// Each level is packed from the left: every node but the last holds the
+    /// split limit, with one record promoted to the parent between adjacent
+    /// siblings. That is the shape libhdf5 searches: `H5B2__locate_record`
+    /// bisects a node's records and, on a miss, descends into the child the
+    /// record would fall between. Packing from the left is what makes a record
+    /// appended past the end change only the rightmost node of each level, so
+    /// a flush after an append rewrites one path, not the tree
+    /// ([`place`](Self::place)).
     ///
-    /// Node capacities come from [`Bt2Geometry`], so no node exceeds what a
-    /// reader computing the same geometry will deserialize.
+    /// The limit is `max_nrec * split_percent / 100` (libhdf5 `split_nrec`,
+    /// `H5B2__hdr_init`), not `max_nrec`: libhdf5 splits a node on insert only
+    /// when it holds exactly `split_nrec` (`H5B2__insert_internal`), so a node
+    /// filled past it would overflow on libhdf5's next insert.
     pub fn build(
         record_type: u8,
         record_size: u16,
         node_size: u32,
         sizeof_addr: u8,
+        split_percent: u8,
         records: &[u8],
     ) -> Self {
         let rec = record_size.max(1) as usize;
@@ -910,21 +941,28 @@ impl Bt2Tree {
         if total > 0 {
             loop {
                 let geo = Bt2Geometry::new(node_size, record_size, depth, sizeof_addr);
-                let cap = geo.node_info[depth as usize].max_nrec.max(1) as usize;
+                let max_nrec = geo.node_info[depth as usize].max_nrec;
+                let cap = (max_nrec * u64::from(split_percent) / 100).max(1) as usize;
                 let n = pending.len() / rec;
                 // Fewest nodes that hold n records with one separator between
                 // each adjacent pair: k * cap + (k - 1) >= n.
                 let k = (n + 1).div_ceil(cap + 1);
-                let own = n - (k - 1);
-                let (base, extra) = (own / k, own % k);
-                debug_assert!(base >= 1, "a bulk-loaded node must hold a record");
-                debug_assert!(base + usize::from(extra > 0) <= cap);
+                // What the last node is left with once the others are full. A
+                // level that divides exactly leaves it nothing, so it takes the
+                // last record of its neighbour instead.
+                let last = n - (k - 1) * (cap + 1);
+                let (borrow, last) = if last == 0 { (1, 1) } else { (0, last) };
 
                 let mut next_pending: Vec<u8> = Vec::new();
                 let mut next_children: Vec<usize> = Vec::with_capacity(k);
                 let (mut r, mut c) = (0usize, 0usize);
                 for i in 0..k {
-                    let m = base + usize::from(i < extra);
+                    let m = match k - 1 - i {
+                        0 => last,
+                        1 => cap - borrow,
+                        _ => cap,
+                    };
+                    debug_assert!(m >= 1, "a bulk-loaded node must hold a record");
                     let record_data = pending[r * rec..(r + m) * rec].to_vec();
                     r += m;
                     let kids: Vec<usize> = if depth == 0 {
@@ -966,7 +1004,7 @@ impl Bt2Tree {
             record_type,
             record_size,
             node_size,
-            split_percent: BT2_SPLIT_PERCENT,
+            split_percent,
             merge_percent: BT2_MERGE_PERCENT,
         }
     }
@@ -990,59 +1028,133 @@ impl Bt2Tree {
     /// [`nodes`](Self::nodes) order.
     ///
     /// `addrs[i]` is the file address assigned to `nodes[i]`; entries past the
-    /// node count are ignored, so a caller may pass a longer block pool.
+    /// node count are ignored.
     pub fn encode(&self, ctx: &FormatContext, addrs: &[u64]) -> Vec<Vec<u8>> {
-        self.nodes
-            .iter()
-            .map(|n| {
-                let mut image = if n.depth == 0 {
-                    Bt2LeafNode {
-                        record_type: self.record_type,
-                        record_data: n.record_data.clone(),
-                        num_records: n.num_records,
-                        record_size: self.record_size,
-                    }
-                    .encode()
-                } else {
-                    Bt2InternalNode {
-                        record_type: self.record_type,
-                        record_data: n.record_data.clone(),
-                        num_records: n.num_records,
-                        record_size: self.record_size,
-                        child_addrs: n.children.iter().map(|&c| addrs[c]).collect(),
-                        child_nrecords: n
-                            .children
-                            .iter()
-                            .map(|&c| self.nodes[c].num_records)
-                            .collect(),
-                        child_total_nrecords: n
-                            .children
-                            .iter()
-                            .map(|&c| self.nodes[c].total_records)
-                            .collect(),
-                    }
-                    .encode(
-                        ctx,
-                        n.depth,
-                        self.geometry.max_nrec_size,
-                        self.geometry.child_total_size(n.depth),
-                    )
-                };
-                debug_assert!(image.len() <= self.node_size as usize);
-                // Only the used prefix is checksummed, but the image is padded
-                // to the whole block so re-serializing overwrites the block
-                // rather than a prefix of it. A node's record count falls as
-                // well as rises — a full 84-record leaf becomes two 42-record
-                // leaves when the tree splits — so a short write would leave
-                // the tail of the previous, larger image behind. A conforming
-                // reader stops at the record count its parent gives it and
-                // never sees those bytes, but they are stale records in a live
-                // node block, and anything scanning the file raw reads them as
-                // real.
-                image.resize(self.node_size as usize, 0);
-                image
-            })
+        (0..self.nodes.len())
+            .map(|i| self.encode_node(ctx, i, addrs))
             .collect()
+    }
+
+    /// Serialize `nodes[i]` to a [`node_size`](Self::node_size)-byte image.
+    ///
+    /// `addrs[c]` is the file address of child `nodes[c]`; children precede
+    /// their parent, so `addrs` needs only the first `i` entries.
+    pub fn encode_node(&self, ctx: &FormatContext, i: usize, addrs: &[u64]) -> Vec<u8> {
+        let n = &self.nodes[i];
+        let mut image = if n.depth == 0 {
+            Bt2LeafNode {
+                record_type: self.record_type,
+                record_data: n.record_data.clone(),
+                num_records: n.num_records,
+                record_size: self.record_size,
+            }
+            .encode()
+        } else {
+            Bt2InternalNode {
+                record_type: self.record_type,
+                record_data: n.record_data.clone(),
+                num_records: n.num_records,
+                record_size: self.record_size,
+                child_addrs: n.children.iter().map(|&c| addrs[c]).collect(),
+                child_nrecords: n
+                    .children
+                    .iter()
+                    .map(|&c| self.nodes[c].num_records)
+                    .collect(),
+                child_total_nrecords: n
+                    .children
+                    .iter()
+                    .map(|&c| self.nodes[c].total_records)
+                    .collect(),
+            }
+            .encode(
+                ctx,
+                n.depth,
+                self.geometry.max_nrec_size,
+                self.geometry.child_total_size(n.depth),
+            )
+        };
+        debug_assert!(image.len() <= self.node_size as usize);
+        // Only the used prefix is checksummed, but the image is padded to the
+        // whole block: a freed node block goes to whichever node next needs
+        // one, so a short write over a block that held a fuller node would
+        // leave the tail of its records behind. A conforming reader stops at
+        // the record count its parent gives it and never sees those bytes, but
+        // anything scanning the file raw reads them as real.
+        image.resize(self.node_size as usize, 0);
+        image
+    }
+
+    /// Lay this tree's nodes out copy-on-write over `published`, the node
+    /// blocks the file's header reaches now, in [`nodes`](Self::nodes) order.
+    ///
+    /// A node whose published counterpart — the same depth, the same place
+    /// from the left — already holds its exact image keeps that block and is
+    /// not written. Every other node goes to a fresh block from `alloc`, never
+    /// over a published one: a reader that loaded the previous header walks an
+    /// intact tree until the next header is written, where an in-place rewrite
+    /// could hand it a leaf whose records shifted under an unchanged count, so
+    /// a present chunk reads as absent. libhdf5's SWMR writer does the same by
+    /// shadowing each node it modifies after a header flush
+    /// (`H5B2__shadow_leaf`, `H5B2__shadow_internal`).
+    ///
+    /// A changed node changes its parent's child address, so every ancestor of
+    /// a changed node moves too. With the tree packed from the left
+    /// ([`build`](Self::build)), an append moves one root-to-leaf path.
+    pub fn place(
+        &self,
+        ctx: &FormatContext,
+        published: &[Bt2NodeBlock],
+        alloc: &mut dyn FnMut() -> u64,
+    ) -> Bt2Placement {
+        // Published block indices by depth, left to right: `published` is in
+        // `nodes` order, which is level by level and left to right.
+        let mut by_depth: Vec<Vec<usize>> = Vec::new();
+        for (p, block) in published.iter().enumerate() {
+            let d = block.depth as usize;
+            if by_depth.len() <= d {
+                by_depth.resize_with(d + 1, Vec::new);
+            }
+            by_depth[d].push(p);
+        }
+        let mut kept = vec![false; published.len()];
+        let mut rank = vec![0usize; self.depth() as usize + 1];
+        let mut addrs = Vec::with_capacity(self.nodes.len());
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        let mut writes = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            let image = self.encode_node(ctx, i, &addrs);
+            let d = node.depth as usize;
+            let counterpart = by_depth.get(d).and_then(|v| v.get(rank[d])).copied();
+            rank[d] += 1;
+            let addr = match counterpart {
+                Some(p) if published[p].image == image => {
+                    kept[p] = true;
+                    published[p].addr
+                }
+                _ => {
+                    writes.push(i);
+                    alloc()
+                }
+            };
+            addrs.push(addr);
+            nodes.push(Bt2NodeBlock {
+                depth: node.depth,
+                addr,
+                image,
+            });
+        }
+        let superseded = published
+            .iter()
+            .zip(&kept)
+            .filter(|(_, &k)| !k)
+            .map(|(b, _)| b.addr)
+            .collect();
+        Bt2Placement {
+            nodes,
+            writes,
+            superseded,
+        }
     }
 
     /// The header describing this tree. `root_addr` is the address given to the
@@ -1087,6 +1199,7 @@ pub fn build_index(
         record_size,
         node_size,
         ctx.sizeof_addr,
+        BT2_SPLIT_PERCENT,
         records,
     );
     // The header address is taken first so it keeps the low address libhdf5
@@ -1146,9 +1259,9 @@ pub struct Bt2ChunkIndex {
     /// reopened tree. libhdf5 sizes every node from `hdr->node_size`
     /// (`H5B2leaf.c`, `H5B2internal.c`), never from a compile-time constant.
     pub node_size: u32,
-    /// Split percentage carried into the header. Advisory for this index —
-    /// the bulk loader rebuilds whole trees instead of splitting nodes — but
-    /// a reopened tree must hand back the value its creator declared.
+    /// Split percentage carried into the header, which also caps how full the
+    /// bulk loader packs a node ([`Bt2Tree::build`]). A reopened tree hands
+    /// back the value its creator declared.
     pub split_percent: u8,
     /// Merge percentage carried into the header (advisory, as above).
     pub merge_percent: u8,
@@ -1335,9 +1448,9 @@ impl Bt2ChunkIndex {
             self.record_size(ctx),
             self.node_size,
             ctx.sizeof_addr,
+            self.split_percent,
             &self.encode_records(ctx),
         );
-        tree.split_percent = self.split_percent;
         tree.merge_percent = self.merge_percent;
         tree
     }
@@ -2075,6 +2188,17 @@ mod tests {
             tree.depth() >= 1,
             "200 records must not fit one 512-byte leaf"
         );
+        // libhdf5 splits a node only when it holds exactly split_nrec, so a
+        // node packed past 90% of 20 would overflow on its next insert.
+        for node in &tree.nodes {
+            let split_nrec = tree.geometry.node_info[node.depth as usize].max_nrec * 90 / 100;
+            assert!(
+                u64::from(node.num_records) <= split_nrec,
+                "a depth-{} node holds {} records, past split_nrec {split_nrec}",
+                node.depth,
+                node.num_records
+            );
+        }
         let addrs: Vec<u64> = (0..tree.nodes.len() as u64)
             .map(|i| 0x1000 + i * 512)
             .collect();
@@ -2145,9 +2269,8 @@ mod tests {
         }
     }
 
-    /// Growing the index must not change the addresses already handed out —
-    /// that is what lets the writer overwrite node blocks instead of
-    /// relocating (and orphaning) them.
+    /// Every node image fills one node-size block at any depth, so a block
+    /// one flush gives up fits whichever node a later flush needs.
     #[test]
     fn every_node_occupies_the_same_size_block_at_any_depth() {
         let ctx = ctx8();
@@ -2158,5 +2281,51 @@ mod tests {
                 assert_eq!(image.len(), BT2_NODE_SIZE as usize, "n = {n}");
             }
         }
+    }
+
+    /// `place` keeps every node whose published block already holds its exact
+    /// image and moves the rest, with every ancestor of a moved node.
+    #[test]
+    fn place_moves_only_changed_nodes_and_their_ancestors() {
+        let ctx = ctx8();
+        let mut next = 0x1000u64;
+        let mut alloc = || {
+            next += u64::from(BT2_NODE_SIZE);
+            next
+        };
+        // 200 records: leaves of 84, 84 and 30 under a two-record root.
+        let mut idx = index_with(200);
+        let first = idx.build_tree(&ctx).place(&ctx, &[], &mut alloc);
+        assert_eq!(first.writes, vec![0, 1, 2, 3]);
+        assert!(first.superseded.is_empty());
+
+        let again = idx.build_tree(&ctx).place(&ctx, &first.nodes, &mut alloc);
+        assert!(
+            again.writes.is_empty(),
+            "an unchanged tree wrote {:?}",
+            again.writes
+        );
+        assert_eq!(again.nodes, first.nodes);
+        assert!(again.superseded.is_empty());
+
+        // An append changes the last leaf, and through its address the root.
+        idx.insert(vec![200, 0], 0x10_000 + 200 * 0x100);
+        let appended = idx.build_tree(&ctx).place(&ctx, &first.nodes, &mut alloc);
+        assert_eq!(appended.writes, vec![2, 3]);
+        assert_eq!(appended.nodes[..2], first.nodes[..2]);
+        assert_eq!(
+            appended.superseded,
+            vec![first.nodes[2].addr, first.nodes[3].addr]
+        );
+
+        // A record ahead of the rest shifts every leaf, so everything moves.
+        idx.insert(vec![0, 1], 0x9_000);
+        let shifted = idx
+            .build_tree(&ctx)
+            .place(&ctx, &appended.nodes, &mut alloc);
+        assert_eq!(shifted.writes, vec![0, 1, 2, 3]);
+        let published: Vec<u64> = appended.nodes.iter().map(|b| b.addr).collect();
+        assert!(shifted.nodes.iter().all(|b| !published.contains(&b.addr)));
+        assert_eq!(shifted.superseded, published);
     }
 }

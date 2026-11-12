@@ -890,11 +890,14 @@ fn find_btree_v2(
 /// memoized nodes finds nothing or fails; only a cold walk's miss or failure
 /// is final.
 ///
-/// A writer inserting into a B-tree moves records between nodes and rewrites
-/// them in place, so a memoized node can route a lookup to a node that no
-/// longer holds its record, or size a child by a record count it no longer
-/// has. A record a walk does find is one the tree held for that chunk: only
-/// the chunk's own key matches.
+/// A writer inserting into a B-tree moves records between nodes. One that
+/// lays changed nodes out in fresh blocks (libhdf5 under SWMR, this crate's
+/// writer) leaves the memoized tree intact but without the records written
+/// since. One that rewrites nodes in place (earlier releases of this crate)
+/// can leave a memoized node routing a lookup to a node that no longer holds
+/// its record, or sizing a child by a record count it no longer has, which
+/// fails the node's checksum. A record a walk does find is one the tree held
+/// for that chunk: only the chunk's own key matches.
 fn walk_btree(
     blocks: &mut BlockCache,
     mut walk: impl FnMut(&mut BlockCache) -> IoResult<Option<ChunkRecord>>,
@@ -999,4 +1002,43 @@ fn find_btree_v1(
     Err(IoError::InvalidState(
         "chunk B-tree v1 exceeds maximum depth".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A walk through memoized nodes that fails — a node rewritten in place
+    /// since it was memoized, read at the record count its memoized parent
+    /// gives — is walked again from no memo, and the cold walk's answer
+    /// stands. A cold walk's failure is final.
+    #[test]
+    fn a_failed_walk_through_memoized_nodes_is_walked_again_cold() {
+        let record = ChunkRecord {
+            addr: 0x1000,
+            nbytes: 1,
+            mask: 0,
+        };
+        let stale_when_warm = |b: &mut BlockCache| {
+            if b.held() > 0 {
+                Err(IoError::InvalidState("checksum mismatch".into()))
+            } else {
+                Ok(Some(record))
+            }
+        };
+        let mut warm = BlockCache::default();
+        warm.records.insert((0, 0), Arc::new(Vec::new()));
+        assert_eq!(
+            walk_btree(&mut warm, stale_when_warm).unwrap(),
+            Some(record)
+        );
+
+        let mut walks = 0;
+        let cold = walk_btree(&mut BlockCache::default(), |_| {
+            walks += 1;
+            Err(IoError::InvalidState("checksum mismatch".into()))
+        });
+        assert!(cold.is_err());
+        assert_eq!(walks, 1, "a cold walk's failure was retried");
+    }
 }

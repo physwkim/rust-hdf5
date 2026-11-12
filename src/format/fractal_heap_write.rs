@@ -24,7 +24,7 @@
 //! `H5HFbtree2.c` (`H5HF__huge_bt2_indir_encode`).
 
 use crate::format::checksum::checksum_metadata;
-use crate::format::chunk_index::btree_v2::{Bt2Tree, BT2_TYPE_FHEAP_HUGE_INDIR};
+use crate::format::chunk_index::btree_v2::{Bt2Tree, BT2_SPLIT_PERCENT, BT2_TYPE_FHEAP_HUGE_INDIR};
 use std::collections::HashMap;
 
 use crate::format::fractal_heap::{
@@ -627,6 +627,7 @@ impl HeapBuilder<'_> {
             record_size,
             HUGE_BT2_NODE_SIZE,
             self.ctx.sizeof_addr,
+            BT2_SPLIT_PERCENT,
             &records,
         );
         let bt2_addr = (self.alloc)(tree.header(UNDEF_ADDR).encoded_size(self.ctx) as u64);

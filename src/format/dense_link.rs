@@ -18,7 +18,8 @@
 
 use crate::format::checksum::checksum_metadata;
 use crate::format::chunk_index::btree_v2::{
-    collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_GRP_CORDER, BT2_TYPE_GRP_NAME,
+    collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_SPLIT_PERCENT, BT2_TYPE_GRP_CORDER,
+    BT2_TYPE_GRP_NAME,
 };
 use crate::format::creation_order::CreationOrder;
 use crate::format::fractal_heap::{
@@ -227,6 +228,7 @@ fn build_index(
         record_size,
         NAME_BT2_NODE_SIZE,
         ctx.sizeof_addr,
+        BT2_SPLIT_PERCENT,
         records,
     );
     let bt2_addr = alloc(tree.header(UNDEF_ADDR).encoded_size(ctx) as u64);

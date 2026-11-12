@@ -108,10 +108,10 @@ fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u6
 
 /// A walk of a v2 B-tree: the file and node geometry the descent reads
 /// through, and the two collections it fills — every node's raw record
-/// bytes and every node block's address, the latter because `open_append`
-/// needs it so the reconstructed [`Bt2DatasetInfo::node_addrs`] pool owns
-/// the on-disk nodes (the next flush re-serializes the tree over them, and
-/// a delete frees them).
+/// bytes and every node block as read, the latter because `open_append`
+/// needs it so the reconstructed [`Bt2DatasetInfo::nodes`] owns the on-disk
+/// nodes (the next flush keeps the ones it would write unchanged and
+/// supersedes the rest, and a delete frees them).
 ///
 /// `record_size`, `node_size` and `geo` are constant for the whole walk, so
 /// [`descend`](Self::descend) takes only what changes per level: the node's
@@ -123,7 +123,7 @@ struct Bt2Walk<'a> {
     node_size: u32,
     geo: &'a crate::format::chunk_index::btree_v2::Bt2Geometry,
     records: Vec<u8>,
-    node_addrs: Vec<u64>,
+    nodes: Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock>,
 }
 
 impl<'a> Bt2Walk<'a> {
@@ -141,21 +141,36 @@ impl<'a> Bt2Walk<'a> {
             node_size,
             geo,
             records: Vec::new(),
-            node_addrs: Vec::new(),
+            nodes: Vec::new(),
         }
+    }
+
+    /// The node blocks walked, in [`Bt2Tree::nodes`] order — level by level
+    /// from the leaves, left to right — which is the order the descent meets
+    /// each depth's nodes in.
+    ///
+    /// [`Bt2Tree::nodes`]: crate::format::chunk_index::btree_v2::Bt2Tree::nodes
+    fn into_nodes(self) -> Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock> {
+        let mut nodes = self.nodes;
+        nodes.sort_by_key(|n| n.depth);
+        nodes
     }
 
     /// Walk the subtree rooted at `addr`, at depth `depth` with `nrec`
     /// records, collecting every node's raw record bytes and every node
-    /// block's address.
+    /// block as read.
     fn descend(&mut self, addr: u64, depth: u16, nrec: u16) -> IoResult<()> {
-        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode, Bt2NodeBlock};
 
-        self.node_addrs.push(addr);
         let buf = self.handle.read_at_most(addr, self.node_size as usize)?;
         if depth == 0 {
             let leaf = Bt2LeafNode::decode(&buf, nrec, self.record_size)?;
             self.records.extend_from_slice(&leaf.record_data);
+            self.nodes.push(Bt2NodeBlock {
+                depth,
+                addr,
+                image: buf,
+            });
         } else {
             let node = Bt2InternalNode::decode(
                 &buf,
@@ -166,6 +181,11 @@ impl<'a> Bt2Walk<'a> {
                 self.geo.max_nrec_size,
                 self.geo.child_total_size(depth),
             )?;
+            self.nodes.push(Bt2NodeBlock {
+                depth,
+                addr,
+                image: buf,
+            });
             // In-order: an internal node's records separate its children, so each
             // one belongs between the subtrees on either side of it.
             let children: Vec<(u64, u16)> = node
@@ -1946,10 +1966,9 @@ pub struct BtreeV1DatasetInfo {
     pub config: BTreeV1Config,
     /// The chunks, in key order (`scaled` ascending, lexicographically).
     pub records: Vec<BtreeV1ChunkRecord>,
-    /// Pool of node-size blocks holding the tree's nodes, on the same terms
-    /// as [`Bt2DatasetInfo::node_addrs`]: a flush re-serializes the whole
-    /// bulk-loaded tree over them and allocates only the shortfall, so no
-    /// flush can orphan a block it replaced.
+    /// Pool of node-size blocks holding the tree's nodes: a flush
+    /// re-serializes the whole bulk-loaded tree over them and allocates only
+    /// the shortfall, so no flush can orphan a block it replaced.
     pub node_addrs: Vec<u64>,
     /// Address of the tree's root node — what the version-3 data layout
     /// message carries. `UNDEF_ADDR` until a flush puts a node in the file,
@@ -2011,21 +2030,16 @@ pub struct Bt2DatasetInfo {
     pub chunk_dims: Vec<u64>,
     /// File offset of the BT2 header.
     pub bt2_header_addr: u64,
-    /// Pool of node-size blocks (the index's
-    /// [`node_size`](Bt2ChunkIndex::node_size) bytes each) holding the tree's
-    /// nodes, in the order [`Bt2Tree::encode`] emits them.
+    /// The node blocks the header on file reaches, with the image each holds,
+    /// in [`Bt2Tree::nodes`] order (the index's
+    /// [`node_size`](Bt2ChunkIndex::node_size) bytes each).
     ///
-    /// The single owner of the tree's node addresses: a flush re-serializes the
-    /// whole tree over these blocks and allocates only the shortfall, so no
-    /// flush can orphan a block it replaced. Every node is the same size, so a
-    /// block stays usable however the tree reshapes.
-    ///
-    /// The pool holds exactly one block per node after every flush, in both
-    /// directions: a taller tree allocates the shortfall, a smaller one frees
-    /// the surplus. Nothing here depends on the record count only ever rising,
-    /// so a record-removal path can be added to [`Bt2ChunkIndex`] without the
-    /// blocks it drops going unreachable.
-    pub node_addrs: Vec<u64>,
+    /// The single owner of the tree's node blocks. These are never rewritten:
+    /// a flush lays the new tree out over them with [`Bt2Tree::place`], which
+    /// keeps the blocks whose image is unchanged and puts every other node in
+    /// a fresh one, writes the header, and only then replaces this list and
+    /// releases the blocks the new tree no longer reaches.
+    pub nodes: Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock>,
     /// In-memory chunk index.
     pub index: Bt2ChunkIndex,
     /// Number of chunks written so far.
@@ -3282,12 +3296,13 @@ fn rebuild_dataset(
                             bt2_hdr.depth,
                             bt2_hdr.num_records_in_root,
                         )?;
-                        walked = (walk.node_addrs, walk.records);
+                        let records = std::mem::take(&mut walk.records);
+                        walked = (walk.into_nodes(), records);
                     }
                     Ok::<_, crate::io::IoError>(Some((bt2_hdr, is_filt, walked)))
                 })?;
                 let ndims = real_chunk_dims.len();
-                if let Some((bt2_hdr, is_filt, (node_addrs, record_bytes))) = loaded {
+                if let Some((bt2_hdr, is_filt, (nodes, record_bytes))) = loaded {
                     let mut index = if is_filt {
                         let csl = (bt2_hdr.record_size as usize)
                             .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
@@ -3344,7 +3359,7 @@ fn rebuild_dataset(
                     info.btree_v2 = Some(Bt2DatasetInfo {
                         chunk_dims: real_chunk_dims,
                         bt2_header_addr: *index_address,
-                        node_addrs,
+                        nodes,
                         index,
                         chunks_written: 0,
                     });
@@ -7516,9 +7531,9 @@ impl Hdf5Writer {
         }
         if let Some(bt2) = m.btree_v2.take() {
             let tree = bt2.index.build_tree(&self.ctx);
-            for &a in &bt2.node_addrs {
+            for node in &bt2.nodes {
                 self.allocator
-                    .free(a, tree.node_size as u64, FreeSpaceClass::Metadata);
+                    .free(node.addr, tree.node_size as u64, FreeSpaceClass::Metadata);
             }
             self.allocator.free(
                 bt2.bt2_header_addr,
@@ -15546,7 +15561,7 @@ impl Hdf5Writer {
                 btree_v2: Some(Bt2DatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
                     bt2_header_addr,
-                    node_addrs: Vec::new(),
+                    nodes: Vec::new(),
                     index: bt2_index,
                     chunks_written: 0,
                 }),
@@ -16900,46 +16915,47 @@ impl Hdf5Writer {
 
         // BT2-indexed dataset
         if let Some(ref bt2) = m.btree_v2 {
-            // Bulk-load the index into fixed-size nodes and lay them over the
-            // dataset's block pool. Because every node is the same size, the
-            // blocks already on disk are reused in place and only the shortfall
-            // is allocated — the pool is the single owner of these addresses,
-            // so no flush leaves a block behind. The addresses a reader already
-            // holds stay valid, which is also what SWMR needs.
+            // Bulk-load the index and lay it out copy-on-write: unchanged
+            // nodes keep their blocks, changed ones go to fresh blocks, and the
+            // header is written last, so a reader holding the previous header
+            // walks an intact tree throughout.
             let tree = bt2.index.build_tree(&self.ctx);
-            let mut node_addrs = bt2.node_addrs.clone();
-            while node_addrs.len() < tree.nodes.len() {
-                node_addrs.push(
+            let node_size = tree.node_size as u64;
+            let placed = tree.place(&self.ctx, &bt2.nodes, &mut || {
+                self.allocator.allocate(node_size, FreeSpaceClass::Metadata)
+            });
+            let written = placed.writes.iter().try_for_each(|&i| {
+                let node = &placed.nodes[i];
+                self.handle.write_at(node.addr, &node.image)
+            });
+            if let Err(e) = written {
+                // No header names the fresh blocks yet.
+                for &i in &placed.writes {
                     self.allocator
-                        .allocate(tree.node_size as u64, FreeSpaceClass::Metadata),
-                );
-            }
-            // A tree with fewer nodes than last flush releases the surplus
-            // rather than leaving it recorded and unreachable, so the pool is
-            // exactly one block per node whichever way the count moved. Under
-            // SWMR a reader may still hold a header naming those blocks, so
-            // keep them out of the free list — the same rule `place_chunk`
-            // applies to a relocated chunk.
-            for addr in node_addrs.split_off(tree.nodes.len()) {
-                if !self.swmr_active {
-                    self.allocator
-                        .free(addr, tree.node_size as u64, FreeSpaceClass::Metadata);
+                        .free(placed.nodes[i].addr, node_size, FreeSpaceClass::Metadata);
                 }
-            }
-
-            for (image, &addr) in tree.encode(&self.ctx, &node_addrs).iter().zip(&node_addrs) {
-                self.handle.write_at(addr, image)?;
+                return Err(e.into());
             }
 
             // The root is the last node the bulk load emits.
-            let root_addr = match tree.nodes.len() {
-                0 => UNDEF_ADDR,
-                n => node_addrs[n - 1],
-            };
+            let root_addr = placed.nodes.last().map_or(UNDEF_ADDR, |n| n.addr);
             let hdr_encoded = tree.header(root_addr).encode(&self.ctx);
+            // A failed header write may still have landed, so the fresh blocks
+            // stay allocated and `nodes` keeps naming the previous tree.
             self.handle.write_at(bt2.bt2_header_addr, &hdr_encoded)?;
 
-            m.btree_v2.as_mut().unwrap().node_addrs = node_addrs;
+            // Under SWMR a reader may still be walking the tree the previous
+            // header named, so its blocks stay out of the free list — as in
+            // libhdf5, whose shadowed nodes are never freed
+            // (`H5B2__shadow_leaf`) — the same rule `place_chunk` applies to
+            // a relocated chunk.
+            if !self.swmr_active {
+                for &addr in &placed.superseded {
+                    self.allocator
+                        .free(addr, node_size, FreeSpaceClass::Metadata);
+                }
+            }
+            m.btree_v2.as_mut().unwrap().nodes = placed.nodes;
 
             if sync {
                 self.handle.sync_data()?;
@@ -16949,10 +16965,9 @@ impl Hdf5Writer {
 
         // Version-1-B-tree-indexed dataset
         if let Some(ref bt1) = m.btree_v1 {
-            // Bulk-loaded over the same block pool the v2 B-tree above uses,
-            // and for the same reason: every node of a v1 tree is the width
-            // its "K" value gives, so a block stays usable however the tree
-            // reshapes, and only the shortfall is ever allocated.
+            // Bulk-loaded over a block pool: every node of a v1 tree is the
+            // width its "K" value gives, so a block stays usable however the
+            // tree reshapes, and only the shortfall is ever allocated.
             let element_size = m.datatype.element_size() as u64;
             let tree = bt1.build_tree(element_size, self.ctx.sizeof_addr as usize);
             let node_size = tree.node_size() as u64;
@@ -16960,11 +16975,11 @@ impl Hdf5Writer {
             while node_addrs.len() < tree.node_count() {
                 node_addrs.push(self.allocator.allocate(node_size, FreeSpaceClass::Metadata));
             }
-            // A tree with fewer nodes than last flush releases the surplus
-            // straight away, where the v2 B-tree has to keep it out of the
-            // free list for a live SWMR reader: this index lives only in a
-            // classic file, which `start_swmr` refuses outright (and upstream
-            // says the same in `H5D_COPS_BTREE`).
+            // Rewritten in place and the surplus released straight away,
+            // where the v2 B-tree goes copy-on-write for a live SWMR reader:
+            // this index lives only in a classic file, which `start_swmr`
+            // refuses outright (and upstream says the same in
+            // `H5D_COPS_BTREE`).
             for addr in node_addrs.split_off(tree.node_count()) {
                 self.allocator
                     .free(addr, node_size, FreeSpaceClass::Metadata);
@@ -19591,10 +19606,13 @@ mod tests {
     const BT2_PROBE_CHUNK: u64 = 8;
 
     /// Write chunks of a 1x1-chunked 2-D BT2 dataset, flushing at each batch
-    /// boundary, and report `(node addresses, file length)` after every flush.
-    /// Chunks are addressed down column 0 so the record count — and hence the
-    /// tree's shape — grows one record at a time.
-    fn btree_v2_flush_probe(path: &std::path::Path, batches: &[u64]) -> Vec<(Vec<u64>, u64)> {
+    /// boundary, and report `(published node blocks, file length)` after every
+    /// flush. Chunks are addressed down column 0 so the record count — and
+    /// hence the tree's shape — grows one record at a time.
+    fn btree_v2_flush_probe(
+        path: &std::path::Path,
+        batches: &[u64],
+    ) -> Vec<(Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock>, u64)> {
         let writer = Hdf5Writer::create(path).unwrap();
         let idx = writer
             .create_btree_v2_dataset(
@@ -19615,26 +19633,40 @@ mod tests {
                 written += 1;
             }
             writer.flush_dataset(idx).unwrap();
-            let addrs = writer
+            let nodes = writer
                 .ds(idx)
                 .lock()
                 .btree_v2
                 .as_ref()
                 .unwrap()
-                .node_addrs
+                .nodes
                 .clone();
-            out.push((addrs, std::fs::metadata(path).unwrap().len()));
+            out.push((nodes, std::fs::metadata(path).unwrap().len()));
         }
         writer.extend_dataset(idx, &[written.max(1), 1]).unwrap();
         writer.close().unwrap();
         out
     }
 
-    /// The node pool tracks the tree in both directions. Dropping records is
+    /// Node addresses of BT2 dataset `idx`'s published tree, in tree order.
+    fn btree_v2_node_addrs(writer: &Hdf5Writer, idx: usize) -> Vec<u64> {
+        let ds = writer.ds(idx);
+        let m = ds.lock();
+        m.btree_v2
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|b| b.addr)
+            .collect()
+    }
+
+    /// A flush gives up every block its new tree does not keep: the old block
+    /// of each node it moved as well as the blocks of nodes the tree no longer
+    /// has. Outside SWMR no reader can still hold the previous header, so they
+    /// go back to the allocator instead of being stranded. Dropping records is
     /// what a removal path would do — [`Bt2ChunkIndex`] has none today, so the
-    /// test drops them itself — and the flush that follows must hand the blocks
-    /// its smaller tree no longer needs back to the allocator instead of
-    /// leaving them recorded and unreachable.
+    /// test drops them itself.
     #[test]
     fn a_btree_v2_flush_frees_the_node_blocks_its_tree_gave_up() {
         use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
@@ -19657,17 +19689,10 @@ mod tests {
                 .unwrap();
         }
         writer.flush_dataset(idx).unwrap();
-        let grown = writer
-            .ds(idx)
-            .lock()
-            .btree_v2
-            .as_ref()
-            .unwrap()
-            .node_addrs
-            .clone();
+        let mut grown = btree_v2_node_addrs(&writer, idx);
         assert_eq!(grown.len(), 3, "expected two leaves and a root");
 
-        // Back to 84 records: one leaf, so two of the three blocks are surplus.
+        // Back to 84 records: one leaf, which differs from both old leaves.
         writer
             .ds(idx)
             .lock()
@@ -19678,35 +19703,125 @@ mod tests {
             .records
             .truncate(84);
         writer.flush_dataset(idx).unwrap();
-        let shrunk = writer
+        let shrunk = btree_v2_node_addrs(&writer, idx);
+        assert_eq!(shrunk.len(), 1, "expected a single leaf");
+        assert!(
+            !grown.contains(&shrunk[0]),
+            "the changed leaf was written over a published block"
+        );
+
+        // All three published blocks went back to the allocator, not on the
+        // floor: the next three node-sized allocations are exactly them.
+        let mut reused: Vec<u64> = (0..3)
+            .map(|_| {
+                writer
+                    .allocator
+                    .allocate(BT2_NODE_SIZE as u64, FreeSpaceClass::Metadata)
+            })
+            .collect();
+        reused.sort_unstable();
+        grown.sort_unstable();
+        assert_eq!(reused, grown, "a superseded node block was not freed");
+
+        writer.extend_dataset(idx, &[85, 1]).unwrap();
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Under SWMR a reader may still be walking from the header it loaded
+    /// before a flush, so the flush must leave every block that header reaches
+    /// untouched. A record inserted ahead of the others is the hard case: the
+    /// first leaf keeps its record count while every record in it shifts, so a
+    /// leaf rewritten in place passes the reader's count and checksum checks
+    /// and hands it the new records under the old separators.
+    #[test]
+    fn a_btree_v2_flush_leaves_the_tree_a_published_header_reaches_intact() {
+        use crate::format::chunk_index::btree_v2::{collect_btree_v2_records, Bt2Header};
+
+        struct Bytes<'a>(&'a [u8]);
+        impl crate::format::BlockReader for Bytes<'_> {
+            fn read_block(
+                &mut self,
+                offset: u64,
+                len: usize,
+            ) -> crate::format::FormatResult<Vec<u8>> {
+                let start = (offset as usize).min(self.0.len());
+                let end = (start + len).min(self.0.len());
+                Ok(self.0[start..end].to_vec())
+            }
+        }
+
+        let path = temp_path("bt2_published_intact");
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_btree_v2_dataset(
+                "data",
+                DatatypeMessage::f64_type(),
+                &[0, 0],
+                &[u64::MAX, u64::MAX],
+                &[1, 1],
+            )
+            .unwrap();
+        // 200 records down column 0: a root over three leaves.
+        for i in 0..200u64 {
+            writer
+                .write_chunk_btree_v2(idx, &[i, 0], &(i as f64 + 1.0).to_le_bytes())
+                .unwrap();
+        }
+        writer.finalize_for_swmr().unwrap();
+        let hdr_addr = writer
             .ds(idx)
             .lock()
             .btree_v2
             .as_ref()
             .unwrap()
-            .node_addrs
-            .clone();
-        assert_eq!(
-            shrunk,
-            grown[..1],
-            "the pool still records the surplus blocks"
-        );
+            .bt2_header_addr;
+        let before = std::fs::read(&path).unwrap();
+        let published = Bt2Header::decode(&before[hdr_addr as usize..], &ctx).unwrap();
+        let records = collect_btree_v2_records(&published, &ctx, &mut Bytes(&before)).unwrap();
+        assert_eq!(published.total_num_records, 200);
 
-        // The surplus went back to the allocator, not on the floor: the next
-        // node-sized allocation lands inside the region the two blocks covered.
-        let reused = writer
-            .allocator
-            .allocate(BT2_NODE_SIZE as u64, FreeSpaceClass::Metadata);
+        // [0, 1] sorts between [0, 0] and [1, 0]: every record of the first
+        // leaf shifts right by one, and its count does not change.
+        writer
+            .write_chunk_btree_v2(idx, &[0, 1], &1000f64.to_le_bytes())
+            .unwrap();
+        writer.flush_dataset(idx).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        let current = Bt2Header::decode(&after[hdr_addr as usize..], &ctx).unwrap();
+        assert_eq!(current.total_num_records, 201);
+        let walked = collect_btree_v2_records(&published, &ctx, &mut Bytes(&after)).unwrap();
+        let rec = published.record_size as usize;
         assert!(
-            (grown[1]..grown[1] + 2 * BT2_NODE_SIZE as u64).contains(&reused),
-            "a node block allocated at {reused:#x}, outside the freed \
-             [{:#x}, {:#x}) the flush gave up",
-            grown[1],
-            grown[1] + 2 * BT2_NODE_SIZE as u64
+            walked == records,
+            "the tree the published header reaches changed under it: record {} of {} differs",
+            walked
+                .chunks(rec)
+                .zip(records.chunks(rec))
+                .position(|(a, b)| a != b)
+                .unwrap_or(walked.len().min(records.len()) / rec),
+            records.len() / rec
         );
 
-        writer.extend_dataset(idx, &[85, 1]).unwrap();
+        writer.extend_dataset(idx, &[200, 2]).unwrap();
         writer.close().unwrap();
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let values: Vec<f64> = reader
+            .read_dataset_raw("data")
+            .unwrap()
+            .chunks(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 400);
+        for r in 0..200usize {
+            assert_eq!(values[2 * r], r as f64 + 1.0, "chunk [{r}, 0]");
+            let want = if r == 0 { 1000.0 } else { 0.0 };
+            assert_eq!(values[2 * r + 1], want, "chunk [{r}, 1]");
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -19783,79 +19898,99 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A node's record count falls as well as rises: the tree's first leaf goes
-    /// from a full 84 records to 42 when 85 records force it to split. The node
-    /// image is padded to the whole block so re-serializing overwrites the
-    /// block, not a prefix of it — otherwise that leaf keeps the tail of its
-    /// 84-record self, stale records sitting in a live node block.
+    /// A freed node block goes to whichever node next needs one, and that node
+    /// may hold fewer records than the block's previous occupant. The node
+    /// image is padded to the whole block so writing it overwrites the block,
+    /// not a prefix of it — otherwise the block keeps the tail of the fuller
+    /// node, stale records sitting in a live node block.
     #[test]
-    fn a_shrinking_btree_v2_node_leaves_no_stale_records_behind() {
-        use crate::format::chunk_index::btree_v2::{Bt2ChunkIndex, BT2_NODE_SIZE};
-
+    fn a_recycled_btree_v2_node_block_holds_no_stale_records() {
         let path = temp_path("bt2_node_blocks");
-        let probe = btree_v2_flush_probe(&path, &[84, 85]);
-        let node0 = probe.last().unwrap().0[0];
-
-        // What the first leaf holds once the tree has split.
-        let ctx = FormatContext {
-            sizeof_addr: 8,
-            sizeof_size: 8,
-        };
-        let mut index = Bt2ChunkIndex::new_unfiltered(2);
-        for i in 0..85u64 {
-            index.insert(vec![i, 0], 0);
-        }
-        let tree = index.build_tree(&ctx);
+        // 84 is one full leaf; 85 splits it into 83 + 1 and frees it; 86 refills
+        // the first leaf and frees the 83-record block; 87 grows the last leaf
+        // to two records, which takes a freed block.
+        let probe = btree_v2_flush_probe(&path, &[84, 85, 86, 87]);
+        let (last, earlier) = probe.split_last().unwrap();
+        let used = |image: &[u8]| image.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
         assert!(
-            tree.nodes[0].num_records < 84,
-            "this test needs the first leaf to shrink, got {}",
-            tree.nodes[0].num_records
+            last.0.iter().any(|b| earlier
+                .iter()
+                .flat_map(|(nodes, _)| nodes)
+                .any(|old| old.addr == b.addr && used(&old.image) > used(&b.image))),
+            "this test needs a node written over a block that held a fuller one"
         );
-        // signature(4) + version(1) + type(1) + records + checksum(4)
-        let used = 10 + tree.nodes[0].num_records as usize * tree.record_size as usize;
 
         let bytes = std::fs::read(&path).unwrap();
-        let block = &bytes[node0 as usize..node0 as usize + BT2_NODE_SIZE as usize];
-        assert!(
-            block[used..].iter().all(|&b| b == 0),
-            "leaf block at {node0:#x} still holds {} bytes of its previous, larger image",
-            block[used..].iter().rposition(|&b| b != 0).unwrap_or(0) + 1
-        );
+        for b in &last.0 {
+            let block = &bytes[b.addr as usize..b.addr as usize + b.image.len()];
+            assert!(
+                block == b.image.as_slice(),
+                "node block at {:#x} holds {} bytes past its image's {}",
+                b.addr,
+                used(block),
+                used(&b.image)
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 
-    /// The node pool is the single owner of the tree's block addresses: a flush
-    /// reuses every block already in it and allocates only the shortfall. So
-    /// re-flushing an unchanged index must cost nothing, and a flush that grows
-    /// the tree must cost exactly the blocks it added — anything more means a
-    /// block was stranded.
+    /// The published node blocks are the single owner of the tree's file
+    /// space, and a flush moves only the nodes that changed. Re-flushing an
+    /// unchanged index writes nothing; an append moves only the right end of
+    /// each level — the last node, and its left neighbour on the flush where
+    /// the level divides exactly ([`Bt2Tree::build`]). Outside SWMR the blocks
+    /// a flush gives up are reused, so a flush per record does not grow the
+    /// file by a path per flush.
+    ///
+    /// [`Bt2Tree::build`]: crate::format::chunk_index::btree_v2::Bt2Tree::build
     #[test]
-    fn a_btree_v2_flush_allocates_only_the_node_blocks_it_adds() {
+    fn a_btree_v2_flush_moves_only_the_nodes_an_append_changes() {
         use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
 
         let path = temp_path("bt2_pool_growth");
-        // Re-flush at 84 (still one leaf), then cross into a three-node depth-1
-        // tree, then keep growing.
-        let batches = [84u64, 84, 85, 200, 200];
+        let mut batches = vec![84u64, 84];
+        batches.extend(85..=400);
+        batches.push(400);
         let probe = btree_v2_flush_probe(&path, &batches);
         for i in 1..probe.len() {
-            let (prev_addrs, prev_len) = &probe[i - 1];
-            let (addrs, len) = &probe[i];
-            assert!(
-                addrs.starts_with(prev_addrs),
-                "flush {i} moved a node block instead of reusing it"
-            );
-            let new_blocks = (addrs.len() - prev_addrs.len()) as u64 * BT2_NODE_SIZE as u64;
-            let new_chunks = (batches[i] - batches[i - 1]) * BT2_PROBE_CHUNK;
-            assert_eq!(
-                len - prev_len,
-                new_blocks + new_chunks,
-                "flush {i} grew the file by more than the blocks it added"
-            );
+            let (prev, cur) = (&probe[i - 1].0, &probe[i].0);
+            for d in 0..=cur.last().unwrap().depth {
+                let level = |nodes: &[crate::format::chunk_index::btree_v2::Bt2NodeBlock]| {
+                    nodes
+                        .iter()
+                        .filter(|b| b.depth == d)
+                        .map(|b| b.addr)
+                        .collect::<Vec<u64>>()
+                };
+                let (p, c) = (level(prev), level(cur));
+                let fixed = c.len().saturating_sub(2).min(p.len());
+                assert_eq!(
+                    c[..fixed],
+                    p[..fixed],
+                    "flush {i} moved a depth-{d} node left of the append"
+                );
+            }
         }
-        // The unchanged re-flushes must be free.
-        assert_eq!(probe[1].1, probe[0].1);
-        assert_eq!(probe[4].1, probe[3].1);
+        // The unchanged re-flushes keep every block and grow nothing.
+        assert_eq!(probe[1], probe[0]);
+        assert_eq!(probe[probe.len() - 1], probe[probe.len() - 2]);
+
+        // Node space is the live tree plus what one flush can have freed for
+        // the next: at most two nodes per level, the root's included.
+        let node = BT2_NODE_SIZE as u64;
+        let (first_nodes, first_len) = (&probe[0].0, probe[0].1);
+        let (nodes, len) = (&probe[probe.len() - 1].0, probe[probe.len() - 1].1);
+        let levels = u64::from(nodes.last().unwrap().depth) + 1;
+        let data = (400 - 84) * BT2_PROBE_CHUNK;
+        let bound = first_len - first_nodes.len() as u64 * node
+            + data
+            + (nodes.len() as u64 + 2 * levels) * node;
+        assert!(
+            len <= bound,
+            "{} flushes left the file at {len} bytes, past the {bound} the live \
+             tree and one flush of freed blocks need",
+            probe.len()
+        );
         std::fs::remove_file(&path).ok();
     }
 
