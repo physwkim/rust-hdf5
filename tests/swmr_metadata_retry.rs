@@ -38,15 +38,17 @@ fn stream(path: &Path) {
 
 /// Flip byte `at` of the file in place; flipping it again restores it.
 fn flip(path: &Path, at: u64) {
-    use std::os::unix::fs::FileExt;
-    let f = std::fs::OpenOptions::new()
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .unwrap();
     let mut b = [0u8];
-    f.read_exact_at(&mut b, at).unwrap();
-    f.write_all_at(&[!b[0]], at).unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.read_exact(&mut b).unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.write_all(&[!b[0]]).unwrap();
 }
 
 /// Restore byte `at` from another thread after `delay`.
