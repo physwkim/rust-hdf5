@@ -17277,9 +17277,7 @@ impl Hdf5Writer {
                 images.iter().map(|(_, image)| image.len()).sum::<usize>()
             )));
         }
-        for (addr, image) in &images {
-            self.handle.write_at(*addr, image)?;
-        }
+        self.write_header_images(&images)?;
         // Only after the bytes are down: a failed write leaves the registry
         // describing the header the file still holds.
         self.ds(index).lock().header_written(nlink);
@@ -17347,7 +17345,9 @@ impl Hdf5Writer {
         }
         self.superseded_root_header = layout.root.blocks();
 
-        // 4. Write superblock with SWMR flags.
+        // 4. Write superblock with SWMR flags: the write that lets a reader
+        // in, so from it on, writes reach the file in the order issued.
+        self.handle.start_swmr_write()?;
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
         self.handle.set_eof(self.allocator.eof())?;
 
@@ -17356,10 +17356,6 @@ impl Hdf5Writer {
         // leave its old block intact for whoever is still holding the previous
         // index (see `swmr_active`).
         self.swmr_active = true;
-        // `H5F__start_swmr_write`: once the lock is released another opener
-        // may be rewriting what this writer loads back.
-        self.handle
-            .set_metadata_read_attempts(crate::io::reader::SWMR_METADATA_READ_ATTEMPTS);
         Ok(())
     }
 
@@ -17668,8 +17664,19 @@ impl Hdf5Writer {
         let images = self.encode_header_in(header, rc, format, placement)?;
         let reserved =
             std::iter::once(placement.size).chain(placement.continuation.map(|(_, s)| s));
-        for ((addr, image), size) in images.iter().zip(reserved) {
+        for ((_, image), size) in images.iter().zip(reserved) {
             check_header_size(image, size, || what.to_string())?;
+        }
+        self.write_header_images(&images)
+    }
+
+    /// Write the chunk images [`encode_header_in`](Self::encode_header_in)
+    /// returns, the continuation before chunk 0, whose message names it: a
+    /// SWMR reader that reaches chunk 0 finds what it leads to already in the
+    /// file. libhdf5 makes every chunk a flush dependency of the chunk naming
+    /// it under SWMR (`H5O__cache_chk_notify`).
+    fn write_header_images(&self, images: &[(u64, Vec<u8>)]) -> IoResult<()> {
+        for (addr, image) in images.iter().rev() {
             self.handle.write_at(*addr, image)?;
         }
         Ok(())
@@ -20940,6 +20947,46 @@ mod tests {
         // its readers attached to.
         writer.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A reader holds the fixed-array header `finalize_for_swmr` published,
+    /// so the data block it names is live from then on: an entry in it must
+    /// not reach the file ahead of the chunk it names. The flush writes the
+    /// block first, before the header, and a block this wide is too large to
+    /// stage; the file is looked at right after that write, where a reader
+    /// can look too.
+    #[test]
+    fn a_swmr_index_write_never_lands_ahead_of_the_chunk_it_names() {
+        let path = temp_path("swmr_write_through");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_fixed_array_dataset("grid", DatatypeMessage::i32_type(), &[3000], &[1])
+            .unwrap();
+        writer.finalize_for_swmr().unwrap();
+        writer.handle().release_lock().unwrap();
+
+        let value = 0x5eed_f00d_i32.to_le_bytes();
+        writer.write_chunk_fixed_array(idx, &[7], &value).unwrap();
+        // The first write of `flush_dataset_synced`'s fixed-array arm.
+        let (dblk_addr, dblk, chunk_addr) = {
+            let ds = writer.ds(idx);
+            let m = ds.lock();
+            let fa = m.fixed_array.as_ref().unwrap();
+            let dblk = encode_fixed_array_dblk(&writer.ctx, &fa.fa_header, &fa.fa_dblk);
+            (fa.fa_dblk_addr, dblk, fa.fa_dblk.elements[7])
+        };
+        writer.handle.write_at(dblk_addr, &dblk).unwrap();
+
+        let file = std::fs::read(&path).unwrap();
+        let on_disk = |addr: u64, len: usize| file.get(addr as usize..addr as usize + len);
+        assert_eq!(on_disk(dblk_addr, dblk.len()), Some(&dblk[..]));
+        assert!(
+            on_disk(chunk_addr, value.len()) == Some(&value[..]),
+            "the data block in the file names chunk 7 at {chunk_addr:#x}, which the file \
+             does not hold yet"
+        );
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 
