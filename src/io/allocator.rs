@@ -95,11 +95,6 @@ impl FileAllocator {
         self.policy
     }
 
-    /// Round `size` up to `alignment`, which must be a power of two.
-    fn round_up(size: u64, alignment: u64) -> u64 {
-        (size + alignment - 1) & !(alignment - 1)
-    }
-
     /// The boundary an allocation drawn from `manager` must start on, for a
     /// request that asks for `align`.
     ///
@@ -121,7 +116,7 @@ impl FileAllocator {
     /// manager, as `H5MF__find_sect` re-adds a remainder to the manager it
     /// carved it from.
     fn carve(block: FreeBlock, size: u64, align: u64) -> Option<(u64, [FreeBlock; 2])> {
-        let addr = Self::round_up(block.addr, align);
+        let addr = block.addr.next_multiple_of(align);
         // Exactly `size`: what a caller is handed is what it will hand back,
         // so a block released later returns every byte drawn here. Rounding
         // the draw up to the alignment instead left the difference inside a
@@ -189,7 +184,7 @@ impl FileAllocator {
         }
         let mut cur = self.eof.load(Ordering::Acquire);
         let aligned = loop {
-            let aligned = Self::round_up(cur, align);
+            let aligned = cur.next_multiple_of(align);
             match self.eof.compare_exchange_weak(
                 cur,
                 aligned + size,
@@ -253,7 +248,7 @@ impl FileAllocator {
             // whose end was, and rounding up puts the file back on its own
             // grid instead of laying a page-aligned block at an unaligned
             // address.
-            let addr = Self::round_up(cur, page);
+            let addr = cur.next_multiple_of(page);
             let frag = (page - (addr + size) % page) % page;
             match self.eof.compare_exchange_weak(
                 cur,
@@ -420,7 +415,10 @@ impl FileAllocator {
         // What a block can actually hand out: the bytes before the first
         // aligned address in it can hold no allocation.
         let align = self.draw_alignment(manager, align);
-        let usable = |b: &FreeBlock| b.len.saturating_sub(Self::round_up(b.addr, align) - b.addr);
+        let usable = |b: &FreeBlock| {
+            b.len
+                .saturating_sub(b.addr.next_multiple_of(align) - b.addr)
+        };
         // Best fit: the smallest sufficient block, so a large released region
         // stays available for a large chunk.
         let pos = list
@@ -1118,6 +1116,24 @@ mod tests {
                 (page + 88, page - 88)
             ]
         );
+    }
+
+    /// H5Pset_file_space_page_size only bounds the page size, so the grid is
+    /// every multiple of a page that is not a power of two as well.
+    #[test]
+    fn a_page_size_that_is_not_a_power_of_two_keeps_its_grid() {
+        let page = 513;
+        let alloc = FileAllocator::with_policy(0, SpacePolicy::Paged { page });
+        assert_eq!(alloc.allocate(7, RAW), 0);
+        assert_eq!(alloc.allocate(1000, RAW), page);
+        assert_eq!(alloc.eof(), 3 * page);
+        // A fresh page off the 8-byte grid is carved at the alignment, or at
+        // its start when the aligned draw would run past the page.
+        assert_eq!(alloc.allocate_aligned(64, META, 8), 3 * page + 5);
+        assert_eq!(alloc.allocate_aligned(511, META, 8), 4 * page);
+        // A freed run of pages is drawn from at its first boundary.
+        alloc.free(page, 1000, RAW);
+        assert_eq!(alloc.allocate(page, META), page);
     }
 
     /// A paged file gives back whole pages and keeps what is below the page
