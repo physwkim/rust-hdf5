@@ -3091,71 +3091,79 @@ fn rebuild_dataset(
                         ep.max_nelmts_bits,
                     )?;
 
-                    // Read EA header
-                    let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                    let ea_header = ExtensibleArrayHeader::decode(&hdr_buf, ctx)?;
-
-                    let is_filtered = ea_header.class_id
-                        == crate::format::chunk_index::extensible_array::EA_CLS_FILT_CHUNK;
-                    let chunk_size_len = if is_filtered {
-                        ea_header.raw_elmt_size - ctx.sizeof_addr - 4
-                    } else {
-                        0
-                    };
-
-                    // Read the EA index block. Filtered datasets
-                    // store a `FilteredIndexBlock`; unfiltered ones a
-                    // plain `ExtensibleArrayIndexBlock`. Both must be
-                    // reconstructed so a reopened dataset can append
+                    // The EA header, then its index block. Filtered
+                    // datasets store a `FilteredIndexBlock`; unfiltered
+                    // ones a plain `ExtensibleArrayIndexBlock`. Both must
+                    // be reconstructed so a reopened dataset can append
                     // (write_chunk consults whichever applies).
-                    let ea_iblk_addr = ea_header.idx_blk_addr;
-                    let (ea_iblk, filt_iblk) = if is_filtered {
-                        let placeholder = ExtensibleArrayIndexBlock::new(
-                            *index_address,
-                            ep.idx_blk_elmts,
-                            ndblk_addrs,
-                            nsblk_addrs,
-                        );
-                        let fib = if ea_iblk_addr != UNDEF_ADDR {
-                            let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
-                            FilteredIndexBlock::decode(
-                                &iblk_buf,
-                                ctx,
-                                ep.idx_blk_elmts as usize,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                                chunk_size_len,
-                            )?
-                        } else {
-                            FilteredIndexBlock::new(
-                                *index_address,
-                                ep.idx_blk_elmts,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                            )
-                        };
-                        (placeholder, Some(fib))
-                    } else {
-                        let eib = if ea_iblk_addr != UNDEF_ADDR {
-                            let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
-                            ExtensibleArrayIndexBlock::decode(
-                                &iblk_buf,
-                                ctx,
-                                ep.idx_blk_elmts as usize,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                            )?
-                        } else {
-                            ExtensibleArrayIndexBlock::new(
-                                *index_address,
-                                ep.idx_blk_elmts,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                            )
-                        };
-                        (eib, None)
-                    };
+                    let (ea_header, chunk_size_len, ea_iblk, filt_iblk) =
+                        handle.load_metadata(|| {
+                            let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                            let ea_header = ExtensibleArrayHeader::decode(&hdr_buf, ctx)?;
 
+                            let is_filtered = ea_header.class_id
+                                == crate::format::chunk_index::extensible_array::EA_CLS_FILT_CHUNK;
+                            let chunk_size_len = if is_filtered {
+                                ea_header.raw_elmt_size - ctx.sizeof_addr - 4
+                            } else {
+                                0
+                            };
+                            let ea_iblk_addr = ea_header.idx_blk_addr;
+                            let (ea_iblk, filt_iblk) = if is_filtered {
+                                let placeholder = ExtensibleArrayIndexBlock::new(
+                                    *index_address,
+                                    ep.idx_blk_elmts,
+                                    ndblk_addrs,
+                                    nsblk_addrs,
+                                );
+                                let fib = if ea_iblk_addr != UNDEF_ADDR {
+                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                                    FilteredIndexBlock::decode(
+                                        &iblk_buf,
+                                        ctx,
+                                        ep.idx_blk_elmts as usize,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                        chunk_size_len,
+                                    )?
+                                } else {
+                                    FilteredIndexBlock::new(
+                                        *index_address,
+                                        ep.idx_blk_elmts,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )
+                                };
+                                (placeholder, Some(fib))
+                            } else {
+                                let eib = if ea_iblk_addr != UNDEF_ADDR {
+                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                                    ExtensibleArrayIndexBlock::decode(
+                                        &iblk_buf,
+                                        ctx,
+                                        ep.idx_blk_elmts as usize,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )?
+                                } else {
+                                    ExtensibleArrayIndexBlock::new(
+                                        *index_address,
+                                        ep.idx_blk_elmts,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )
+                                };
+                                (eib, None)
+                            };
+                            Ok::<_, crate::io::IoError>((
+                                ea_header,
+                                chunk_size_len,
+                                ea_iblk,
+                                filt_iblk,
+                            ))
+                        })?;
+
+                    let ea_iblk_addr = ea_header.idx_blk_addr;
                     info.chunked = Some(ChunkedDatasetInfo {
                         chunk_dims: real_chunk_dims,
                         earray_params: ep,
@@ -3180,25 +3188,31 @@ fn rebuild_dataset(
                 // dblk_page_nelmts chunks, libhdf5 default 1024)
                 // reconstruct through the same decode owner; only
                 // pages the bitmap marks initialized are decoded.
-                let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                let fa_header = FixedArrayHeader::decode(&hdr_buf, ctx)?;
-                let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
-                let chunk_size_len = if is_filtered {
-                    (fa_header.element_size as usize)
-                        .checked_sub(ctx.sizeof_addr as usize + 4)
-                        .ok_or_else(|| {
-                            crate::io::IoError::InvalidState(
-                                "fixed array filtered element_size too small".into(),
-                            )
-                        })?
-                } else {
-                    0
-                };
-                if fa_header.data_blk_addr != UNDEF_ADDR && chunk_size_len <= 8 {
+                let loaded = handle.load_metadata(|| {
+                    let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                    let fa_header = FixedArrayHeader::decode(&hdr_buf, ctx)?;
+                    let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
+                    let chunk_size_len = if is_filtered {
+                        (fa_header.element_size as usize)
+                            .checked_sub(ctx.sizeof_addr as usize + 4)
+                            .ok_or_else(|| {
+                                crate::io::IoError::InvalidState(
+                                    "fixed array filtered element_size too small".into(),
+                                )
+                            })?
+                    } else {
+                        0
+                    };
+                    if fa_header.data_blk_addr == UNDEF_ADDR || chunk_size_len > 8 {
+                        return Ok(None);
+                    }
                     let dblk_size = fixed_array_dblk_disk_size(ctx, &fa_header) as usize;
                     let dblk_buf = handle.read_at_most(fa_header.data_blk_addr, dblk_size)?;
                     let fa_dblk =
                         decode_fixed_array_dblk(ctx, &fa_header, &dblk_buf, chunk_size_len)?;
+                    Ok::<_, crate::io::IoError>(Some((fa_header, fa_dblk)))
+                })?;
+                if let Some((fa_header, fa_dblk)) = loaded {
                     info.fixed_array = Some(FixedArrayDatasetInfo {
                         chunk_dims: real_chunk_dims,
                         fa_header_addr: *index_address,
@@ -3225,18 +3239,43 @@ fn rebuild_dataset(
                 // the bulk loader's few-records-per-node floor
                 // (the same bound creation enforces), stays
                 // re-link only.
-                let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                let bt2_hdr = Bt2Header::decode(&hdr_buf, ctx)?;
+                // The header and the walk are one load: every node is
+                // placed by the header the walk started from.
+                let loaded = handle.load_metadata(|| {
+                    let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                    let bt2_hdr = Bt2Header::decode(&hdr_buf, ctx)?;
+                    let is_filt = match bt2_hdr.record_type {
+                        BT2_TYPE_CHUNK_UNFILT => Some(false),
+                        BT2_TYPE_CHUNK_FILT => Some(true),
+                        _ => None,
+                    };
+                    let (Some(is_filt), true) = (
+                        is_filt,
+                        bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let mut walked = (Vec::new(), Vec::new());
+                    if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0 {
+                        let geo = Bt2Geometry::new(
+                            bt2_hdr.node_size,
+                            bt2_hdr.record_size,
+                            bt2_hdr.depth,
+                            ctx.sizeof_addr,
+                        );
+                        let mut walk =
+                            Bt2Walk::new(handle, ctx, bt2_hdr.record_size, bt2_hdr.node_size, &geo);
+                        walk.descend(
+                            bt2_hdr.root_node_addr,
+                            bt2_hdr.depth,
+                            bt2_hdr.num_records_in_root,
+                        )?;
+                        walked = (walk.node_addrs, walk.records);
+                    }
+                    Ok::<_, crate::io::IoError>(Some((bt2_hdr, is_filt, walked)))
+                })?;
                 let ndims = real_chunk_dims.len();
-                let is_filt = match bt2_hdr.record_type {
-                    BT2_TYPE_CHUNK_UNFILT => Some(false),
-                    BT2_TYPE_CHUNK_FILT => Some(true),
-                    _ => None,
-                };
-                if let (Some(is_filt), true) = (
-                    is_filt,
-                    bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
-                ) {
+                if let Some((bt2_hdr, is_filt, (node_addrs, record_bytes))) = loaded {
                     let mut index = if is_filt {
                         let csl = (bt2_hdr.record_size as usize)
                             .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
@@ -3258,23 +3297,7 @@ fn rebuild_dataset(
                     index.node_size = bt2_hdr.node_size;
                     index.split_percent = bt2_hdr.split_percent;
                     index.merge_percent = bt2_hdr.merge_percent;
-                    let mut node_addrs = Vec::new();
-                    if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0 {
-                        let geo = Bt2Geometry::new(
-                            bt2_hdr.node_size,
-                            bt2_hdr.record_size,
-                            bt2_hdr.depth,
-                            ctx.sizeof_addr,
-                        );
-                        let mut walk =
-                            Bt2Walk::new(handle, ctx, bt2_hdr.record_size, bt2_hdr.node_size, &geo);
-                        walk.descend(
-                            bt2_hdr.root_node_addr,
-                            bt2_hdr.depth,
-                            bt2_hdr.num_records_in_root,
-                        )?;
-                        node_addrs = walk.node_addrs;
-                        let record_bytes = walk.records;
+                    if !record_bytes.is_empty() {
                         let total = if bt2_hdr.record_size > 0 {
                             record_bytes.len() / bt2_hdr.record_size as usize
                         } else {
@@ -5760,23 +5783,27 @@ impl Hdf5Writer {
                 list_max: index.list_max,
                 btree_min: index.btree_min,
             });
-            let mut reader = crate::io::reader::HandleBlockReader { handle };
-            if index.heap_addr != UNDEF_ADDR {
-                superseded.extend(collect_heap_extents(index.heap_addr, ctx, &mut reader)?);
-            }
-            if index.index_addr != UNDEF_ADDR {
-                if index.index_type == SOHM_INDEX_LIST {
-                    // `H5SM_LIST_SIZE`: the block is sized for `list_max`
-                    // records however few are in it.
-                    superseded.push((index.index_addr, list_size(ctx, index.list_max) as u64));
-                } else {
-                    superseded.extend(collect_btree_v2_extents(
-                        index.index_addr,
-                        ctx,
-                        &mut reader,
-                    )?);
+            superseded.extend(handle.load_metadata(|| {
+                let mut reader = crate::io::reader::HandleBlockReader { handle };
+                let mut extents = Vec::new();
+                if index.heap_addr != UNDEF_ADDR {
+                    extents.extend(collect_heap_extents(index.heap_addr, ctx, &mut reader)?);
                 }
-            }
+                if index.index_addr != UNDEF_ADDR {
+                    if index.index_type == SOHM_INDEX_LIST {
+                        // `H5SM_LIST_SIZE`: the block is sized for `list_max`
+                        // records however few are in it.
+                        extents.push((index.index_addr, list_size(ctx, index.list_max) as u64));
+                    } else {
+                        extents.extend(collect_btree_v2_extents(
+                            index.index_addr,
+                            ctx,
+                            &mut reader,
+                        )?);
+                    }
+                }
+                Ok::<_, crate::format::FormatError>(extents)
+            })?);
         }
         Ok(Some(Box::new(SohmState::new(specs, superseded))))
     }
@@ -5825,7 +5852,7 @@ impl Hdf5Writer {
             let ext = sb.superblock_extension_address;
             (ctx, btree, root, ext, Some(sb))
         } else {
-            let sb = SuperblockV2V3::decode(&sb_buf)?;
+            let sb = crate::io::reader::load_superblock_v2v3(&handle)?;
             let ctx = FormatContext {
                 sizeof_addr: sb.sizeof_offsets,
                 sizeof_size: sb.sizeof_lengths,
@@ -7328,20 +7355,23 @@ impl Hdf5Writer {
         use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
         use crate::format::fractal_heap::collect_heap_extents;
 
-        let mut reader = crate::io::reader::HandleBlockReader {
-            handle: &self.handle,
-        };
-        let mut extents = Vec::new();
-        if heap_addr != UNDEF_ADDR {
-            extents.extend(collect_heap_extents(heap_addr, &self.ctx, &mut reader)?);
-        }
-        for addr in [Some(name_bt2_addr), corder_bt2_addr]
-            .into_iter()
-            .flatten()
-            .filter(|&a| a != UNDEF_ADDR)
-        {
-            extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
-        }
+        let extents = self.handle.load_metadata(|| {
+            let mut reader = crate::io::reader::HandleBlockReader {
+                handle: &self.handle,
+            };
+            let mut extents = Vec::new();
+            if heap_addr != UNDEF_ADDR {
+                extents.extend(collect_heap_extents(heap_addr, &self.ctx, &mut reader)?);
+            }
+            for addr in [Some(name_bt2_addr), corder_bt2_addr]
+                .into_iter()
+                .flatten()
+                .filter(|&a| a != UNDEF_ADDR)
+            {
+                extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
+            }
+            Ok::<_, crate::format::FormatError>(extents)
+        })?;
         for (addr, len) in extents {
             self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
@@ -11434,14 +11464,15 @@ impl Hdf5Writer {
         addr: u64,
     ) -> IoResult<ExtensibleArraySuperBlock> {
         let len = k.geo.sblk_size(u, self.ctx.sizeof_addr, k.max_nelmts_bits);
-        let buf = self.handle.read_at(addr, len)?;
-        Ok(ExtensibleArraySuperBlock::decode(
-            &buf,
-            &self.ctx,
-            k.max_nelmts_bits,
-            k.geo.sblk[u].ndblks as usize,
-            k.geo.sblk_page_init_len(u),
-        )?)
+        self.handle.load_metadata(|| {
+            Ok(ExtensibleArraySuperBlock::decode(
+                &self.handle.read_at(addr, len)?,
+                &self.ctx,
+                k.max_nelmts_bits,
+                k.geo.sblk[u].ndblks as usize,
+                k.geo.sblk_page_init_len(u),
+            )?)
+        })
     }
 
     /// The `nelmts` entries of the block at `addr`, from `c`'s held copy
@@ -11461,8 +11492,9 @@ impl Hdf5Writer {
                 return Ok((0..nelmts).map(|i| img.entry(k, i, sa)).collect());
             }
         }
-        let buf = self.handle.read_at(addr, len)?;
-        self.decode_ea_entries(k, &buf, block, nelmts)
+        self.handle.load_metadata(|| {
+            self.decode_ea_entries(k, &self.handle.read_at(addr, len)?, block, nelmts)
+        })
     }
 
     /// The `nelmts` entries of `buf`, a whole block, checked against its
@@ -11604,8 +11636,11 @@ impl Hdf5Writer {
             .is_some_and(|i| i.addr == addr && i.bytes.len() == len);
         if !held {
             self.flush_ea_block(c)?;
-            let bytes = self.handle.read_at(addr, len)?;
-            self.decode_ea_entries(k, &bytes, block, nelmts)?;
+            let bytes = self.handle.load_metadata(|| {
+                let bytes = self.handle.read_at(addr, len)?;
+                self.decode_ea_entries(k, &bytes, block, nelmts)?;
+                Ok::<_, crate::io::IoError>(bytes)
+            })?;
             c.ea_cache.block = Some(EaImage {
                 addr,
                 entries_at,
@@ -17228,6 +17263,10 @@ impl Hdf5Writer {
         // leave its old block intact for whoever is still holding the previous
         // index (see `swmr_active`).
         self.swmr_active = true;
+        // `H5F__start_swmr_write`: once the lock is released another opener
+        // may be rewriting what this writer loads back.
+        self.handle
+            .set_metadata_read_attempts(crate::io::reader::SWMR_METADATA_READ_ATTEMPTS);
         Ok(())
     }
 

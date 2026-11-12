@@ -192,3 +192,60 @@ fn a_torn_chunk_index_block_is_read_again_until_it_checks() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// A SWMR writer reads metadata again while its checksum fails, as
+/// `H5F__start_swmr_write` gives it libhdf5's SWMR read attempts: once it
+/// has released its lock, another opener may be rewriting what it loads.
+#[test]
+fn a_swmr_writer_reads_a_torn_data_block_again() {
+    let path = tmp("writer");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let ds = w.create_streaming_dataset::<u8>("frames", &[4]).unwrap();
+        w.start_swmr().unwrap();
+        for i in 0..40u8 {
+            w.append_frame(ds, &[i; 4]).unwrap();
+        }
+        w.close().unwrap();
+    }
+    let mut w = SwmrFileWriter::open_append_with_locking(&path, FileLocking::Disabled).unwrap();
+    let ds = w.dataset_index("frames").unwrap();
+    w.start_swmr().unwrap();
+    // Frame 40 goes in a data block already on disk, which the reopened
+    // writer has to load. Each block's first entry follows its prefix:
+    // signature, version, client id, header address, 4-byte block offset.
+    let bytes = std::fs::read(&path).unwrap();
+    let blocks: Vec<u64> = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"EADB")
+        .map(|(at, _)| at as u64 + 18)
+        .collect();
+    assert_eq!(blocks.len(), 2);
+    for &at in &blocks {
+        flip(&path, at);
+    }
+    let fixer = {
+        let path = path.clone();
+        let blocks = blocks.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            for at in blocks {
+                flip(&path, at);
+            }
+        })
+    };
+    w.append_frame(ds, &[40; 4]).unwrap();
+    fixer.join().unwrap();
+    w.close().unwrap();
+
+    let mut r = SwmrFileReader::open_with_locking(&path, FileLocking::Disabled).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![41, 4]);
+    for i in 0..41u64 {
+        assert_eq!(
+            r.read_chunk_raw("frames", &[i, 0]).unwrap(),
+            Some((vec![i as u8; 4], 0))
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}

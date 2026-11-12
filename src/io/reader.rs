@@ -447,7 +447,7 @@ pub(crate) const SWMR_METADATA_READ_ATTEMPTS: NonZeroU32 = NonZeroU32::new(100).
 
 /// The v2/v3 superblock at the start of the address space, read and decoded
 /// as one load so a torn read is retried whole.
-fn load_superblock_v2v3(handle: &FileHandle) -> IoResult<SuperblockV2V3> {
+pub(crate) fn load_superblock_v2v3(handle: &FileHandle) -> IoResult<SuperblockV2V3> {
     handle.load_metadata(|| Ok(SuperblockV2V3::decode(&handle.read_at_most(0, 256)?)?))
 }
 
