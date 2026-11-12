@@ -2029,7 +2029,7 @@ fn chunk_read_job(
 }
 
 /// Read one chunk's raw bytes according to its job.
-fn read_chunk_raw(handle: &FileHandle, j: &ChunkReadJob) -> IoResult<Vec<u8>> {
+fn read_job_bytes(handle: &FileHandle, j: &ChunkReadJob) -> IoResult<Vec<u8>> {
     if j.at_most {
         Ok(handle.read_at_most(j.addr, j.len)?)
     } else {
@@ -2686,7 +2686,7 @@ fn read_and_decompress_chunks(
         let decode =
             |(job, sink): (Option<ChunkReadJob>, ChunkSink<'_>)| -> IoResult<ChunkDecoded> {
                 match job {
-                    Some(j) => deliver(read_chunk_raw(handle, &j)?, j.mask, sink),
+                    Some(j) => deliver(read_job_bytes(handle, &j)?, j.mask, sink),
                     None => Ok(ChunkDecoded::Absent),
                 }
             };
@@ -2714,7 +2714,7 @@ fn read_and_decompress_chunks(
         let raws: Vec<Option<(Vec<u8>, u32)>> = jobs
             .into_iter()
             .map(|job| match job {
-                Some(j) => Ok(Some((read_chunk_raw(handle, &j)?, j.mask))),
+                Some(j) => Ok(Some((read_job_bytes(handle, &j)?, j.mask))),
                 None => Ok(None),
             })
             .collect::<IoResult<Vec<_>>>()?;
@@ -2742,7 +2742,7 @@ fn read_and_decompress_chunks(
         jobs.into_iter()
             .zip(sinks)
             .map(|(job, sink)| match job {
-                Some(j) => deliver(read_chunk_raw(handle, &j)?, j.mask, sink),
+                Some(j) => deliver(read_job_bytes(handle, &j)?, j.mask, sink),
                 None => Ok(ChunkDecoded::Absent),
             })
             .collect()
@@ -6280,37 +6280,23 @@ impl Hdf5Reader {
     /// ([`chunk_lookup::find`]), so it decodes only the index blocks on the
     /// way to this one chunk.
     ///
-    /// `Err` when the dataset is not chunked, `chunk_coords` has the wrong
-    /// rank or lies outside the chunk grid, or the chunk at those coordinates
-    /// has never been written.
-    pub fn read_chunk_raw_at(
-        &mut self,
-        name: &str,
-        chunk_coords: &[u64],
-    ) -> IoResult<(Vec<u8>, u32)> {
-        self.lookup_chunk_raw(name, chunk_coords)?.ok_or_else(|| {
-            crate::io::IoError::InvalidState(format!(
-                "chunk at coordinates {chunk_coords:?} has not been written"
-            ))
-        })
-    }
-
-    /// The stored bytes and filter mask of the chunk at `chunk_coords`, or
-    /// `None` when the index holds no chunk there.
-    fn lookup_chunk_raw(
+    /// `Ok(None)` when no chunk is there yet: the index holds none at those
+    /// coordinates, or they lie beyond the extent last read (a SWMR reader's
+    /// extent at its last refresh) though inside the maximum shape. `Err`
+    /// when the dataset is not chunked or `chunk_coords` has the wrong rank or
+    /// lies outside the maximum shape's chunk grid.
+    pub fn read_chunk_raw(
         &mut self,
         name: &str,
         chunk_coords: &[u64],
     ) -> IoResult<Option<(Vec<u8>, u32)>> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.lookup_chunk_raw(&path, chunk_coords);
+            return owner.read_chunk_raw(&path, chunk_coords);
         }
         let pos = self.dataset_position(name)?;
         let view = self.chunk_index_view(pos)?.ok_or_else(|| {
-            crate::io::IoError::InvalidState(
-                "read_chunk_raw_at is only for chunked datasets".into(),
-            )
+            crate::io::IoError::InvalidState(format!("dataset '{name}' is not chunked"))
         })?;
         let cache = self.datasets.chunk_cache_mut(pos, view.index_address());
         let Some(rec) = chunk_lookup::find(&self.handle, &view, &mut cache.blocks, chunk_coords)?
@@ -6321,6 +6307,20 @@ impl Hdf5Reader {
             self.handle.read_at(rec.addr, rec.nbytes as usize)?,
             rec.mask,
         )))
+    }
+
+    /// [`read_chunk_raw`](Self::read_chunk_raw), with a chunk that is not
+    /// there an `Err` rather than `None`.
+    pub fn read_chunk_raw_at(
+        &mut self,
+        name: &str,
+        chunk_coords: &[u64],
+    ) -> IoResult<(Vec<u8>, u32)> {
+        self.read_chunk_raw(name, chunk_coords)?.ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "chunk at coordinates {chunk_coords:?} has not been written"
+            ))
+        })
     }
 }
 

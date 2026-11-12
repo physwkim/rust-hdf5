@@ -1015,6 +1015,26 @@ impl SwmrFileReader {
         Ok(self.reader.read_slice(name, starts, counts)?)
     }
 
+    /// Read one chunk's stored bytes and filter mask, with no filter undone
+    /// — `H5Dread_chunk` (h5py: `Dataset.id.read_direct_chunk`).
+    ///
+    /// `chunk_coords` counts chunks, not elements, one per dimension. The
+    /// lookup decodes only the index blocks on the way to that chunk, so the
+    /// cost does not grow with the number of chunks written.
+    ///
+    /// `Ok(None)` when the writer has not put a chunk there as of the last
+    /// [`refresh`](Self::refresh): none is indexed at those coordinates, or
+    /// they lie beyond the extent read then but inside the maximum shape.
+    /// `Err` when the dataset is not chunked or `chunk_coords` has the wrong
+    /// rank or lies outside the maximum shape's chunk grid.
+    pub fn read_chunk_raw(
+        &mut self,
+        name: &str,
+        chunk_coords: &[u64],
+    ) -> Result<Option<(Vec<u8>, u32)>> {
+        Ok(self.reader.read_chunk_raw(name, chunk_coords)?)
+    }
+
     /// Read a slice (hyperslab) of a dataset as a typed vector.
     /// See [`read_slice_raw`](Self::read_slice_raw); `T`'s width is checked
     /// like [`read_dataset`](Self::read_dataset).
