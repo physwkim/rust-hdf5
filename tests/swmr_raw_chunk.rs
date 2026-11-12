@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_hdf5::format::messages::filter::{apply_filters, reverse_filters};
+use rust_hdf5::format::messages::filter::{apply_filters, reverse_filters, reverse_filters_masked};
 use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
 use rust_hdf5::{FileLocking, FilterPipeline, H5File};
 
@@ -212,6 +212,47 @@ fn a_refreshing_reader_reads_each_flushed_frame_raw() {
             Some((packed_of(0), 0))
         );
     }
+    w.close().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The reader reports the pipeline the writer recorded, and that pipeline
+/// undoes a live raw chunk under the chunk's own mask: both filters applied,
+/// and deflate skipped (mask bit 1). An unfiltered dataset reports none; an
+/// unknown name is an error.
+#[test]
+fn a_live_reader_decodes_raw_chunks_with_the_reported_filters() {
+    let path = tmp("filters");
+    let pipeline = FilterPipeline::shuffle_deflate(2, 4);
+    let mut w = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+    let ds = w
+        .create_streaming_dataset_compressed::<u16>("frames", &[4, 8], pipeline.clone())
+        .unwrap();
+    w.create_streaming_dataset::<u16>("plain", &[4, 8]).unwrap();
+    w.start_swmr().unwrap();
+    let packed = apply_filters(&pipeline, &frame(0)).unwrap();
+    let shuffled = apply_filters(&FilterPipeline::shuffle(2), &frame(1)).unwrap();
+    w.append_frame_raw(ds, &packed, 0).unwrap();
+    w.append_frame_raw(ds, &shuffled, 0b10).unwrap();
+    w.flush().unwrap();
+
+    let mut r = SwmrFileReader::open_with_locking(&path, FileLocking::Disabled).unwrap();
+    let filters = r.dataset_filters("frames").unwrap();
+    assert_eq!(filters, pipeline.filters);
+    let reported = FilterPipeline { filters };
+    for i in 0..2u16 {
+        let (raw, mask) = r
+            .read_chunk_raw("frames", &[u64::from(i), 0, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reverse_filters_masked(&reported, &raw, mask).unwrap(),
+            frame(i),
+            "frame {i}"
+        );
+    }
+    assert_eq!(r.dataset_filters("plain").unwrap(), Vec::new());
+    assert!(r.dataset_filters("missing").is_err());
     w.close().unwrap();
     let _ = std::fs::remove_file(&path);
 }
