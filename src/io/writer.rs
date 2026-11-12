@@ -17287,8 +17287,9 @@ impl Hdf5Writer {
     /// Perform a full finalize for SWMR mode.
     ///
     /// This writes all dataset object headers, the root group header, and the
-    /// superblock with SWMR flags. After this call, the file is valid for
-    /// SWMR readers. Subsequent writes use in-place updates.
+    /// superblock with SWMR flags, then releases the file lock. After this
+    /// call, SWMR readers can open the file. Subsequent writes use in-place
+    /// updates.
     pub fn finalize_for_swmr(&mut self) -> IoResult<()> {
         self.reject_swmr()?;
         // 0. Flush all chunked dataset index structures.
@@ -17356,6 +17357,10 @@ impl Hdf5Writer {
         // leave its old block intact for whoever is still holding the previous
         // index (see `swmr_active`).
         self.swmr_active = true;
+        // Last, as `H5F__start_swmr_write` unlocks last: a reader the lock
+        // let in finds the SWMR superblock. Released, not downgraded: a
+        // shared `LockFileEx` lock would refuse this writer's own writes.
+        self.handle.release_lock()?;
         Ok(())
     }
 
@@ -20936,10 +20941,6 @@ mod tests {
         assert_eq!(writer.superblock_version_for(0), SUPERBLOCK_V2);
 
         writer.finalize_for_swmr().unwrap();
-        // What `start_swmr` does after finalizing, and what lets a second
-        // handle read the file while this writer lives — the writer's
-        // exclusive lock is mandatory on Windows.
-        writer.handle().release_lock().unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
 
         // The close-time finalize carries no SWMR flag; the file is still an
@@ -20947,6 +20948,30 @@ mod tests {
         // its readers attached to.
         writer.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `finalize_for_swmr` lets readers in, and a reader that locks the file,
+    /// as libhdf5's do, takes a shared lock: the writer has to hold none from
+    /// then on. On Windows its exclusive lock also refuses every read
+    /// through another handle.
+    #[test]
+    fn finalize_for_swmr_lets_a_locking_reader_attach() {
+        let path = temp_path("swmr_unlocked");
+        let mut writer =
+            Hdf5Writer::create_with_locking(&path, crate::io::locking::FileLocking::Enabled)
+                .unwrap();
+        writer
+            .create_dataset("d", DatatypeMessage::i32_type(), &[2])
+            .unwrap();
+        writer.finalize_for_swmr().unwrap();
+
+        let reader = std::fs::File::open(&path).unwrap();
+        reader
+            .try_lock_shared()
+            .expect("the SWMR writer still holds its lock");
+        drop(reader);
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 
@@ -20964,7 +20989,6 @@ mod tests {
             .create_fixed_array_dataset("grid", DatatypeMessage::i32_type(), &[3000], &[1])
             .unwrap();
         writer.finalize_for_swmr().unwrap();
-        writer.handle().release_lock().unwrap();
 
         let value = 0x5eed_f00d_i32.to_le_bytes();
         writer.write_chunk_fixed_array(idx, &[7], &value).unwrap();

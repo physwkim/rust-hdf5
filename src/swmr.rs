@@ -50,8 +50,8 @@ impl SwmrFileWriter {
 
     /// Create a new HDF5 file for SWMR streaming with an explicit locking
     /// policy. The writer holds an exclusive lock until [`Self::start_swmr`]
-    /// is called, at which point the lock is downgraded to shared so
-    /// concurrent SWMR readers can attach.
+    /// is called, at which point the lock is released so concurrent SWMR
+    /// readers can attach.
     pub fn create_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self> {
         let inner = IoSwmrWriter::create_with_locking(path.as_ref(), locking)?;
         Ok(Self { inner })
@@ -930,9 +930,9 @@ pub struct SwmrFileReader {
 
 impl SwmrFileReader {
     /// Open an HDF5 file for SWMR reading using the env-var-derived
-    /// locking policy. Takes a shared lock so it coexists with the
-    /// downgraded shared lock held by [`SwmrFileWriter`] after
-    /// `start_swmr`, and with other concurrent SWMR readers.
+    /// locking policy. Takes a shared lock, which coexists with other
+    /// concurrent SWMR readers; [`SwmrFileWriter`] holds none after
+    /// `start_swmr`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = Hdf5Reader::open_swmr(path.as_ref())?;
         Ok(Self { reader })
