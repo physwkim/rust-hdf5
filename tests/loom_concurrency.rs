@@ -21,7 +21,7 @@
 use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
 
-/// Byte-for-byte the production `FileAllocator::allocate` CAS loop
+/// Byte-for-byte the production `FileAllocator::allocate_aligned` CAS loop
 /// (`src/io/allocator.rs`): align the current EOF up, bump by `size`, publish
 /// with a weak compare-and-swap, retry on contention or spurious failure.
 fn allocate(eof: &AtomicU64, alignment: u64, size: u64) -> u64 {

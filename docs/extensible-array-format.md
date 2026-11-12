@@ -261,7 +261,15 @@ Verified round-trip with h5py 3.16 / libhdf5 2.0.0 in both directions,
 filtered and unfiltered, across super blocks (1500–2000 chunks) and across
 paged data blocks (140,000 chunks).
 
-Not done — *writing* paged data blocks (chunk index `>= 131,060` with
-default parameters): the writer errors clearly rather than emitting an
-unpaged block where libhdf5 expects pages. The reader handles paged data
-blocks (item 7).
+8. `writer.rs::ea_slot` writes paged data blocks (chunk index `>= 131,060`
+   with default parameters) as `H5EA__lookup_elmt` does: the data block
+   holds only its prefix, each page is created on its first chunk and its
+   bit set in the super block's page-init bitmap, and under SWMR a page or
+   block is written before the parent that points at it. A data block
+   addressed directly from the index block is never paged by libhdf5's
+   geometry, and the writer refuses one.
+
+Verified with h5py on SWMR streams of 263,232 chunks, filtered and
+unfiltered: live `read_direct_chunk` of the newest chunk, a whole read
+after close, and the EA header's super-block, data-block and element
+counts against the same dataset written by libhdf5 1.14.6.

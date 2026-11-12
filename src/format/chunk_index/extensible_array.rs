@@ -907,7 +907,8 @@ pub struct EaChunkLoc {
     pub offset_in_dblk: u64,
     /// `block_offset` value to stamp into the data block header.
     pub dblk_block_offset: u64,
-    /// Whether the data block exceeds the page size (paged — unsupported).
+    /// Whether the data block exceeds the page size, so its elements live in
+    /// pages after its prefix.
     pub paged: bool,
     /// How the data block address is reached.
     pub path: EaDblkPath,
@@ -1068,6 +1069,39 @@ impl EaGeometry {
         4 + 1 + 1 + sizeof_addr as usize + arr_off + 4
     }
 
+    /// Size of super block `u`'s page-init bitmaps, all its data blocks'
+    /// together; 0 when they are not paged.
+    pub fn sblk_page_init_len(&self, u: usize) -> usize {
+        self.sblk[u].ndblks as usize * self.dblk_page_init_size(u)
+    }
+
+    /// On-disk size of super block `u` (`H5EA_SBLOCK_SIZE`).
+    pub fn sblk_size(&self, u: usize, sizeof_addr: u8, max_nelmts_bits: u8) -> usize {
+        let arr_off = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
+        4 + 1
+            + 1
+            + sizeof_addr as usize
+            + arr_off
+            + self.sblk_page_init_len(u)
+            + self.sblk[u].ndblks as usize * sizeof_addr as usize
+            + 4
+    }
+
+    /// On-disk size of one data block of super block `u` (`H5EA_DBLOCK_SIZE`):
+    /// its prefix, every element, and a checksum per page. A paged block's
+    /// pages follow its prefix inside this one allocation.
+    pub fn dblk_size(
+        &self,
+        u: usize,
+        sizeof_addr: u8,
+        max_nelmts_bits: u8,
+        raw_elmt_size: usize,
+    ) -> usize {
+        self.dblk_prefix_size(sizeof_addr, max_nelmts_bits)
+            + self.sblk[u].dblk_nelmts as usize * raw_elmt_size
+            + self.npages(u) as usize * 4
+    }
+
     /// Locate chunk `idx` within the array.
     ///
     /// Returns an error when `idx` exceeds the array's capacity (rather than
@@ -1120,8 +1154,8 @@ impl EaGeometry {
 /// Extensible array super block (EASB).
 ///
 /// Holds the data-block addresses for one super block. Used for super blocks
-/// whose data-block addresses do not fit in the index block. Paged data
-/// blocks (very large arrays) are not supported.
+/// whose data-block addresses do not fit in the index block. When those data
+/// blocks are paged it also holds which of their pages exist.
 ///
 /// On-disk layout:
 /// ```text
@@ -1144,14 +1178,22 @@ pub struct ExtensibleArraySuperBlock {
 }
 
 impl ExtensibleArraySuperBlock {
-    /// Create an empty (non-paged) super block with `ndblks` undefined slots.
-    pub fn new(class_id: u8, header_addr: u64, block_offset: u64, ndblks: usize) -> Self {
+    /// Create an empty super block with `ndblks` undefined slots and a
+    /// cleared `page_init_len`-byte page-init bitmap
+    /// ([`EaGeometry::sblk_page_init_len`]).
+    pub fn new(
+        class_id: u8,
+        header_addr: u64,
+        block_offset: u64,
+        ndblks: usize,
+        page_init_len: usize,
+    ) -> Self {
         Self {
             class_id,
             header_addr,
             block_offset,
             dblk_addrs: vec![UNDEF_ADDR; ndblks],
-            page_init: Vec::new(),
+            page_init: vec![0; page_init_len],
         }
     }
 

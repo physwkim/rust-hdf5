@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.12
+
+### Added
+
+- `SwmrFileReader::dataset_filters` returns a dataset's filter pipeline in
+  application order, each filter's id, flags and client data, as
+  `H5Dataset::filters` does on a closed file, so a live reader can undo
+  the bytes `read_chunk_raw` returns under their filter mask.
+
+### Fixed
+
+- A dataset whose chunks an extensible array indexes takes chunks past
+  index 131,059, where 0.7.11 refused the chunk: the writer adds super
+  blocks and paged data blocks as libhdf5's `H5EA` does, so a SWMR stream
+  is no longer capped at 131,060 frames. h5py reads the newest chunk of a
+  263,232-chunk stream live and the whole dataset after close, and the
+  array's super-block, data-block and element counts match libhdf5's.
+
+### Changed
+
+- Chunks and metadata blocks start where the file ends, unaligned, as
+  libhdf5 places them by default; only contiguous dataset storage still
+  starts on an eight-byte boundary, for mapped views. Aligning every
+  allocation left a free-list fragment per chunk whose size was not a
+  multiple of eight, and every later allocation scanned the list: a SWMR
+  append of a 4-byte frame took 230 µs by frame 300,000.
+- An append into an extensible-array data block or page sets its entry in
+  the block the writer holds; a flush writes the entries changed since the
+  last one and the block's checksum, before the index block that
+  publishes them. The append used to read, re-encode and rewrite the whole
+  block, which cost 6 µs at frame 0 and up to 23 µs past frame 32,768. A SWMR
+  append of a 4- or 5-byte frame now takes 0.3–0.5 µs from frame 0 to
+  300,000, and 0.6–0.7 µs with a flush every 1000 frames.
+
 ## 0.7.11
 
 ### Added

@@ -392,10 +392,11 @@ fn stageable(_len: usize) -> bool {
 
 /// Widest gap the accumulator will bridge to keep one run going.
 ///
-/// The writer aligns each object header block, so consecutive headers land a
-/// few bytes apart with the slack in between never written. Bridging that
-/// slack is what turns 2000 header writes into one; a page bounds how much of
-/// the file a bridge can pull into the run.
+/// Blocks one flush writes need not be adjacent: between two of them can lie
+/// bytes the flush does not rewrite, a block written earlier or one released.
+/// Bridging that slack keeps one run going where breaking it would cost a
+/// `pwrite` per block; a page bounds how much of the file a bridge can pull
+/// into the run.
 const ACCUM_MAX_GAP: u64 = 4096;
 
 /// The write accumulator: one contiguous run of bytes waiting for a single

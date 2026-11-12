@@ -651,8 +651,9 @@ mod tests {
     /// Paged file-space allocation is what makes this reachable: it aligns to
     /// the page and to nothing else, exactly as `H5Pset_alignment`'s defaults
     /// leave libhdf5, so a byte dataset of odd length pushes whatever follows
-    /// off an eight-byte boundary. This crate's unpaged allocator aligns every
-    /// block to eight and cannot produce one.
+    /// off an eight-byte boundary. An unpaged file starts contiguous storage on
+    /// an eight-byte boundary (`Hdf5Writer::allocate_contiguous`) and cannot
+    /// produce one.
     #[test]
     fn a_misaligned_data_offset_is_refused() {
         let path = temp_path("alignment");

@@ -20,12 +20,14 @@ pub(crate) struct FreeBlock {
 
 /// File space allocator: bump-the-end-of-file, with reuse of released blocks.
 ///
-/// Hands out file offsets by bumping an end-of-file pointer. Every
-/// allocation is aligned to the configured boundary (default 8 bytes).
+/// Hands out file offsets by bumping an end-of-file pointer. An allocation
+/// starts wherever the end of the file is, as libhdf5's default alignment of
+/// one (`H5F_ALIGN_DEF`) leaves it; only a request through
+/// [`allocate_aligned`](Self::allocate_aligned) skips to a boundary.
 ///
 /// The end-of-file pointer is an [`AtomicU64`], so `allocate` takes `&self`
 /// and is safe to call concurrently: two threads allocating at once each get
-/// a distinct, non-overlapping, aligned offset. This is the lock-free
+/// a distinct, non-overlapping offset. This is the lock-free
 /// foundation that lets the `threadsafe` writer hand out chunk space without
 /// a global lock (see `docs/threadsafe-fine-grained-locking.md`). A writer
 /// that never calls [`free`](Self::free) never touches the free list, and
@@ -52,14 +54,12 @@ pub(crate) struct FreeBlock {
 /// file and the two accounts cannot drift apart.
 pub struct FileAllocator {
     eof: AtomicU64,
-    alignment: u64,
     /// How the file's strategy maps requests onto managers and pages. Fixed
     /// for the allocator's life: it is a file creation property.
     policy: SpacePolicy,
     /// Free regions of the file, sorted by address with adjacent regions
     /// merged: blocks this session released, and — for a persisting file —
-    /// the sections it opened holding. Only the former are guaranteed to
-    /// start on the alignment boundary.
+    /// the sections it opened holding.
     ///
     /// A plain `Mutex` regardless of the `threadsafe` feature: the allocator
     /// is shared across threads in both builds (see
@@ -81,20 +81,9 @@ impl FileAllocator {
 
     /// Create a new allocator whose free region starts at `initial_eof`,
     /// for a file whose strategy is known.
-    ///
-    /// A paged file aligns nothing to eight bytes: a small allocation is
-    /// carved from a page and a large one is page-aligned, so the only
-    /// boundary that exists is the page. An unpaged file keeps this crate's
-    /// eight-byte alignment, which libhdf5 does not have (`H5Pset_alignment`
-    /// defaults to a threshold and an alignment of one) but which every file
-    /// this crate has written so far does.
     pub fn with_policy(initial_eof: u64, policy: SpacePolicy) -> Self {
         Self {
             eof: AtomicU64::new(initial_eof),
-            alignment: match policy {
-                SpacePolicy::Aggr => 8,
-                SpacePolicy::Paged { .. } => 1,
-            },
             policy,
             free_list: Mutex::new(Vec::new()),
             free_count: AtomicU64::new(0),
@@ -111,16 +100,18 @@ impl FileAllocator {
         (size + alignment - 1) & !(alignment - 1)
     }
 
-    /// The boundary an allocation drawn from `manager` must start on.
+    /// The boundary an allocation drawn from `manager` must start on, for a
+    /// request that asks for `align`.
     ///
     /// `H5MF__open_fstype` (H5MF.c:325-330) gives a paged file's large manager
-    /// an alignment of one page and every other manager `H5F_ALIGN_DEF`, which
-    /// is one byte. Unpaged, this crate uses its own eight.
-    fn draw_alignment(&self, manager: FreeSpaceManager) -> u64 {
+    /// an alignment of one page and every other paged manager `H5F_ALIGN_DEF`,
+    /// which is one byte; only an unpaged file's managers take an alignment
+    /// from the file, and here that is the request's.
+    fn draw_alignment(&self, manager: FreeSpaceManager, align: u64) -> u64 {
         match (self.policy, manager) {
             (SpacePolicy::Paged { page }, FreeSpaceManager::Large) => page,
             (SpacePolicy::Paged { .. }, _) => 1,
-            (SpacePolicy::Aggr, _) => self.alignment,
+            (SpacePolicy::Aggr, _) => align,
         }
     }
 
@@ -129,23 +120,35 @@ impl FileAllocator {
     /// A released block in the manager the request maps to is reused before
     /// the file grows; otherwise the end-of-file pointer is bumped. The bump
     /// is lock-free: it is published with a compare-and-swap loop, so
-    /// concurrent callers never overlap (alignment makes a plain `fetch_add`
-    /// insufficient, hence the CAS).
+    /// concurrent callers never overlap (an aligned draw's start depends on
+    /// the end it read, so a plain `fetch_add` could not serve both).
     ///
     /// `class` is `H5MF_alloc`'s `alloc_type` reduced through the sec2
     /// driver's dichotomy. It decides which manager the request is served
-    /// from and which one records whatever the request leaves over — the
-    /// alignment fragment before it, the page remainder after it. Without it
+    /// from and which one records whatever the request leaves over — an
+    /// aligned draw's fragment before it, the page remainder after it. Without it
     /// those bytes would be held by nothing and recorded by no manager, which
     /// is what `h5stat -S` counts as unaccounted space.
     pub fn allocate(&self, size: u64, class: FreeSpaceClass) -> u64 {
+        self.allocate_aligned(size, class, 1)
+    }
+
+    /// [`allocate`](Self::allocate) starting on a multiple of `align`, a
+    /// power of two, in a file with no page structure. A paged file aligns
+    /// to its page grid alone, as libhdf5 does.
+    ///
+    /// Every aligned draw from the end of the file can leave a fragment
+    /// behind it, so this is for an allocation that is read in place at a
+    /// typed address, not for one made per chunk or per metadata block.
+    pub fn allocate_aligned(&self, size: u64, class: FreeSpaceClass, align: u64) -> u64 {
         match self.policy {
-            SpacePolicy::Aggr => self.allocate_aggr(size, class),
+            SpacePolicy::Aggr => self.allocate_aggr(size, class, align),
             SpacePolicy::Paged { page } => self.allocate_paged(size, class, page),
         }
     }
 
-    /// [`allocate`](Self::allocate) for a file with no page structure.
+    /// [`allocate_aligned`](Self::allocate_aligned) for a file with no page
+    /// structure.
     ///
     /// Rounding the end-of-file pointer up skips the bytes between the old
     /// pointer and the aligned address; nothing else will ever name them, so
@@ -153,13 +156,13 @@ impl FileAllocator {
     /// displaced them. That is `H5MF__aggr_alloc`'s own alignment fragment,
     /// which it hands to `H5MF_xfree(f, alloc_type, eoa_frag_addr,
     /// eoa_frag_size)` (H5MFaggr.c:339-341).
-    fn allocate_aggr(&self, size: u64, class: FreeSpaceClass) -> u64 {
-        if let Some(addr) = self.take_free(size, self.policy.manager(class, size)) {
+    fn allocate_aggr(&self, size: u64, class: FreeSpaceClass, align: u64) -> u64 {
+        if let Some(addr) = self.take_free(size, self.policy.manager(class, size), align) {
             return addr;
         }
         let mut cur = self.eof.load(Ordering::Acquire);
         let aligned = loop {
-            let aligned = Self::round_up(cur, self.alignment);
+            let aligned = Self::round_up(cur, align);
             match self.eof.compare_exchange_weak(
                 cur,
                 aligned + size,
@@ -192,7 +195,7 @@ impl FileAllocator {
             return self.eof.load(Ordering::Acquire);
         }
         let manager = self.policy.manager(class, size);
-        if let Some(addr) = self.take_free(size, manager) {
+        if let Some(addr) = self.take_free(size, manager, 1) {
             return addr;
         }
         if manager != FreeSpaceManager::Large {
@@ -369,19 +372,15 @@ impl FileAllocator {
     /// of the bytes: a request served out of another manager's section would
     /// hand those bytes back to its own manager when it released them, and the
     /// two accounts would drift a block apart on every reuse.
-    fn take_free(&self, size: u64, manager: FreeSpaceManager) -> Option<u64> {
+    fn take_free(&self, size: u64, manager: FreeSpaceManager, align: u64) -> Option<u64> {
         if size == 0 || self.free_count.load(Ordering::Acquire) == 0 {
             return None;
         }
         let mut list = self.free_list.lock().unwrap();
-        // What a block can actually hand out. A block this allocator released
-        // itself starts aligned, but one read out of a file's free-space
-        // manager starts wherever the file put it, and the bytes before the
-        // first aligned address in it can hold no allocation.
-        let usable = |b: &FreeBlock| {
-            let align = self.draw_alignment(b.manager);
-            b.len.saturating_sub(Self::round_up(b.addr, align) - b.addr)
-        };
+        // What a block can actually hand out: the bytes before the first
+        // aligned address in it can hold no allocation.
+        let align = self.draw_alignment(manager, align);
+        let usable = |b: &FreeBlock| b.len.saturating_sub(Self::round_up(b.addr, align) - b.addr);
         // Best fit: the smallest sufficient block, so a large released region
         // stays available for a large chunk.
         let pos = list
@@ -392,7 +391,7 @@ impl FileAllocator {
             .min_by_key(|(_, b)| usable(b))
             .map(|(i, _)| i)?;
         let block = list[pos];
-        let addr = Self::round_up(block.addr, self.draw_alignment(block.manager));
+        let addr = Self::round_up(block.addr, align);
         // Exactly `size`: what a caller is handed is what it will hand back,
         // so a block released later returns every byte drawn here. Rounding
         // the draw up to the alignment instead left the difference inside a
@@ -684,12 +683,40 @@ mod tests {
         assert_eq!(alloc.eof(), 148);
     }
 
+    /// A plain draw starts at the end of the file, as libhdf5's does at its
+    /// default alignment of one. Only an aligned draw skips to a boundary,
+    /// and the bytes it skips go on the list under its own class.
     #[test]
     fn alignment() {
         let alloc = FileAllocator::new(50); // not 8-aligned
-        let a = alloc.allocate(10, META);
-        assert_eq!(a, 56); // aligned to 8
-        assert_eq!(alloc.eof(), 66);
+        assert_eq!(alloc.allocate(10, META), 50);
+        assert_eq!(alloc.allocate_aligned(10, RAW, 8), 64);
+        assert_eq!(alloc.eof(), 74);
+        assert_eq!(
+            alloc.free_extents(),
+            vec![FreeBlock {
+                addr: 60,
+                len: 4,
+                manager: FreeSpaceManager::RawData
+            }]
+        );
+    }
+
+    /// Odd-sized draws of both classes, as a stream of compressed chunks and
+    /// the index blocks between them makes them, tile the file: none leaves
+    /// a fragment, so the list every later draw searches stays empty.
+    #[test]
+    fn odd_sized_draws_leave_nothing_on_the_list() {
+        let alloc = FileAllocator::new(0);
+        let mut end = 0;
+        for (i, size) in [5u64, 13, 1, 7, 4093, 3].into_iter().enumerate() {
+            let class = if i % 2 == 0 { RAW } else { META };
+            assert_eq!(alloc.allocate(size, class), end);
+            end += size;
+        }
+        assert_eq!(alloc.eof(), end);
+        assert!(free_blocks(&alloc).is_empty());
+        assert_eq!(alloc.free_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -707,13 +734,15 @@ mod tests {
         let a2 = alloc.allocate(20, META);
         let a3 = alloc.allocate(5, META);
         assert_eq!(a1, 0);
-        assert_eq!(a2, 16); // 10 -> aligned to 16
-        assert_eq!(a3, 40); // 36 -> aligned to 40
+        assert_eq!(a2, 10);
+        assert_eq!(a3, 30);
     }
 
-    // Concurrent allocation must hand out distinct, non-overlapping,
-    // aligned ranges — the property the fine-grained-locking writer relies
-    // on to let threads claim chunk space without a global lock.
+    // Concurrent allocation must hand out distinct, non-overlapping ranges
+    // — the property the fine-grained-locking writer relies on to let
+    // threads claim chunk space without a global lock. Half the threads draw
+    // aligned, so the fragments they release race the plain draws that
+    // reuse them.
     #[test]
     fn concurrent_allocations_are_disjoint() {
         use std::sync::Arc;
@@ -722,15 +751,18 @@ mod tests {
         let alloc = Arc::new(FileAllocator::new(0));
         let n_threads = 8;
         let per_thread = 1000;
-        let size = 7u64; // unaligned size to exercise the alignment path
+        let size = 7u64; // unaligned, so every aligned draw skips bytes
 
         let mut handles = Vec::new();
-        for _ in 0..n_threads {
+        for t in 0..n_threads {
             let a = Arc::clone(&alloc);
             handles.push(thread::spawn(move || {
+                let align = if t % 2 == 0 { 1 } else { 8 };
                 let mut offs = Vec::with_capacity(per_thread);
                 for _ in 0..per_thread {
-                    offs.push(a.allocate(size, META));
+                    let off = a.allocate_aligned(size, META, align);
+                    assert_eq!(off % align, 0, "offset {off} not {align}-aligned");
+                    offs.push(off);
                 }
                 offs
             }));
@@ -740,9 +772,7 @@ mod tests {
             .flat_map(|h| h.join().unwrap())
             .collect();
         all.sort_unstable();
-        // Every offset is 8-aligned and no two allocated ranges overlap.
         for w in all.windows(2) {
-            assert_eq!(w[0] % 8, 0, "offset {} not 8-aligned", w[0]);
             assert!(
                 w[1] >= w[0] + size,
                 "ranges overlap: {} + {} > {}",
@@ -752,9 +782,10 @@ mod tests {
             );
         }
         assert_eq!(all.len(), n_threads * per_thread);
-        // No duplicates.
-        let unique = all.iter().collect::<std::collections::HashSet<_>>().len();
-        assert_eq!(unique, all.len(), "duplicate offsets handed out");
+        // Every byte below the end of the file is either handed out or on
+        // the list: no skipped byte went unrecorded.
+        let recorded: u64 = free_blocks(&alloc).iter().map(|(_, len)| len).sum();
+        assert_eq!(all.len() as u64 * size + recorded, alloc.eof());
     }
 
     /// Snapshot of the free list for assertions.
@@ -789,16 +820,17 @@ mod tests {
         alloc.free(a, 64, META);
         assert_eq!(alloc.allocate(10, META), a);
         assert_eq!(free_blocks(&alloc), vec![(a + 10, 54)]);
-        // The next draw still starts aligned; the six bytes that costs stay on
-        // the list instead of disappearing into the allocation before them.
-        assert_eq!(alloc.allocate(48, META), a + 16);
+        // An aligned draw out of the rest starts on the boundary; the six
+        // bytes that costs stay on the list instead of disappearing into the
+        // allocation before them.
+        assert_eq!(alloc.allocate_aligned(48, META, 8), a + 16);
         assert_eq!(free_blocks(&alloc), vec![(a + 10, 6)]);
         assert_eq!(alloc.eof(), eof_before);
     }
 
-    /// Growing an unaligned file leaves the bytes between its end and the
-    /// next boundary held by nothing, so `allocate` records them rather than
-    /// stepping over them — `H5MF__aggr_alloc` hands the same fragment to
+    /// An aligned draw from an unaligned end of file leaves the bytes between
+    /// that end and the next boundary held by nothing, so `allocate_aligned`
+    /// records them rather than stepping over them — `H5MF__aggr_alloc` hands the same fragment to
     /// `H5MF_xfree` (H5MFaggr.c:339-341). That is what lets the managers'
     /// own blocks come out of this allocator at all: `settle_free_space_managers`
     /// re-reads the section set each round, so a fragment one round leaves is
@@ -813,7 +845,7 @@ mod tests {
         // 5 is not a multiple of eight, so the draw starts at 8 — and 5..8
         // lands on the free list instead of becoming a byte no structure
         // holds and no manager names.
-        assert_eq!(alloc.allocate(16, META), 8);
+        assert_eq!(alloc.allocate_aligned(16, META, 8), 8);
         assert_eq!(alloc.eof(), 24);
         assert_eq!(free_blocks(&alloc), vec![(5, 3)]);
 
@@ -937,14 +969,15 @@ mod tests {
     }
 
     /// A section read out of a file's free-space manager starts wherever the
-    /// file put it. The allocation still comes back aligned, and the bytes
-    /// alignment skipped stay free rather than becoming untracked slack.
+    /// file put it. An aligned draw out of it still comes back aligned, and
+    /// the bytes alignment skipped stay free rather than becoming untracked
+    /// slack.
     #[test]
     fn an_unaligned_block_is_carved_from_its_first_aligned_address() {
         let alloc = FileAllocator::new(4096);
         alloc.reset_free_list(&[block(185, 15)]);
 
-        assert_eq!(alloc.allocate(8, META), 192);
+        assert_eq!(alloc.allocate_aligned(8, META, 8), 192);
         // The seven bytes before 192 stay on the list; the block ends exactly
         // where the allocation does, so there is no tail.
         assert_eq!(free_blocks(&alloc), vec![(185, 7)]);
@@ -962,7 +995,7 @@ mod tests {
         let alloc = FileAllocator::new(4096);
         alloc.reset_free_list(&[block(2038, 100)]);
 
-        assert_eq!(alloc.allocate(16, META), 2040);
+        assert_eq!(alloc.allocate_aligned(16, META, 8), 2040);
         assert_eq!(free_blocks(&alloc), vec![(2038, 2), (2056, 82)]);
     }
 
@@ -975,21 +1008,22 @@ mod tests {
         alloc.reset_free_list(&[block(2038, 12)]);
 
         // Ten usable bytes from 2040, and ten are asked for.
-        assert_eq!(alloc.allocate(10, META), 2040);
+        assert_eq!(alloc.allocate_aligned(10, META, 8), 2040);
         assert_eq!(free_blocks(&alloc), vec![(2038, 2)]);
     }
 
-    /// Best fit is by what a block can hand out, not by its length: the longer
-    /// but badly aligned block loses to the shorter aligned one.
+    /// Best fit is by what a block can hand out, not by its length: for an
+    /// aligned draw the longer but badly aligned block loses to the shorter
+    /// aligned one.
     #[test]
     fn best_fit_measures_the_usable_part_of_a_block() {
         let alloc = FileAllocator::new(4096);
         alloc.reset_free_list(&[block(1001, 9), block(2000, 8)]);
 
-        assert_eq!(alloc.allocate(8, META), 2000);
+        assert_eq!(alloc.allocate_aligned(8, META, 8), 2000);
         assert_eq!(free_blocks(&alloc), vec![(1001, 9)]);
         // Nothing left can hold eight aligned bytes, so the file grows.
-        assert_eq!(alloc.allocate(8, META), 4096);
+        assert_eq!(alloc.allocate_aligned(8, META, 8), 4096);
     }
 
     #[test]

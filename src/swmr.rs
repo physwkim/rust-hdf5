@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::filter::Filter;
 use crate::io::locking::FileLocking;
 use crate::io::Hdf5Reader;
 use crate::io::SwmrWriter as IoSwmrWriter;
@@ -1053,6 +1054,22 @@ impl SwmrFileReader {
         chunk_coords: &[u64],
     ) -> Result<Option<(Vec<u8>, u32)>> {
         Ok(self.reader.read_chunk_raw(name, chunk_coords)?)
+    }
+
+    /// A dataset's filter pipeline in application order, as
+    /// [`H5Dataset::filters`](crate::dataset::H5Dataset::filters) reports
+    /// it: what undoes the bytes [`read_chunk_raw`](Self::read_chunk_raw)
+    /// returns, under its filter mask. Empty for an unfiltered dataset.
+    pub fn dataset_filters(&mut self, name: &str) -> Result<Vec<Filter>> {
+        self.reader
+            .dataset_info(name)
+            .map(|i| {
+                i.filter_pipeline
+                    .as_ref()
+                    .map(|fp| fp.filters.clone())
+                    .unwrap_or_default()
+            })
+            .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))
     }
 
     /// Read a slice (hyperslab) of a dataset as a typed vector.
