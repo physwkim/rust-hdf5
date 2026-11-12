@@ -63,13 +63,21 @@ pub(crate) fn read_managers(
                     .into(),
             ));
         }
-        let hdr = FreeSpaceHeader::decode(&handle.read_at(addr, hdr_size)?, ctx)?;
+        // The header and its section list are one load: the list is
+        // placed and sized by the header it was read through.
+        let (hdr, decoded) = handle.load_metadata(|| {
+            let hdr = FreeSpaceHeader::decode(&handle.read_at(addr, hdr_size)?, ctx)?;
+            if hdr.sect_addr == UNDEF_ADDR || hdr.sect_size == 0 {
+                return Ok::<_, IoError>((hdr, None));
+            }
+            let image = handle.read_at(hdr.sect_addr, hdr.sect_size as usize)?;
+            let decoded = free_space::decode_sections(&image, &hdr, addr, ctx)?;
+            Ok((hdr, Some(decoded)))
+        })?;
         blocks.push((addr, hdr_size as u64));
-        if hdr.sect_addr == UNDEF_ADDR || hdr.sect_size == 0 {
+        let Some(decoded) = decoded else {
             continue;
-        }
-        let image = handle.read_at(hdr.sect_addr, hdr.sect_size as usize)?;
-        let decoded = free_space::decode_sections(&image, &hdr, addr, ctx)?;
+        };
         blocks.push((hdr.sect_addr, hdr.alloc_sect_size.max(hdr.sect_size)));
         let bucket = &mut found.iter_mut().find(|(m, _)| *m == manager).unwrap().1;
         bucket.extend(decoded.iter().map(|s| (s.addr, s.len)));

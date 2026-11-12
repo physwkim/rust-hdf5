@@ -648,15 +648,30 @@ mod tests {
     /// A dataset whose data lands at an offset `T` cannot be read from in
     /// place is refused rather than read through an unaligned pointer.
     ///
-    /// Paged file-space allocation is what makes this reachable: it aligns to
-    /// the page and to nothing else, exactly as `H5Pset_alignment`'s defaults
-    /// leave libhdf5, so a byte dataset of odd length pushes whatever follows
-    /// off an eight-byte boundary. An unpaged file starts contiguous storage on
-    /// an eight-byte boundary (`Hdf5Writer::allocate_contiguous`) and cannot
-    /// produce one.
+    /// libhdf5 aligns nothing by default, so its files are where such an
+    /// offset comes from: this fixture's `shared0` is four-byte integers at
+    /// an odd offset.
     #[test]
     fn a_misaligned_data_offset_is_refused() {
-        let path = temp_path("alignment");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sohm_list.h5");
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("shared0").unwrap();
+        let reason = refusal::<i32>(&ds);
+        assert!(
+            matches!(reason, ViewRefusal::Alignment { align: 4, offset } if offset % 4 != 0),
+            "unexpected refusal: {reason}"
+        );
+        // The copying read does not care where the bytes start.
+        assert_eq!(ds.read_raw::<i32>().unwrap().len(), 8);
+    }
+
+    /// A paged file's contiguous storage starts on an eight-byte boundary
+    /// like an unpaged file's, so it is viewed in place even when a byte
+    /// dataset of odd length left the page's free remainder unaligned.
+    #[test]
+    fn a_paged_files_contiguous_storage_is_viewed_in_place() {
+        let path = temp_path("paged_alignment");
         {
             let file = H5File::options()
                 .file_space(FileSpaceStrategy::Page, true, 1)
@@ -679,13 +694,7 @@ mod tests {
         }
         let file = H5File::open(&path).unwrap();
         let ds = file.dataset("doubles").unwrap();
-        let reason = refusal::<f64>(&ds);
-        assert!(
-            matches!(reason, ViewRefusal::Alignment { align: 8, offset } if offset % 8 != 0),
-            "unexpected refusal: {reason}"
-        );
-        // The copying read does not care where the bytes start.
-        assert_eq!(ds.read_raw::<f64>().unwrap(), vec![2.0f64; 8]);
+        assert_eq!(&*ds.read_mapped::<f64>().unwrap(), &[2.0f64; 8]);
         drop(file);
         let _ = std::fs::remove_file(&path);
     }

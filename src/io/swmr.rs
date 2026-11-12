@@ -71,8 +71,8 @@ impl SwmrWriter {
 
     /// Create a new HDF5 file configured for SWMR with an explicit locking
     /// policy. The writer takes an exclusive lock initially; once
-    /// [`Self::start_swmr`] is called, the lock is downgraded to shared so
-    /// concurrent SWMR readers can attach.
+    /// [`Self::start_swmr`] is called, the lock is released so concurrent
+    /// SWMR readers can attach.
     pub fn create_with_locking(
         path: &Path,
         locking: crate::io::locking::FileLocking,
@@ -446,14 +446,9 @@ impl SwmrWriter {
     /// first, zero-padded, as `flush` writes them.
     pub fn start_swmr(&mut self) -> IoResult<()> {
         self.write_band_buffers(Tail::Write)?;
+        // Releases the writer's lock too, so nothing keeps a second writer
+        // out from here on: the SWMR protocol assumes a single writer.
         self.writer.finalize_for_swmr()?;
-        // Release the writer's exclusive lock so concurrent SWMR readers
-        // can attach. Note: the SWMR protocol assumes a single writer —
-        // the caller is responsible for ensuring no second writer
-        // attaches once SWMR mode starts. (Holding a shared lock here
-        // would block other writers but breaks subsequent writes on
-        // Windows due to LockFileEx semantics.)
-        self.writer.handle().release_lock()?;
         self.swmr_active = true;
         Ok(())
     }

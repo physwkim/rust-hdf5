@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.7.13
+
+### Fixed
+
+- A SWMR reader no longer finds an index entry in the file ahead of the
+  chunk or block it names. Once `start_swmr` publishes the file, the
+  writer stops staging small writes in its metadata accumulator, as
+  `H5F__start_swmr_write` does: a staged write used to reach the file
+  after wider or lower-addressed writes issued later, so a fixed-array
+  data block of 3000 entries could name a chunk the file did not hold
+  yet. An object header's continuation chunk is now written before the
+  chunk that names it. Each small write after `start_swmr` is its own
+  system call, about 0.7 µs more per chunk write.
+- A v2 B-tree chunk index moves every node a flush changes to a fresh
+  block, as libhdf5's `H5B2__shadow_leaf` does, where it used to rewrite
+  the node in place: a SWMR reader still on the previous header could
+  read a leaf shifted under an unchanged record count and miss a chunk.
+  Under SWMR the replaced nodes stay allocated, since a reader may still
+  be following them.
+- After `start_swmr` the writer's own loads of chunk-index, free-space
+  and heap metadata retry a checksum failure, up to libhdf5's 100 SWMR
+  read attempts, where the first failure used to fail the append.
+- A paged file's contiguous storage starts on an eight-byte boundary, so
+  `read_mapped` views it in place. A byte dataset of odd length before it
+  used to push it off the boundary, and the view was refused.
+- A file-space page size that is not a power of two keeps large blocks on
+  the page grid. 0.7.12 placed them off it, and libhdf5's page buffer then
+  failed their metadata checksums.
+
+### Changed
+
+- A new extensible-array data block, page or super block is written once,
+  whole, at the flush that publishes it. A data block or page used to be
+  written at creation with every entry undefined and again by its first
+  entry, and a new super block twice.
+
 ## 0.7.12
 
 ### Added

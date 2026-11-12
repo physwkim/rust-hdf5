@@ -49,7 +49,8 @@ compile_error!(
 /// same trade `H5Faccum.c` makes for the C library's sec2 driver. Metadata
 /// leaves the writer in 30-to-500-byte pieces laid down in address order, and
 /// one `pwrite` per piece costs far more in syscalls than the memcpy that
-/// coalesces them.
+/// coalesces them. Until SWMR writing starts: see
+/// [`start_swmr_write`](Self::start_swmr_write).
 pub struct FileHandle {
     file: File,
     /// Where this handle's reads come from. Every read entry point goes
@@ -66,6 +67,11 @@ pub struct FileHandle {
     /// threads issue positioned writes at once and must not queue behind one
     /// another on a lock they have no bytes in.
     accum_dirty: AtomicBool,
+    /// Whether [`write_at`](Self::write_at) may stage a write in `accum`.
+    /// Cleared only by [`start_swmr_write`](Self::start_swmr_write), after it
+    /// empties `accum`, and never set again: so `accum` stays empty from then
+    /// on, and every write is in the file before the next is issued.
+    accumulate: bool,
     /// False for files opened read-only; [`write_at`](Self::write_at) then
     /// errors instead of attempting a write.
     writable: bool,
@@ -567,6 +573,7 @@ impl FileHandle {
             source: ReadSource::Pread,
             accum: Mutex::new(Accum::new()),
             accum_dirty: AtomicBool::new(false),
+            accumulate: true,
             writable,
             lock_policy,
             lock_held,
@@ -687,6 +694,27 @@ impl FileHandle {
     /// (`H5Pset_metadata_read_attempts`).
     pub fn set_metadata_read_attempts(&mut self, attempts: NonZeroU32) {
         self.read_attempts = attempts;
+    }
+
+    /// Set this handle up for SWMR writing, the way `H5F__start_swmr_write`
+    /// does (H5Fint.c:3978-3996): write out the accumulator and stop using
+    /// it, and retry checksummed loads, since another opener may now be
+    /// rewriting what this writer reads back.
+    ///
+    /// A staged write reaches the file after writes issued later: any wide
+    /// one that goes straight out, and, within its run, any at a lower
+    /// address. Under SWMR that order is what a reader sees, and the writer
+    /// lays down every child before the parent that leads to it, so each
+    /// write has to be in the file before the next is issued.
+    ///
+    /// For good: libhdf5 turns the accumulator back on when a start fails,
+    /// but only together with taking the SWMR flag back off the superblock,
+    /// which this crate's writer never does.
+    pub fn start_swmr_write(&mut self) -> std::io::Result<()> {
+        self.flush()?;
+        self.accumulate = false;
+        self.read_attempts = crate::io::reader::SWMR_METADATA_READ_ATTEMPTS;
+        Ok(())
     }
 
     /// Run `load` — one read and decode of checksummed metadata — again while
@@ -818,7 +846,7 @@ impl FileHandle {
                 ),
             )
         })?;
-        if !stageable(data.len()) {
+        if !(self.accumulate && stageable(data.len())) {
             // Buffered bytes under this write are older than it, so they have
             // to reach the file first or the flush would undo it. The write
             // itself then goes out with no lock held, which is what keeps

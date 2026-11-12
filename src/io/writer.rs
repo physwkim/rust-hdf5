@@ -108,10 +108,10 @@ fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u6
 
 /// A walk of a v2 B-tree: the file and node geometry the descent reads
 /// through, and the two collections it fills — every node's raw record
-/// bytes and every node block's address, the latter because `open_append`
-/// needs it so the reconstructed [`Bt2DatasetInfo::node_addrs`] pool owns
-/// the on-disk nodes (the next flush re-serializes the tree over them, and
-/// a delete frees them).
+/// bytes and every node block as read, the latter because `open_append`
+/// needs it so the reconstructed [`Bt2DatasetInfo::nodes`] owns the on-disk
+/// nodes (the next flush keeps the ones it would write unchanged and
+/// supersedes the rest, and a delete frees them).
 ///
 /// `record_size`, `node_size` and `geo` are constant for the whole walk, so
 /// [`descend`](Self::descend) takes only what changes per level: the node's
@@ -123,7 +123,7 @@ struct Bt2Walk<'a> {
     node_size: u32,
     geo: &'a crate::format::chunk_index::btree_v2::Bt2Geometry,
     records: Vec<u8>,
-    node_addrs: Vec<u64>,
+    nodes: Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock>,
 }
 
 impl<'a> Bt2Walk<'a> {
@@ -141,21 +141,36 @@ impl<'a> Bt2Walk<'a> {
             node_size,
             geo,
             records: Vec::new(),
-            node_addrs: Vec::new(),
+            nodes: Vec::new(),
         }
+    }
+
+    /// The node blocks walked, in [`Bt2Tree::nodes`] order — level by level
+    /// from the leaves, left to right — which is the order the descent meets
+    /// each depth's nodes in.
+    ///
+    /// [`Bt2Tree::nodes`]: crate::format::chunk_index::btree_v2::Bt2Tree::nodes
+    fn into_nodes(self) -> Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock> {
+        let mut nodes = self.nodes;
+        nodes.sort_by_key(|n| n.depth);
+        nodes
     }
 
     /// Walk the subtree rooted at `addr`, at depth `depth` with `nrec`
     /// records, collecting every node's raw record bytes and every node
-    /// block's address.
+    /// block as read.
     fn descend(&mut self, addr: u64, depth: u16, nrec: u16) -> IoResult<()> {
-        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode, Bt2NodeBlock};
 
-        self.node_addrs.push(addr);
         let buf = self.handle.read_at_most(addr, self.node_size as usize)?;
         if depth == 0 {
             let leaf = Bt2LeafNode::decode(&buf, nrec, self.record_size)?;
             self.records.extend_from_slice(&leaf.record_data);
+            self.nodes.push(Bt2NodeBlock {
+                depth,
+                addr,
+                image: buf,
+            });
         } else {
             let node = Bt2InternalNode::decode(
                 &buf,
@@ -166,6 +181,11 @@ impl<'a> Bt2Walk<'a> {
                 self.geo.max_nrec_size,
                 self.geo.child_total_size(depth),
             )?;
+            self.nodes.push(Bt2NodeBlock {
+                depth,
+                addr,
+                image: buf,
+            });
             // In-order: an internal node's records separate its children, so each
             // one belongs between the subtrees on either side of it.
             let children: Vec<(u64, u16)> = node
@@ -1266,17 +1286,29 @@ impl EaImage {
 /// nor a whole-block checksum is paid per chunk.
 ///
 /// INVARIANT: a held block is what the file holds at its address, except
-/// for the held data block's `dirty` bytes. A super block, data block or
-/// page is written only by [`Hdf5Writer::ea_slot`],
-/// [`Hdf5Writer::write_ea_entries`] and [`Hdf5Writer::flush_ea_block`];
-/// the dirty bytes are written by `flush_ea_block` alone, which runs before
+/// for the held data block's `dirty` bytes and a held super block that is
+/// `dirty`. A block [`Hdf5Writer::ea_slot`] creates is held wholly dirty, so
+/// its first write already carries the entry it was created for. Data
+/// blocks and pages are written only by [`Hdf5Writer::write_ea_entries`]
+/// and [`Hdf5Writer::flush_ea_block`], super blocks only by
+/// [`Hdf5Writer::flush_ea`], after the held data block: a child reaches the
+/// file before the parent that leads a reader to it. `flush_ea` runs before
 /// [`Hdf5Writer::flush_dataset_synced`] writes the index block and before
+/// another super block replaces the held one; `flush_ea_block` before
 /// another block replaces the held one. Nothing frees these blocks while
 /// their dataset's [`ChunkedDatasetInfo`] lives.
 #[derive(Default)]
 struct EaCache {
-    sblk: Option<(u64, ExtensibleArraySuperBlock)>,
+    sblk: Option<HeldSblk>,
     block: Option<EaImage>,
+}
+
+/// An extensible-array super block as [`EaCache`] holds it.
+struct HeldSblk {
+    addr: u64,
+    sb: ExtensibleArraySuperBlock,
+    /// Changed since the file last got it, or never written.
+    dirty: bool,
 }
 
 /// What reading and writing one dataset's extensible-array blocks needs.
@@ -1934,10 +1966,9 @@ pub struct BtreeV1DatasetInfo {
     pub config: BTreeV1Config,
     /// The chunks, in key order (`scaled` ascending, lexicographically).
     pub records: Vec<BtreeV1ChunkRecord>,
-    /// Pool of node-size blocks holding the tree's nodes, on the same terms
-    /// as [`Bt2DatasetInfo::node_addrs`]: a flush re-serializes the whole
-    /// bulk-loaded tree over them and allocates only the shortfall, so no
-    /// flush can orphan a block it replaced.
+    /// Pool of node-size blocks holding the tree's nodes: a flush
+    /// re-serializes the whole bulk-loaded tree over them and allocates only
+    /// the shortfall, so no flush can orphan a block it replaced.
     pub node_addrs: Vec<u64>,
     /// Address of the tree's root node — what the version-3 data layout
     /// message carries. `UNDEF_ADDR` until a flush puts a node in the file,
@@ -1999,21 +2030,16 @@ pub struct Bt2DatasetInfo {
     pub chunk_dims: Vec<u64>,
     /// File offset of the BT2 header.
     pub bt2_header_addr: u64,
-    /// Pool of node-size blocks (the index's
-    /// [`node_size`](Bt2ChunkIndex::node_size) bytes each) holding the tree's
-    /// nodes, in the order [`Bt2Tree::encode`] emits them.
+    /// The node blocks the header on file reaches, with the image each holds,
+    /// in [`Bt2Tree::nodes`] order (the index's
+    /// [`node_size`](Bt2ChunkIndex::node_size) bytes each).
     ///
-    /// The single owner of the tree's node addresses: a flush re-serializes the
-    /// whole tree over these blocks and allocates only the shortfall, so no
-    /// flush can orphan a block it replaced. Every node is the same size, so a
-    /// block stays usable however the tree reshapes.
-    ///
-    /// The pool holds exactly one block per node after every flush, in both
-    /// directions: a taller tree allocates the shortfall, a smaller one frees
-    /// the surplus. Nothing here depends on the record count only ever rising,
-    /// so a record-removal path can be added to [`Bt2ChunkIndex`] without the
-    /// blocks it drops going unreachable.
-    pub node_addrs: Vec<u64>,
+    /// The single owner of the tree's node blocks. These are never rewritten:
+    /// a flush lays the new tree out over them with [`Bt2Tree::place`], which
+    /// keeps the blocks whose image is unchanged and puts every other node in
+    /// a fresh one, writes the header, and only then replaces this list and
+    /// releases the blocks the new tree no longer reaches.
+    pub nodes: Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock>,
     /// In-memory chunk index.
     pub index: Bt2ChunkIndex,
     /// Number of chunks written so far.
@@ -3091,71 +3117,79 @@ fn rebuild_dataset(
                         ep.max_nelmts_bits,
                     )?;
 
-                    // Read EA header
-                    let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                    let ea_header = ExtensibleArrayHeader::decode(&hdr_buf, ctx)?;
-
-                    let is_filtered = ea_header.class_id
-                        == crate::format::chunk_index::extensible_array::EA_CLS_FILT_CHUNK;
-                    let chunk_size_len = if is_filtered {
-                        ea_header.raw_elmt_size - ctx.sizeof_addr - 4
-                    } else {
-                        0
-                    };
-
-                    // Read the EA index block. Filtered datasets
-                    // store a `FilteredIndexBlock`; unfiltered ones a
-                    // plain `ExtensibleArrayIndexBlock`. Both must be
-                    // reconstructed so a reopened dataset can append
+                    // The EA header, then its index block. Filtered
+                    // datasets store a `FilteredIndexBlock`; unfiltered
+                    // ones a plain `ExtensibleArrayIndexBlock`. Both must
+                    // be reconstructed so a reopened dataset can append
                     // (write_chunk consults whichever applies).
-                    let ea_iblk_addr = ea_header.idx_blk_addr;
-                    let (ea_iblk, filt_iblk) = if is_filtered {
-                        let placeholder = ExtensibleArrayIndexBlock::new(
-                            *index_address,
-                            ep.idx_blk_elmts,
-                            ndblk_addrs,
-                            nsblk_addrs,
-                        );
-                        let fib = if ea_iblk_addr != UNDEF_ADDR {
-                            let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
-                            FilteredIndexBlock::decode(
-                                &iblk_buf,
-                                ctx,
-                                ep.idx_blk_elmts as usize,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                                chunk_size_len,
-                            )?
-                        } else {
-                            FilteredIndexBlock::new(
-                                *index_address,
-                                ep.idx_blk_elmts,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                            )
-                        };
-                        (placeholder, Some(fib))
-                    } else {
-                        let eib = if ea_iblk_addr != UNDEF_ADDR {
-                            let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
-                            ExtensibleArrayIndexBlock::decode(
-                                &iblk_buf,
-                                ctx,
-                                ep.idx_blk_elmts as usize,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                            )?
-                        } else {
-                            ExtensibleArrayIndexBlock::new(
-                                *index_address,
-                                ep.idx_blk_elmts,
-                                ndblk_addrs,
-                                nsblk_addrs,
-                            )
-                        };
-                        (eib, None)
-                    };
+                    let (ea_header, chunk_size_len, ea_iblk, filt_iblk) =
+                        handle.load_metadata(|| {
+                            let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                            let ea_header = ExtensibleArrayHeader::decode(&hdr_buf, ctx)?;
 
+                            let is_filtered = ea_header.class_id
+                                == crate::format::chunk_index::extensible_array::EA_CLS_FILT_CHUNK;
+                            let chunk_size_len = if is_filtered {
+                                ea_header.raw_elmt_size - ctx.sizeof_addr - 4
+                            } else {
+                                0
+                            };
+                            let ea_iblk_addr = ea_header.idx_blk_addr;
+                            let (ea_iblk, filt_iblk) = if is_filtered {
+                                let placeholder = ExtensibleArrayIndexBlock::new(
+                                    *index_address,
+                                    ep.idx_blk_elmts,
+                                    ndblk_addrs,
+                                    nsblk_addrs,
+                                );
+                                let fib = if ea_iblk_addr != UNDEF_ADDR {
+                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                                    FilteredIndexBlock::decode(
+                                        &iblk_buf,
+                                        ctx,
+                                        ep.idx_blk_elmts as usize,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                        chunk_size_len,
+                                    )?
+                                } else {
+                                    FilteredIndexBlock::new(
+                                        *index_address,
+                                        ep.idx_blk_elmts,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )
+                                };
+                                (placeholder, Some(fib))
+                            } else {
+                                let eib = if ea_iblk_addr != UNDEF_ADDR {
+                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                                    ExtensibleArrayIndexBlock::decode(
+                                        &iblk_buf,
+                                        ctx,
+                                        ep.idx_blk_elmts as usize,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )?
+                                } else {
+                                    ExtensibleArrayIndexBlock::new(
+                                        *index_address,
+                                        ep.idx_blk_elmts,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )
+                                };
+                                (eib, None)
+                            };
+                            Ok::<_, crate::io::IoError>((
+                                ea_header,
+                                chunk_size_len,
+                                ea_iblk,
+                                filt_iblk,
+                            ))
+                        })?;
+
+                    let ea_iblk_addr = ea_header.idx_blk_addr;
                     info.chunked = Some(ChunkedDatasetInfo {
                         chunk_dims: real_chunk_dims,
                         earray_params: ep,
@@ -3180,25 +3214,31 @@ fn rebuild_dataset(
                 // dblk_page_nelmts chunks, libhdf5 default 1024)
                 // reconstruct through the same decode owner; only
                 // pages the bitmap marks initialized are decoded.
-                let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                let fa_header = FixedArrayHeader::decode(&hdr_buf, ctx)?;
-                let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
-                let chunk_size_len = if is_filtered {
-                    (fa_header.element_size as usize)
-                        .checked_sub(ctx.sizeof_addr as usize + 4)
-                        .ok_or_else(|| {
-                            crate::io::IoError::InvalidState(
-                                "fixed array filtered element_size too small".into(),
-                            )
-                        })?
-                } else {
-                    0
-                };
-                if fa_header.data_blk_addr != UNDEF_ADDR && chunk_size_len <= 8 {
+                let loaded = handle.load_metadata(|| {
+                    let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                    let fa_header = FixedArrayHeader::decode(&hdr_buf, ctx)?;
+                    let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
+                    let chunk_size_len = if is_filtered {
+                        (fa_header.element_size as usize)
+                            .checked_sub(ctx.sizeof_addr as usize + 4)
+                            .ok_or_else(|| {
+                                crate::io::IoError::InvalidState(
+                                    "fixed array filtered element_size too small".into(),
+                                )
+                            })?
+                    } else {
+                        0
+                    };
+                    if fa_header.data_blk_addr == UNDEF_ADDR || chunk_size_len > 8 {
+                        return Ok(None);
+                    }
                     let dblk_size = fixed_array_dblk_disk_size(ctx, &fa_header) as usize;
                     let dblk_buf = handle.read_at_most(fa_header.data_blk_addr, dblk_size)?;
                     let fa_dblk =
                         decode_fixed_array_dblk(ctx, &fa_header, &dblk_buf, chunk_size_len)?;
+                    Ok::<_, crate::io::IoError>(Some((fa_header, fa_dblk)))
+                })?;
+                if let Some((fa_header, fa_dblk)) = loaded {
                     info.fixed_array = Some(FixedArrayDatasetInfo {
                         chunk_dims: real_chunk_dims,
                         fa_header_addr: *index_address,
@@ -3225,18 +3265,44 @@ fn rebuild_dataset(
                 // the bulk loader's few-records-per-node floor
                 // (the same bound creation enforces), stays
                 // re-link only.
-                let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                let bt2_hdr = Bt2Header::decode(&hdr_buf, ctx)?;
+                // The header and the walk are one load: every node is
+                // placed by the header the walk started from.
+                let loaded = handle.load_metadata(|| {
+                    let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                    let bt2_hdr = Bt2Header::decode(&hdr_buf, ctx)?;
+                    let is_filt = match bt2_hdr.record_type {
+                        BT2_TYPE_CHUNK_UNFILT => Some(false),
+                        BT2_TYPE_CHUNK_FILT => Some(true),
+                        _ => None,
+                    };
+                    let (Some(is_filt), true) = (
+                        is_filt,
+                        bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let mut walked = (Vec::new(), Vec::new());
+                    if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0 {
+                        let geo = Bt2Geometry::new(
+                            bt2_hdr.node_size,
+                            bt2_hdr.record_size,
+                            bt2_hdr.depth,
+                            ctx.sizeof_addr,
+                        );
+                        let mut walk =
+                            Bt2Walk::new(handle, ctx, bt2_hdr.record_size, bt2_hdr.node_size, &geo);
+                        walk.descend(
+                            bt2_hdr.root_node_addr,
+                            bt2_hdr.depth,
+                            bt2_hdr.num_records_in_root,
+                        )?;
+                        let records = std::mem::take(&mut walk.records);
+                        walked = (walk.into_nodes(), records);
+                    }
+                    Ok::<_, crate::io::IoError>(Some((bt2_hdr, is_filt, walked)))
+                })?;
                 let ndims = real_chunk_dims.len();
-                let is_filt = match bt2_hdr.record_type {
-                    BT2_TYPE_CHUNK_UNFILT => Some(false),
-                    BT2_TYPE_CHUNK_FILT => Some(true),
-                    _ => None,
-                };
-                if let (Some(is_filt), true) = (
-                    is_filt,
-                    bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
-                ) {
+                if let Some((bt2_hdr, is_filt, (nodes, record_bytes))) = loaded {
                     let mut index = if is_filt {
                         let csl = (bt2_hdr.record_size as usize)
                             .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
@@ -3258,23 +3324,7 @@ fn rebuild_dataset(
                     index.node_size = bt2_hdr.node_size;
                     index.split_percent = bt2_hdr.split_percent;
                     index.merge_percent = bt2_hdr.merge_percent;
-                    let mut node_addrs = Vec::new();
-                    if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0 {
-                        let geo = Bt2Geometry::new(
-                            bt2_hdr.node_size,
-                            bt2_hdr.record_size,
-                            bt2_hdr.depth,
-                            ctx.sizeof_addr,
-                        );
-                        let mut walk =
-                            Bt2Walk::new(handle, ctx, bt2_hdr.record_size, bt2_hdr.node_size, &geo);
-                        walk.descend(
-                            bt2_hdr.root_node_addr,
-                            bt2_hdr.depth,
-                            bt2_hdr.num_records_in_root,
-                        )?;
-                        node_addrs = walk.node_addrs;
-                        let record_bytes = walk.records;
+                    if !record_bytes.is_empty() {
                         let total = if bt2_hdr.record_size > 0 {
                             record_bytes.len() / bt2_hdr.record_size as usize
                         } else {
@@ -3309,7 +3359,7 @@ fn rebuild_dataset(
                     info.btree_v2 = Some(Bt2DatasetInfo {
                         chunk_dims: real_chunk_dims,
                         bt2_header_addr: *index_address,
-                        node_addrs,
+                        nodes,
                         index,
                         chunks_written: 0,
                     });
@@ -5760,23 +5810,27 @@ impl Hdf5Writer {
                 list_max: index.list_max,
                 btree_min: index.btree_min,
             });
-            let mut reader = crate::io::reader::HandleBlockReader { handle };
-            if index.heap_addr != UNDEF_ADDR {
-                superseded.extend(collect_heap_extents(index.heap_addr, ctx, &mut reader)?);
-            }
-            if index.index_addr != UNDEF_ADDR {
-                if index.index_type == SOHM_INDEX_LIST {
-                    // `H5SM_LIST_SIZE`: the block is sized for `list_max`
-                    // records however few are in it.
-                    superseded.push((index.index_addr, list_size(ctx, index.list_max) as u64));
-                } else {
-                    superseded.extend(collect_btree_v2_extents(
-                        index.index_addr,
-                        ctx,
-                        &mut reader,
-                    )?);
+            superseded.extend(handle.load_metadata(|| {
+                let mut reader = crate::io::reader::HandleBlockReader { handle };
+                let mut extents = Vec::new();
+                if index.heap_addr != UNDEF_ADDR {
+                    extents.extend(collect_heap_extents(index.heap_addr, ctx, &mut reader)?);
                 }
-            }
+                if index.index_addr != UNDEF_ADDR {
+                    if index.index_type == SOHM_INDEX_LIST {
+                        // `H5SM_LIST_SIZE`: the block is sized for `list_max`
+                        // records however few are in it.
+                        extents.push((index.index_addr, list_size(ctx, index.list_max) as u64));
+                    } else {
+                        extents.extend(collect_btree_v2_extents(
+                            index.index_addr,
+                            ctx,
+                            &mut reader,
+                        )?);
+                    }
+                }
+                Ok::<_, crate::format::FormatError>(extents)
+            })?);
         }
         Ok(Some(Box::new(SohmState::new(specs, superseded))))
     }
@@ -5825,7 +5879,7 @@ impl Hdf5Writer {
             let ext = sb.superblock_extension_address;
             (ctx, btree, root, ext, Some(sb))
         } else {
-            let sb = SuperblockV2V3::decode(&sb_buf)?;
+            let sb = crate::io::reader::load_superblock_v2v3(&handle)?;
             let ctx = FormatContext {
                 sizeof_addr: sb.sizeof_offsets,
                 sizeof_size: sb.sizeof_lengths,
@@ -7328,20 +7382,23 @@ impl Hdf5Writer {
         use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
         use crate::format::fractal_heap::collect_heap_extents;
 
-        let mut reader = crate::io::reader::HandleBlockReader {
-            handle: &self.handle,
-        };
-        let mut extents = Vec::new();
-        if heap_addr != UNDEF_ADDR {
-            extents.extend(collect_heap_extents(heap_addr, &self.ctx, &mut reader)?);
-        }
-        for addr in [Some(name_bt2_addr), corder_bt2_addr]
-            .into_iter()
-            .flatten()
-            .filter(|&a| a != UNDEF_ADDR)
-        {
-            extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
-        }
+        let extents = self.handle.load_metadata(|| {
+            let mut reader = crate::io::reader::HandleBlockReader {
+                handle: &self.handle,
+            };
+            let mut extents = Vec::new();
+            if heap_addr != UNDEF_ADDR {
+                extents.extend(collect_heap_extents(heap_addr, &self.ctx, &mut reader)?);
+            }
+            for addr in [Some(name_bt2_addr), corder_bt2_addr]
+                .into_iter()
+                .flatten()
+                .filter(|&a| a != UNDEF_ADDR)
+            {
+                extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
+            }
+            Ok::<_, crate::format::FormatError>(extents)
+        })?;
         for (addr, len) in extents {
             self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
@@ -7393,7 +7450,15 @@ impl Hdf5Writer {
                     continue;
                 }
                 let u = k.geo.iblock_nsblks + off;
-                let sb = self.read_ea_sblk(&k, u, sa_addr)?;
+                // The held super block may be one the file never got.
+                let read;
+                let sb = match &c.ea_cache.sblk {
+                    Some(h) if h.addr == sa_addr => &h.sb,
+                    _ => {
+                        read = self.read_ea_sblk(&k, u, sa_addr)?;
+                        &read
+                    }
+                };
                 for &da in &sb.dblk_addrs {
                     if da != UNDEF_ADDR {
                         self.allocator
@@ -7466,9 +7531,9 @@ impl Hdf5Writer {
         }
         if let Some(bt2) = m.btree_v2.take() {
             let tree = bt2.index.build_tree(&self.ctx);
-            for &a in &bt2.node_addrs {
+            for node in &bt2.nodes {
                 self.allocator
-                    .free(a, tree.node_size as u64, FreeSpaceClass::Metadata);
+                    .free(node.addr, tree.node_size as u64, FreeSpaceClass::Metadata);
             }
             self.allocator.free(
                 bt2.bt2_header_addr,
@@ -11308,45 +11373,56 @@ impl Hdf5Writer {
                 sblk_block_offset,
                 ..
             } => {
-                let mut sblk_addr = c.iblk_addrs().1[sblk_off];
-                let mut sb = if sblk_addr == UNDEF_ADDR {
-                    if !extend {
-                        return Ok(EaSlot::Absent {
-                            end: k.geo.idx_blk_elmts + s.start_idx + s.ndblks * s.dblk_nelmts,
-                        });
-                    }
-                    let sb = ExtensibleArraySuperBlock::new(
-                        k.class_id(),
-                        k.header_addr,
-                        sblk_block_offset,
-                        s.ndblks as usize,
-                        k.geo.sblk_page_init_len(u),
-                    );
-                    let enc = sb.encode(&self.ctx, k.max_nelmts_bits);
-                    sblk_addr = self
-                        .allocator
-                        .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
-                    self.handle.write_at(sblk_addr, &enc)?;
-                    c.iblk_addrs_mut().1[sblk_off] = sblk_addr;
-                    c.ea_header.num_sblks_created += 1;
-                    c.ea_header.size_sblks_created += enc.len() as u64;
-                    sb
-                } else {
-                    match c.ea_cache.sblk.take_if(|(a, _)| *a == sblk_addr) {
-                        Some((_, sb)) => sb,
-                        None => self.read_ea_sblk(k, u, sblk_addr)?,
+                let sblk_addr = c.iblk_addrs().1[sblk_off];
+                if sblk_addr == UNDEF_ADDR && !extend {
+                    return Ok(EaSlot::Absent {
+                        end: k.geo.idx_blk_elmts + s.start_idx + s.ndblks * s.dblk_nelmts,
+                    });
+                }
+                let mut held = match c.ea_cache.sblk.take_if(|h| h.addr == sblk_addr) {
+                    Some(h) => h,
+                    None => {
+                        // The super block held so far, and its children
+                        // first, reach the file before it is let go.
+                        self.flush_ea(c)?;
+                        if sblk_addr == UNDEF_ADDR {
+                            let sb = ExtensibleArraySuperBlock::new(
+                                k.class_id(),
+                                k.header_addr,
+                                sblk_block_offset,
+                                s.ndblks as usize,
+                                k.geo.sblk_page_init_len(u),
+                            );
+                            let len = k.geo.sblk_size(u, self.ctx.sizeof_addr, k.max_nelmts_bits);
+                            let addr = self
+                                .allocator
+                                .allocate(len as u64, FreeSpaceClass::Metadata);
+                            c.iblk_addrs_mut().1[sblk_off] = addr;
+                            c.ea_header.num_sblks_created += 1;
+                            c.ea_header.size_sblks_created += len as u64;
+                            HeldSblk {
+                                addr,
+                                sb,
+                                dirty: true,
+                            }
+                        } else {
+                            HeldSblk {
+                                addr: sblk_addr,
+                                sb: self.read_ea_sblk(k, u, sblk_addr)?,
+                                dirty: false,
+                            }
+                        }
                     }
                 };
-                let mut sb_dirty = false;
-                let mut dblk_addr = sb.dblk_addrs[local_dblk];
+                let mut dblk_addr = held.sb.dblk_addrs[local_dblk];
                 if dblk_addr == UNDEF_ADDR {
                     if !extend {
-                        c.ea_cache.sblk = Some((sblk_addr, sb));
+                        c.ea_cache.sblk = Some(held);
                         return Ok(EaSlot::Absent { end: dblk_end });
                     }
                     dblk_addr = self.create_ea_dblk(c, k, u, loc.dblk_block_offset)?;
-                    sb.dblk_addrs[local_dblk] = dblk_addr;
-                    sb_dirty = true;
+                    held.sb.dblk_addrs[local_dblk] = dblk_addr;
+                    held.dirty = true;
                 }
                 let slot = if loc.paged {
                     // The page-init bitmap is one MSB-first bit string over
@@ -11361,9 +11437,9 @@ impl Hdf5Writer {
                             .dblk_prefix_size(self.ctx.sizeof_addr, k.max_nelmts_bits)
                             as u64
                         + page * page_size as u64;
-                    if sb.page_init[byte] & mask == 0 {
+                    if held.sb.page_init[byte] & mask == 0 {
                         if !extend {
-                            c.ea_cache.sblk = Some((sblk_addr, sb));
+                            c.ea_cache.sblk = Some(held);
                             return Ok(EaSlot::Absent {
                                 end: dblk_start + (page + 1) * page_nelmts,
                             });
@@ -11371,9 +11447,9 @@ impl Hdf5Writer {
                         // H5EA__dblk_page_create: a page of undefined entries,
                         // and no statistic counts it.
                         let undef = vec![FilteredChunkEntry::undef(); page_nelmts as usize];
-                        self.write_ea_entries(c, k, addr, EaEntryBlock::Page, &undef)?;
-                        sb.page_init[byte] |= mask;
-                        sb_dirty = true;
+                        self.hold_new_ea_block(c, k, addr, EaEntryBlock::Page, &undef)?;
+                        held.sb.page_init[byte] |= mask;
+                        held.dirty = true;
                     }
                     EaSlot::Block {
                         addr,
@@ -11384,20 +11460,16 @@ impl Hdf5Writer {
                 } else {
                     unpaged(dblk_addr)
                 };
-                if sb_dirty {
-                    self.handle
-                        .write_at(sblk_addr, &sb.encode(&self.ctx, k.max_nelmts_bits))?;
-                }
-                c.ea_cache.sblk = Some((sblk_addr, sb));
+                c.ea_cache.sblk = Some(held);
                 Ok(slot)
             }
         }
     }
 
-    /// Allocate and write a data block of super block `u`
-    /// (`H5EA__dblock_create`) and count it in the header's statistics. The
-    /// allocation covers a paged block's pages too, but only its prefix is
-    /// written: a page is written when its first entry is.
+    /// Allocate a data block of super block `u` (`H5EA__dblock_create`),
+    /// hold it, and count it in the header's statistics. The allocation
+    /// covers a paged block's pages too, but only its prefix is held: a page
+    /// is held when its first entry is set.
     fn create_ea_dblk(
         &self,
         c: &mut ChunkedDatasetInfo,
@@ -11419,7 +11491,7 @@ impl Hdf5Writer {
             s.dblk_nelmts as usize
         };
         let undef = vec![FilteredChunkEntry::undef(); nelmts];
-        self.write_ea_entries(c, k, addr, EaEntryBlock::Dblk { block_offset }, &undef)?;
+        self.hold_new_ea_block(c, k, addr, EaEntryBlock::Dblk { block_offset }, &undef)?;
         c.ea_header.num_dblks_created += 1;
         c.ea_header.size_dblks_created += size;
         c.ea_header.num_elmts_realized += s.dblk_nelmts;
@@ -11434,14 +11506,15 @@ impl Hdf5Writer {
         addr: u64,
     ) -> IoResult<ExtensibleArraySuperBlock> {
         let len = k.geo.sblk_size(u, self.ctx.sizeof_addr, k.max_nelmts_bits);
-        let buf = self.handle.read_at(addr, len)?;
-        Ok(ExtensibleArraySuperBlock::decode(
-            &buf,
-            &self.ctx,
-            k.max_nelmts_bits,
-            k.geo.sblk[u].ndblks as usize,
-            k.geo.sblk_page_init_len(u),
-        )?)
+        self.handle.load_metadata(|| {
+            Ok(ExtensibleArraySuperBlock::decode(
+                &self.handle.read_at(addr, len)?,
+                &self.ctx,
+                k.max_nelmts_bits,
+                k.geo.sblk[u].ndblks as usize,
+                k.geo.sblk_page_init_len(u),
+            )?)
+        })
     }
 
     /// The `nelmts` entries of the block at `addr`, from `c`'s held copy
@@ -11461,8 +11534,9 @@ impl Hdf5Writer {
                 return Ok((0..nelmts).map(|i| img.entry(k, i, sa)).collect());
             }
         }
-        let buf = self.handle.read_at(addr, len)?;
-        self.decode_ea_entries(k, &buf, block, nelmts)
+        self.handle.load_metadata(|| {
+            self.decode_ea_entries(k, &self.handle.read_at(addr, len)?, block, nelmts)
+        })
     }
 
     /// The `nelmts` entries of `buf`, a whole block, checked against its
@@ -11523,7 +11597,51 @@ impl Hdf5Writer {
         block: EaEntryBlock,
         entries: &[FilteredChunkEntry],
     ) -> IoResult<()> {
-        let enc = match (block, k.filtered) {
+        let enc = self.encode_ea_entries(k, block, entries);
+        let (entries_at, _) = k.extent(block, entries.len(), self.ctx.sizeof_addr);
+        // Before the write, which may be over the held block itself.
+        self.flush_ea_block(c)?;
+        self.handle.write_at(addr, &enc)?;
+        c.ea_cache.block = Some(EaImage {
+            addr,
+            entries_at,
+            bytes: enc,
+            dirty: None,
+        });
+        Ok(())
+    }
+
+    /// Hold `entries` as the block at `addr`, which the file does not have
+    /// yet: the block is wholly dirty, and its one write is
+    /// [`flush_ea_block`](Self::flush_ea_block)'s.
+    fn hold_new_ea_block(
+        &self,
+        c: &mut ChunkedDatasetInfo,
+        k: &EaCodec,
+        addr: u64,
+        block: EaEntryBlock,
+        entries: &[FilteredChunkEntry],
+    ) -> IoResult<()> {
+        let enc = self.encode_ea_entries(k, block, entries);
+        let (entries_at, _) = k.extent(block, entries.len(), self.ctx.sizeof_addr);
+        self.flush_ea_block(c)?;
+        c.ea_cache.block = Some(EaImage {
+            addr,
+            entries_at,
+            dirty: Some(0..enc.len()),
+            bytes: enc,
+        });
+        Ok(())
+    }
+
+    /// `entries` as the image of `block`, its checksum last.
+    fn encode_ea_entries(
+        &self,
+        k: &EaCodec,
+        block: EaEntryBlock,
+        entries: &[FilteredChunkEntry],
+    ) -> Vec<u8> {
+        match (block, k.filtered) {
             (EaEntryBlock::Dblk { block_offset }, true) => FilteredDataBlock {
                 class_id: EA_CLS_FILT_CHUNK,
                 header_addr: k.header_addr,
@@ -11553,18 +11671,7 @@ impl Hdf5Writer {
                 let addrs: Vec<u64> = entries.iter().map(|e| e.addr).collect();
                 encode_unfiltered_page(&addrs, &self.ctx)
             }
-        };
-        let (entries_at, _) = k.extent(block, entries.len(), self.ctx.sizeof_addr);
-        // Before the write, which may be over the held block itself.
-        self.flush_ea_block(c)?;
-        self.handle.write_at(addr, &enc)?;
-        c.ea_cache.block = Some(EaImage {
-            addr,
-            entries_at,
-            bytes: enc,
-            dirty: None,
-        });
-        Ok(())
+        }
     }
 
     /// Write the entries set in `c`'s held data block since the file last got
@@ -11579,10 +11686,28 @@ impl Hdf5Writer {
         let ck = img.bytes.len() - 4;
         let sum = crate::format::checksum::checksum_metadata(&img.bytes[..ck]).to_le_bytes();
         img.bytes[ck..].copy_from_slice(&sum);
-        self.handle
-            .write_at(img.addr + dirty.start as u64, &img.bytes[dirty])?;
-        self.handle.write_at(img.addr + ck as u64, &sum)?;
+        if dirty.end >= ck {
+            self.handle
+                .write_at(img.addr + dirty.start as u64, &img.bytes[dirty.start..])?;
+        } else {
+            self.handle
+                .write_at(img.addr + dirty.start as u64, &img.bytes[dirty])?;
+            self.handle.write_at(img.addr + ck as u64, &sum)?;
+        }
         img.dirty = None;
+        Ok(())
+    }
+
+    /// [`flush_ea_block`](Self::flush_ea_block), then the held super block
+    /// if it changed: the blocks it leads to are in the file by then.
+    fn flush_ea(&self, c: &mut ChunkedDatasetInfo) -> IoResult<()> {
+        self.flush_ea_block(c)?;
+        if let Some(h) = c.ea_cache.sblk.as_mut().filter(|h| h.dirty) {
+            let bits = c.earray_params.max_nelmts_bits;
+            self.handle
+                .write_at(h.addr, &h.sb.encode(&self.ctx, bits))?;
+            h.dirty = false;
+        }
         Ok(())
     }
 
@@ -11604,8 +11729,11 @@ impl Hdf5Writer {
             .is_some_and(|i| i.addr == addr && i.bytes.len() == len);
         if !held {
             self.flush_ea_block(c)?;
-            let bytes = self.handle.read_at(addr, len)?;
-            self.decode_ea_entries(k, &bytes, block, nelmts)?;
+            let bytes = self.handle.load_metadata(|| {
+                let bytes = self.handle.read_at(addr, len)?;
+                self.decode_ea_entries(k, &bytes, block, nelmts)?;
+                Ok::<_, crate::io::IoError>(bytes)
+            })?;
             c.ea_cache.block = Some(EaImage {
                 addr,
                 entries_at,
@@ -15433,7 +15561,7 @@ impl Hdf5Writer {
                 btree_v2: Some(Bt2DatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
                     bt2_header_addr,
-                    node_addrs: Vec::new(),
+                    nodes: Vec::new(),
                     index: bt2_index,
                     chunks_written: 0,
                 }),
@@ -16753,9 +16881,9 @@ impl Hdf5Writer {
 
         // EA-indexed dataset
         if let Some(ref mut chunked) = m.chunked {
-            // Children before parents: the data block's entries before the
-            // index block that leads a reader to them.
-            self.flush_ea_block(chunked)?;
+            // Children before parents: the data block's entries and the
+            // super block before the index block that leads a reader to them.
+            self.flush_ea(chunked)?;
             if let Some(ref fiblk) = chunked.filt_iblk {
                 // Filtered EA
                 let iblk_encoded = fiblk.encode(&self.ctx, chunked.chunk_size_len);
@@ -16787,46 +16915,47 @@ impl Hdf5Writer {
 
         // BT2-indexed dataset
         if let Some(ref bt2) = m.btree_v2 {
-            // Bulk-load the index into fixed-size nodes and lay them over the
-            // dataset's block pool. Because every node is the same size, the
-            // blocks already on disk are reused in place and only the shortfall
-            // is allocated — the pool is the single owner of these addresses,
-            // so no flush leaves a block behind. The addresses a reader already
-            // holds stay valid, which is also what SWMR needs.
+            // Bulk-load the index and lay it out copy-on-write: unchanged
+            // nodes keep their blocks, changed ones go to fresh blocks, and the
+            // header is written last, so a reader holding the previous header
+            // walks an intact tree throughout.
             let tree = bt2.index.build_tree(&self.ctx);
-            let mut node_addrs = bt2.node_addrs.clone();
-            while node_addrs.len() < tree.nodes.len() {
-                node_addrs.push(
+            let node_size = tree.node_size as u64;
+            let placed = tree.place(&self.ctx, &bt2.nodes, &mut || {
+                self.allocator.allocate(node_size, FreeSpaceClass::Metadata)
+            });
+            let written = placed.writes.iter().try_for_each(|&i| {
+                let node = &placed.nodes[i];
+                self.handle.write_at(node.addr, &node.image)
+            });
+            if let Err(e) = written {
+                // No header names the fresh blocks yet.
+                for &i in &placed.writes {
                     self.allocator
-                        .allocate(tree.node_size as u64, FreeSpaceClass::Metadata),
-                );
-            }
-            // A tree with fewer nodes than last flush releases the surplus
-            // rather than leaving it recorded and unreachable, so the pool is
-            // exactly one block per node whichever way the count moved. Under
-            // SWMR a reader may still hold a header naming those blocks, so
-            // keep them out of the free list — the same rule `place_chunk`
-            // applies to a relocated chunk.
-            for addr in node_addrs.split_off(tree.nodes.len()) {
-                if !self.swmr_active {
-                    self.allocator
-                        .free(addr, tree.node_size as u64, FreeSpaceClass::Metadata);
+                        .free(placed.nodes[i].addr, node_size, FreeSpaceClass::Metadata);
                 }
-            }
-
-            for (image, &addr) in tree.encode(&self.ctx, &node_addrs).iter().zip(&node_addrs) {
-                self.handle.write_at(addr, image)?;
+                return Err(e.into());
             }
 
             // The root is the last node the bulk load emits.
-            let root_addr = match tree.nodes.len() {
-                0 => UNDEF_ADDR,
-                n => node_addrs[n - 1],
-            };
+            let root_addr = placed.nodes.last().map_or(UNDEF_ADDR, |n| n.addr);
             let hdr_encoded = tree.header(root_addr).encode(&self.ctx);
+            // A failed header write may still have landed, so the fresh blocks
+            // stay allocated and `nodes` keeps naming the previous tree.
             self.handle.write_at(bt2.bt2_header_addr, &hdr_encoded)?;
 
-            m.btree_v2.as_mut().unwrap().node_addrs = node_addrs;
+            // Under SWMR a reader may still be walking the tree the previous
+            // header named, so its blocks stay out of the free list — as in
+            // libhdf5, whose shadowed nodes are never freed
+            // (`H5B2__shadow_leaf`) — the same rule `place_chunk` applies to
+            // a relocated chunk.
+            if !self.swmr_active {
+                for &addr in &placed.superseded {
+                    self.allocator
+                        .free(addr, node_size, FreeSpaceClass::Metadata);
+                }
+            }
+            m.btree_v2.as_mut().unwrap().nodes = placed.nodes;
 
             if sync {
                 self.handle.sync_data()?;
@@ -16836,10 +16965,9 @@ impl Hdf5Writer {
 
         // Version-1-B-tree-indexed dataset
         if let Some(ref bt1) = m.btree_v1 {
-            // Bulk-loaded over the same block pool the v2 B-tree above uses,
-            // and for the same reason: every node of a v1 tree is the width
-            // its "K" value gives, so a block stays usable however the tree
-            // reshapes, and only the shortfall is ever allocated.
+            // Bulk-loaded over a block pool: every node of a v1 tree is the
+            // width its "K" value gives, so a block stays usable however the
+            // tree reshapes, and only the shortfall is ever allocated.
             let element_size = m.datatype.element_size() as u64;
             let tree = bt1.build_tree(element_size, self.ctx.sizeof_addr as usize);
             let node_size = tree.node_size() as u64;
@@ -16847,11 +16975,11 @@ impl Hdf5Writer {
             while node_addrs.len() < tree.node_count() {
                 node_addrs.push(self.allocator.allocate(node_size, FreeSpaceClass::Metadata));
             }
-            // A tree with fewer nodes than last flush releases the surplus
-            // straight away, where the v2 B-tree has to keep it out of the
-            // free list for a live SWMR reader: this index lives only in a
-            // classic file, which `start_swmr` refuses outright (and upstream
-            // says the same in `H5D_COPS_BTREE`).
+            // Rewritten in place and the surplus released straight away,
+            // where the v2 B-tree goes copy-on-write for a live SWMR reader:
+            // this index lives only in a classic file, which `start_swmr`
+            // refuses outright (and upstream says the same in
+            // `H5D_COPS_BTREE`).
             for addr in node_addrs.split_off(tree.node_count()) {
                 self.allocator
                     .free(addr, node_size, FreeSpaceClass::Metadata);
@@ -17149,9 +17277,7 @@ impl Hdf5Writer {
                 images.iter().map(|(_, image)| image.len()).sum::<usize>()
             )));
         }
-        for (addr, image) in &images {
-            self.handle.write_at(*addr, image)?;
-        }
+        self.write_header_images(&images)?;
         // Only after the bytes are down: a failed write leaves the registry
         // describing the header the file still holds.
         self.ds(index).lock().header_written(nlink);
@@ -17161,8 +17287,9 @@ impl Hdf5Writer {
     /// Perform a full finalize for SWMR mode.
     ///
     /// This writes all dataset object headers, the root group header, and the
-    /// superblock with SWMR flags. After this call, the file is valid for
-    /// SWMR readers. Subsequent writes use in-place updates.
+    /// superblock with SWMR flags, then releases the file lock. After this
+    /// call, SWMR readers can open the file. Subsequent writes use in-place
+    /// updates.
     pub fn finalize_for_swmr(&mut self) -> IoResult<()> {
         self.reject_swmr()?;
         // 0. Flush all chunked dataset index structures.
@@ -17219,7 +17346,9 @@ impl Hdf5Writer {
         }
         self.superseded_root_header = layout.root.blocks();
 
-        // 4. Write superblock with SWMR flags.
+        // 4. Write superblock with SWMR flags: the write that lets a reader
+        // in, so from it on, writes reach the file in the order issued.
+        self.handle.start_swmr_write()?;
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
         self.handle.set_eof(self.allocator.eof())?;
 
@@ -17228,6 +17357,10 @@ impl Hdf5Writer {
         // leave its old block intact for whoever is still holding the previous
         // index (see `swmr_active`).
         self.swmr_active = true;
+        // Last, as `H5F__start_swmr_write` unlocks last: a reader the lock
+        // let in finds the SWMR superblock. Released, not downgraded: a
+        // shared `LockFileEx` lock would refuse this writer's own writes.
+        self.handle.release_lock()?;
         Ok(())
     }
 
@@ -17536,8 +17669,19 @@ impl Hdf5Writer {
         let images = self.encode_header_in(header, rc, format, placement)?;
         let reserved =
             std::iter::once(placement.size).chain(placement.continuation.map(|(_, s)| s));
-        for ((addr, image), size) in images.iter().zip(reserved) {
+        for ((_, image), size) in images.iter().zip(reserved) {
             check_header_size(image, size, || what.to_string())?;
+        }
+        self.write_header_images(&images)
+    }
+
+    /// Write the chunk images [`encode_header_in`](Self::encode_header_in)
+    /// returns, the continuation before chunk 0, whose message names it: a
+    /// SWMR reader that reaches chunk 0 finds what it leads to already in the
+    /// file. libhdf5 makes every chunk a flush dependency of the chunk naming
+    /// it under SWMR (`H5O__cache_chk_notify`).
+    fn write_header_images(&self, images: &[(u64, Vec<u8>)]) -> IoResult<()> {
+        for (addr, image) in images.iter().rev() {
             self.handle.write_at(*addr, image)?;
         }
         Ok(())
@@ -19474,10 +19618,13 @@ mod tests {
     const BT2_PROBE_CHUNK: u64 = 8;
 
     /// Write chunks of a 1x1-chunked 2-D BT2 dataset, flushing at each batch
-    /// boundary, and report `(node addresses, file length)` after every flush.
-    /// Chunks are addressed down column 0 so the record count — and hence the
-    /// tree's shape — grows one record at a time.
-    fn btree_v2_flush_probe(path: &std::path::Path, batches: &[u64]) -> Vec<(Vec<u64>, u64)> {
+    /// boundary, and report `(published node blocks, file length)` after every
+    /// flush. Chunks are addressed down column 0 so the record count — and
+    /// hence the tree's shape — grows one record at a time.
+    fn btree_v2_flush_probe(
+        path: &std::path::Path,
+        batches: &[u64],
+    ) -> Vec<(Vec<crate::format::chunk_index::btree_v2::Bt2NodeBlock>, u64)> {
         let writer = Hdf5Writer::create(path).unwrap();
         let idx = writer
             .create_btree_v2_dataset(
@@ -19498,26 +19645,40 @@ mod tests {
                 written += 1;
             }
             writer.flush_dataset(idx).unwrap();
-            let addrs = writer
+            let nodes = writer
                 .ds(idx)
                 .lock()
                 .btree_v2
                 .as_ref()
                 .unwrap()
-                .node_addrs
+                .nodes
                 .clone();
-            out.push((addrs, std::fs::metadata(path).unwrap().len()));
+            out.push((nodes, std::fs::metadata(path).unwrap().len()));
         }
         writer.extend_dataset(idx, &[written.max(1), 1]).unwrap();
         writer.close().unwrap();
         out
     }
 
-    /// The node pool tracks the tree in both directions. Dropping records is
+    /// Node addresses of BT2 dataset `idx`'s published tree, in tree order.
+    fn btree_v2_node_addrs(writer: &Hdf5Writer, idx: usize) -> Vec<u64> {
+        let ds = writer.ds(idx);
+        let m = ds.lock();
+        m.btree_v2
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|b| b.addr)
+            .collect()
+    }
+
+    /// A flush gives up every block its new tree does not keep: the old block
+    /// of each node it moved as well as the blocks of nodes the tree no longer
+    /// has. Outside SWMR no reader can still hold the previous header, so they
+    /// go back to the allocator instead of being stranded. Dropping records is
     /// what a removal path would do — [`Bt2ChunkIndex`] has none today, so the
-    /// test drops them itself — and the flush that follows must hand the blocks
-    /// its smaller tree no longer needs back to the allocator instead of
-    /// leaving them recorded and unreachable.
+    /// test drops them itself.
     #[test]
     fn a_btree_v2_flush_frees_the_node_blocks_its_tree_gave_up() {
         use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
@@ -19540,17 +19701,10 @@ mod tests {
                 .unwrap();
         }
         writer.flush_dataset(idx).unwrap();
-        let grown = writer
-            .ds(idx)
-            .lock()
-            .btree_v2
-            .as_ref()
-            .unwrap()
-            .node_addrs
-            .clone();
+        let mut grown = btree_v2_node_addrs(&writer, idx);
         assert_eq!(grown.len(), 3, "expected two leaves and a root");
 
-        // Back to 84 records: one leaf, so two of the three blocks are surplus.
+        // Back to 84 records: one leaf, which differs from both old leaves.
         writer
             .ds(idx)
             .lock()
@@ -19561,35 +19715,125 @@ mod tests {
             .records
             .truncate(84);
         writer.flush_dataset(idx).unwrap();
-        let shrunk = writer
+        let shrunk = btree_v2_node_addrs(&writer, idx);
+        assert_eq!(shrunk.len(), 1, "expected a single leaf");
+        assert!(
+            !grown.contains(&shrunk[0]),
+            "the changed leaf was written over a published block"
+        );
+
+        // All three published blocks went back to the allocator, not on the
+        // floor: the next three node-sized allocations are exactly them.
+        let mut reused: Vec<u64> = (0..3)
+            .map(|_| {
+                writer
+                    .allocator
+                    .allocate(BT2_NODE_SIZE as u64, FreeSpaceClass::Metadata)
+            })
+            .collect();
+        reused.sort_unstable();
+        grown.sort_unstable();
+        assert_eq!(reused, grown, "a superseded node block was not freed");
+
+        writer.extend_dataset(idx, &[85, 1]).unwrap();
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Under SWMR a reader may still be walking from the header it loaded
+    /// before a flush, so the flush must leave every block that header reaches
+    /// untouched. A record inserted ahead of the others is the hard case: the
+    /// first leaf keeps its record count while every record in it shifts, so a
+    /// leaf rewritten in place passes the reader's count and checksum checks
+    /// and hands it the new records under the old separators.
+    #[test]
+    fn a_btree_v2_flush_leaves_the_tree_a_published_header_reaches_intact() {
+        use crate::format::chunk_index::btree_v2::{collect_btree_v2_records, Bt2Header};
+
+        struct Bytes<'a>(&'a [u8]);
+        impl crate::format::BlockReader for Bytes<'_> {
+            fn read_block(
+                &mut self,
+                offset: u64,
+                len: usize,
+            ) -> crate::format::FormatResult<Vec<u8>> {
+                let start = (offset as usize).min(self.0.len());
+                let end = (start + len).min(self.0.len());
+                Ok(self.0[start..end].to_vec())
+            }
+        }
+
+        let path = temp_path("bt2_published_intact");
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_btree_v2_dataset(
+                "data",
+                DatatypeMessage::f64_type(),
+                &[0, 0],
+                &[u64::MAX, u64::MAX],
+                &[1, 1],
+            )
+            .unwrap();
+        // 200 records down column 0: a root over three leaves.
+        for i in 0..200u64 {
+            writer
+                .write_chunk_btree_v2(idx, &[i, 0], &(i as f64 + 1.0).to_le_bytes())
+                .unwrap();
+        }
+        writer.finalize_for_swmr().unwrap();
+        let hdr_addr = writer
             .ds(idx)
             .lock()
             .btree_v2
             .as_ref()
             .unwrap()
-            .node_addrs
-            .clone();
-        assert_eq!(
-            shrunk,
-            grown[..1],
-            "the pool still records the surplus blocks"
-        );
+            .bt2_header_addr;
+        let before = std::fs::read(&path).unwrap();
+        let published = Bt2Header::decode(&before[hdr_addr as usize..], &ctx).unwrap();
+        let records = collect_btree_v2_records(&published, &ctx, &mut Bytes(&before)).unwrap();
+        assert_eq!(published.total_num_records, 200);
 
-        // The surplus went back to the allocator, not on the floor: the next
-        // node-sized allocation lands inside the region the two blocks covered.
-        let reused = writer
-            .allocator
-            .allocate(BT2_NODE_SIZE as u64, FreeSpaceClass::Metadata);
+        // [0, 1] sorts between [0, 0] and [1, 0]: every record of the first
+        // leaf shifts right by one, and its count does not change.
+        writer
+            .write_chunk_btree_v2(idx, &[0, 1], &1000f64.to_le_bytes())
+            .unwrap();
+        writer.flush_dataset(idx).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        let current = Bt2Header::decode(&after[hdr_addr as usize..], &ctx).unwrap();
+        assert_eq!(current.total_num_records, 201);
+        let walked = collect_btree_v2_records(&published, &ctx, &mut Bytes(&after)).unwrap();
+        let rec = published.record_size as usize;
         assert!(
-            (grown[1]..grown[1] + 2 * BT2_NODE_SIZE as u64).contains(&reused),
-            "a node block allocated at {reused:#x}, outside the freed \
-             [{:#x}, {:#x}) the flush gave up",
-            grown[1],
-            grown[1] + 2 * BT2_NODE_SIZE as u64
+            walked == records,
+            "the tree the published header reaches changed under it: record {} of {} differs",
+            walked
+                .chunks(rec)
+                .zip(records.chunks(rec))
+                .position(|(a, b)| a != b)
+                .unwrap_or(walked.len().min(records.len()) / rec),
+            records.len() / rec
         );
 
-        writer.extend_dataset(idx, &[85, 1]).unwrap();
+        writer.extend_dataset(idx, &[200, 2]).unwrap();
         writer.close().unwrap();
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let values: Vec<f64> = reader
+            .read_dataset_raw("data")
+            .unwrap()
+            .chunks(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 400);
+        for r in 0..200usize {
+            assert_eq!(values[2 * r], r as f64 + 1.0, "chunk [{r}, 0]");
+            let want = if r == 0 { 1000.0 } else { 0.0 };
+            assert_eq!(values[2 * r + 1], want, "chunk [{r}, 1]");
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -19666,79 +19910,99 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A node's record count falls as well as rises: the tree's first leaf goes
-    /// from a full 84 records to 42 when 85 records force it to split. The node
-    /// image is padded to the whole block so re-serializing overwrites the
-    /// block, not a prefix of it — otherwise that leaf keeps the tail of its
-    /// 84-record self, stale records sitting in a live node block.
+    /// A freed node block goes to whichever node next needs one, and that node
+    /// may hold fewer records than the block's previous occupant. The node
+    /// image is padded to the whole block so writing it overwrites the block,
+    /// not a prefix of it — otherwise the block keeps the tail of the fuller
+    /// node, stale records sitting in a live node block.
     #[test]
-    fn a_shrinking_btree_v2_node_leaves_no_stale_records_behind() {
-        use crate::format::chunk_index::btree_v2::{Bt2ChunkIndex, BT2_NODE_SIZE};
-
+    fn a_recycled_btree_v2_node_block_holds_no_stale_records() {
         let path = temp_path("bt2_node_blocks");
-        let probe = btree_v2_flush_probe(&path, &[84, 85]);
-        let node0 = probe.last().unwrap().0[0];
-
-        // What the first leaf holds once the tree has split.
-        let ctx = FormatContext {
-            sizeof_addr: 8,
-            sizeof_size: 8,
-        };
-        let mut index = Bt2ChunkIndex::new_unfiltered(2);
-        for i in 0..85u64 {
-            index.insert(vec![i, 0], 0);
-        }
-        let tree = index.build_tree(&ctx);
+        // 84 is one full leaf; 85 splits it into 83 + 1 and frees it; 86 refills
+        // the first leaf and frees the 83-record block; 87 grows the last leaf
+        // to two records, which takes a freed block.
+        let probe = btree_v2_flush_probe(&path, &[84, 85, 86, 87]);
+        let (last, earlier) = probe.split_last().unwrap();
+        let used = |image: &[u8]| image.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
         assert!(
-            tree.nodes[0].num_records < 84,
-            "this test needs the first leaf to shrink, got {}",
-            tree.nodes[0].num_records
+            last.0.iter().any(|b| earlier
+                .iter()
+                .flat_map(|(nodes, _)| nodes)
+                .any(|old| old.addr == b.addr && used(&old.image) > used(&b.image))),
+            "this test needs a node written over a block that held a fuller one"
         );
-        // signature(4) + version(1) + type(1) + records + checksum(4)
-        let used = 10 + tree.nodes[0].num_records as usize * tree.record_size as usize;
 
         let bytes = std::fs::read(&path).unwrap();
-        let block = &bytes[node0 as usize..node0 as usize + BT2_NODE_SIZE as usize];
-        assert!(
-            block[used..].iter().all(|&b| b == 0),
-            "leaf block at {node0:#x} still holds {} bytes of its previous, larger image",
-            block[used..].iter().rposition(|&b| b != 0).unwrap_or(0) + 1
-        );
+        for b in &last.0 {
+            let block = &bytes[b.addr as usize..b.addr as usize + b.image.len()];
+            assert!(
+                block == b.image.as_slice(),
+                "node block at {:#x} holds {} bytes past its image's {}",
+                b.addr,
+                used(block),
+                used(&b.image)
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 
-    /// The node pool is the single owner of the tree's block addresses: a flush
-    /// reuses every block already in it and allocates only the shortfall. So
-    /// re-flushing an unchanged index must cost nothing, and a flush that grows
-    /// the tree must cost exactly the blocks it added — anything more means a
-    /// block was stranded.
+    /// The published node blocks are the single owner of the tree's file
+    /// space, and a flush moves only the nodes that changed. Re-flushing an
+    /// unchanged index writes nothing; an append moves only the right end of
+    /// each level — the last node, and its left neighbour on the flush where
+    /// the level divides exactly ([`Bt2Tree::build`]). Outside SWMR the blocks
+    /// a flush gives up are reused, so a flush per record does not grow the
+    /// file by a path per flush.
+    ///
+    /// [`Bt2Tree::build`]: crate::format::chunk_index::btree_v2::Bt2Tree::build
     #[test]
-    fn a_btree_v2_flush_allocates_only_the_node_blocks_it_adds() {
+    fn a_btree_v2_flush_moves_only_the_nodes_an_append_changes() {
         use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
 
         let path = temp_path("bt2_pool_growth");
-        // Re-flush at 84 (still one leaf), then cross into a three-node depth-1
-        // tree, then keep growing.
-        let batches = [84u64, 84, 85, 200, 200];
+        let mut batches = vec![84u64, 84];
+        batches.extend(85..=400);
+        batches.push(400);
         let probe = btree_v2_flush_probe(&path, &batches);
         for i in 1..probe.len() {
-            let (prev_addrs, prev_len) = &probe[i - 1];
-            let (addrs, len) = &probe[i];
-            assert!(
-                addrs.starts_with(prev_addrs),
-                "flush {i} moved a node block instead of reusing it"
-            );
-            let new_blocks = (addrs.len() - prev_addrs.len()) as u64 * BT2_NODE_SIZE as u64;
-            let new_chunks = (batches[i] - batches[i - 1]) * BT2_PROBE_CHUNK;
-            assert_eq!(
-                len - prev_len,
-                new_blocks + new_chunks,
-                "flush {i} grew the file by more than the blocks it added"
-            );
+            let (prev, cur) = (&probe[i - 1].0, &probe[i].0);
+            for d in 0..=cur.last().unwrap().depth {
+                let level = |nodes: &[crate::format::chunk_index::btree_v2::Bt2NodeBlock]| {
+                    nodes
+                        .iter()
+                        .filter(|b| b.depth == d)
+                        .map(|b| b.addr)
+                        .collect::<Vec<u64>>()
+                };
+                let (p, c) = (level(prev), level(cur));
+                let fixed = c.len().saturating_sub(2).min(p.len());
+                assert_eq!(
+                    c[..fixed],
+                    p[..fixed],
+                    "flush {i} moved a depth-{d} node left of the append"
+                );
+            }
         }
-        // The unchanged re-flushes must be free.
-        assert_eq!(probe[1].1, probe[0].1);
-        assert_eq!(probe[4].1, probe[3].1);
+        // The unchanged re-flushes keep every block and grow nothing.
+        assert_eq!(probe[1], probe[0]);
+        assert_eq!(probe[probe.len() - 1], probe[probe.len() - 2]);
+
+        // Node space is the live tree plus what one flush can have freed for
+        // the next: at most two nodes per level, the root's included.
+        let node = BT2_NODE_SIZE as u64;
+        let (first_nodes, first_len) = (&probe[0].0, probe[0].1);
+        let (nodes, len) = (&probe[probe.len() - 1].0, probe[probe.len() - 1].1);
+        let levels = u64::from(nodes.last().unwrap().depth) + 1;
+        let data = (400 - 84) * BT2_PROBE_CHUNK;
+        let bound = first_len - first_nodes.len() as u64 * node
+            + data
+            + (nodes.len() as u64 + 2 * levels) * node;
+        assert!(
+            len <= bound,
+            "{} flushes left the file at {len} bytes, past the {bound} the live \
+             tree and one flush of freed blocks need",
+            probe.len()
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -19882,6 +20146,114 @@ mod tests {
         let raw = reader.read_dataset_raw("frames").unwrap();
         assert!(raw.chunks(5).enumerate().all(|(i, f)| f == [i as u8; 5]));
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A block the extensible array creates is held, and written once, at
+    /// flush, with the entry it was created for: a data block off the index
+    /// block, a super block with its first data block, and a page of the
+    /// first paged data block. Until then the file has nothing at either
+    /// address, so neither is written a first time all undefined.
+    #[test]
+    fn a_new_extensible_array_block_is_written_once_at_flush() {
+        let path = temp_path("ea_new_block_once");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_chunked_dataset(
+                "frames",
+                DatatypeMessage::u8_type(),
+                &[0, 1],
+                &[u64::MAX, 1],
+                &[1, 1],
+            )
+            .unwrap();
+        // The block at `addr` whose checksum checks, if the file has it.
+        let on_file = |addr: u64, len: usize| {
+            let buf = writer.handle.read_at_most(addr, len).unwrap();
+            let ck = len - 4;
+            (buf.len() == len
+                && buf[ck..]
+                    == crate::format::checksum::checksum_metadata(&buf[..ck]).to_le_bytes())
+            .then_some(buf)
+        };
+        // Under the default parameters: past the index block's 4 entries,
+        // past its direct data blocks' 240, and past super blocks 0 to 12.
+        let chunks = [4u64, 244, 131_060];
+        for (i, &chunk) in chunks.iter().enumerate() {
+            writer.write_chunk(idx, chunk, &[i as u8 + 1]).unwrap();
+            let (block, page, sblk) = {
+                let ds = writer.ds(idx);
+                let m = ds.lock();
+                let c = m.chunked.as_ref().unwrap();
+                let k = EaCodec::new(c, 1).unwrap();
+                let img = c.ea_cache.block.as_ref().unwrap();
+                let sblks = c.iblk_addrs().1;
+                let sblk = sblks.iter().rposition(|&a| a != UNDEF_ADDR).map(|off| {
+                    let u = k.geo.iblock_nsblks + off;
+                    let len = k
+                        .geo
+                        .sblk_size(u, writer.ctx.sizeof_addr, k.max_nelmts_bits);
+                    (sblks[off], len)
+                });
+                ((img.addr, img.bytes.len()), img.entries_at == 0, sblk)
+            };
+            assert_eq!(page, i == 2, "chunk {chunk}");
+            assert_eq!(sblk.is_some(), i > 0, "chunk {chunk}");
+            assert!(on_file(block.0, block.1).is_none(), "chunk {chunk}: block");
+            if let Some(s) = sblk {
+                assert!(on_file(s.0, s.1).is_none(), "chunk {chunk}: super block");
+            }
+            writer.flush_dataset(idx).unwrap();
+            let held = {
+                let ds = writer.ds(idx);
+                let m = ds.lock();
+                let img = m.chunked.as_ref().unwrap().ea_cache.block.as_ref().unwrap();
+                assert!(img.dirty.is_none());
+                img.bytes.clone()
+            };
+            assert_eq!(
+                on_file(block.0, block.1),
+                Some(held),
+                "chunk {chunk}: block"
+            );
+            if let Some(s) = sblk {
+                assert!(on_file(s.0, s.1).is_some(), "chunk {chunk}: super block");
+            }
+        }
+        writer.extend_dataset(idx, &[chunks[2] + 1, 1]).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let raw = reader.read_dataset_raw("frames").unwrap();
+        for (i, &chunk) in chunks.iter().enumerate() {
+            assert_eq!(raw[chunk as usize], i as u8 + 1, "chunk {chunk}");
+        }
+        assert_eq!(raw.iter().filter(|&&b| b != 0).count(), chunks.len());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A dataset deleted before its index is flushed frees a super block
+    /// the file never got from the copy the writer holds.
+    #[test]
+    fn deleting_a_dataset_frees_a_super_block_never_flushed() {
+        let path = temp_path("ea_delete_held_sblk");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_chunked_dataset(
+                "frames",
+                DatatypeMessage::u8_type(),
+                &[0, 1],
+                &[u64::MAX, 1],
+                &[1, 1],
+            )
+            .unwrap();
+        writer.write_chunk(idx, 244, &[7]).unwrap();
+        writer.extend_dataset(idx, &[245, 1]).unwrap();
+        writer.delete_dataset("frames").unwrap();
+        writer.close().unwrap();
+
+        let reader = Hdf5Reader::open(&path).unwrap();
+        assert!(reader.dataset_names().is_empty());
         std::fs::remove_file(&path).ok();
     }
 
@@ -20569,10 +20941,6 @@ mod tests {
         assert_eq!(writer.superblock_version_for(0), SUPERBLOCK_V2);
 
         writer.finalize_for_swmr().unwrap();
-        // What `start_swmr` does after finalizing, and what lets a second
-        // handle read the file while this writer lives — the writer's
-        // exclusive lock is mandatory on Windows.
-        writer.handle().release_lock().unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
 
         // The close-time finalize carries no SWMR flag; the file is still an
@@ -20580,6 +20948,69 @@ mod tests {
         // its readers attached to.
         writer.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `finalize_for_swmr` lets readers in, and a reader that locks the file,
+    /// as libhdf5's do, takes a shared lock: the writer has to hold none from
+    /// then on. On Windows its exclusive lock also refuses every read
+    /// through another handle.
+    #[test]
+    fn finalize_for_swmr_lets_a_locking_reader_attach() {
+        let path = temp_path("swmr_unlocked");
+        let mut writer =
+            Hdf5Writer::create_with_locking(&path, crate::io::locking::FileLocking::Enabled)
+                .unwrap();
+        writer
+            .create_dataset("d", DatatypeMessage::i32_type(), &[2])
+            .unwrap();
+        writer.finalize_for_swmr().unwrap();
+
+        let reader = std::fs::File::open(&path).unwrap();
+        reader
+            .try_lock_shared()
+            .expect("the SWMR writer still holds its lock");
+        drop(reader);
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A reader holds the fixed-array header `finalize_for_swmr` published,
+    /// so the data block it names is live from then on: an entry in it must
+    /// not reach the file ahead of the chunk it names. The flush writes the
+    /// block first, before the header, and a block this wide is too large to
+    /// stage; the file is looked at right after that write, where a reader
+    /// can look too.
+    #[test]
+    fn a_swmr_index_write_never_lands_ahead_of_the_chunk_it_names() {
+        let path = temp_path("swmr_write_through");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_fixed_array_dataset("grid", DatatypeMessage::i32_type(), &[3000], &[1])
+            .unwrap();
+        writer.finalize_for_swmr().unwrap();
+
+        let value = 0x5eed_f00d_i32.to_le_bytes();
+        writer.write_chunk_fixed_array(idx, &[7], &value).unwrap();
+        // The first write of `flush_dataset_synced`'s fixed-array arm.
+        let (dblk_addr, dblk, chunk_addr) = {
+            let ds = writer.ds(idx);
+            let m = ds.lock();
+            let fa = m.fixed_array.as_ref().unwrap();
+            let dblk = encode_fixed_array_dblk(&writer.ctx, &fa.fa_header, &fa.fa_dblk);
+            (fa.fa_dblk_addr, dblk, fa.fa_dblk.elements[7])
+        };
+        writer.handle.write_at(dblk_addr, &dblk).unwrap();
+
+        let file = std::fs::read(&path).unwrap();
+        let on_disk = |addr: u64, len: usize| file.get(addr as usize..addr as usize + len);
+        assert_eq!(on_disk(dblk_addr, dblk.len()), Some(&dblk[..]));
+        assert!(
+            on_disk(chunk_addr, value.len()) == Some(&value[..]),
+            "the data block in the file names chunk 7 at {chunk_addr:#x}, which the file \
+             does not hold yet"
+        );
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 
