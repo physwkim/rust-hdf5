@@ -10327,6 +10327,18 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Allocate `size` bytes of a dataset's contiguous storage.
+    ///
+    /// It starts on an eight-byte boundary, the widest alignment of an
+    /// element a mapped view reads in place (`crate::mapped::view` refuses
+    /// an offset the element type does not permit). Nothing else this writer
+    /// allocates is aligned, as libhdf5 aligns nothing by default, so a
+    /// chunk or metadata block leaves no fragment behind it.
+    fn allocate_contiguous(&self, size: u64) -> u64 {
+        self.allocator
+            .allocate_aligned(size, FreeSpaceClass::RawData, 8)
+    }
+
     /// Define a new contiguous dataset. Returns the dataset index (used with
     /// `write_dataset_raw`).
     ///
@@ -10350,7 +10362,7 @@ impl Hdf5Writer {
 
         // Allocate space for the raw data.
         let data_addr = if data_size > 0 {
-            self.allocator.allocate(data_size, FreeSpaceClass::RawData)
+            self.allocate_contiguous(data_size)
         } else {
             UNDEF_ADDR
         };
@@ -12794,9 +12806,7 @@ impl Hdf5Writer {
         }
 
         // Allocate and write raw data
-        let data_addr = self
-            .allocator
-            .allocate(data_size as u64, FreeSpaceClass::RawData);
+        let data_addr = self.allocate_contiguous(data_size as u64);
         self.handle.write_at(data_addr, &raw_data)?;
 
         // Create the dataset with vlen string datatype
@@ -12921,9 +12931,7 @@ impl Hdf5Writer {
         }
 
         // Allocate and write raw data.
-        let data_addr = self
-            .allocator
-            .allocate(data_size as u64, FreeSpaceClass::RawData);
+        let data_addr = self.allocate_contiguous(data_size as u64);
         self.handle.write_at(data_addr, &raw_data)?;
 
         let datatype = DatatypeMessage::VarLenSequence {
@@ -17889,6 +17897,18 @@ mod tests {
         ))
     }
 
+    /// Whether the block at `addr` is back with the allocator: on its free
+    /// list, or past the end of the file, where a release that reached the
+    /// end gave it back to the file instead.
+    fn reclaimed(writer: &Hdf5Writer, addr: u64) -> bool {
+        addr >= writer.allocator.eof()
+            || writer
+                .allocator
+                .free_blocks()
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+    }
+
     /// A group past the link phase change keeps its links in a fractal heap
     /// with a v2 B-tree name index. The reopen that rewrites that group's
     /// header lays a fresh pair out, so both blocks the old header named must
@@ -17929,13 +17949,16 @@ mod tests {
             .release_superseded_dense_links(LinkScope::Group(gidx))
             .unwrap();
         let freed = writer.allocator.free_blocks();
-        let covers = |addr: u64| {
-            freed
-                .iter()
-                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
-        };
-        assert!(covers(linfo.fractal_heap_address), "heap header: {freed:?}");
-        assert!(covers(linfo.name_btree_address), "name index: {freed:?}");
+        let covers = |addr: u64| reclaimed(&writer, addr);
+        let eof = writer.allocator.eof();
+        assert!(
+            covers(linfo.fractal_heap_address),
+            "heap header: {freed:?}, eof {eof}"
+        );
+        assert!(
+            covers(linfo.name_btree_address),
+            "name index: {freed:?}, eof {eof}"
+        );
 
         // And exactly once: the entry is gone, so the finalize that follows
         // cannot hand the same blocks back a second time.
@@ -17993,13 +18016,16 @@ mod tests {
 
         writer.prepare_dense_attributes(&[]).unwrap();
         let freed = writer.allocator.free_blocks();
-        let covers = |addr: u64| {
-            freed
-                .iter()
-                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
-        };
-        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
-        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        let covers = |addr: u64| reclaimed(&writer, addr);
+        let eof = writer.allocator.eof();
+        assert!(
+            covers(ainfo.fractal_heap_address),
+            "heap header: {freed:?}, eof {eof}"
+        );
+        assert!(
+            covers(ainfo.name_btree_address),
+            "name index: {freed:?}, eof {eof}"
+        );
         assert!(writer
             .superseded_dense
             .lock()
@@ -18046,13 +18072,16 @@ mod tests {
 
         writer.delete_group("/run").unwrap();
         let freed = writer.allocator.free_blocks();
-        let covers = |addr: u64| {
-            freed
-                .iter()
-                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
-        };
-        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
-        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        let covers = |addr: u64| reclaimed(&writer, addr);
+        let eof = writer.allocator.eof();
+        assert!(
+            covers(ainfo.fractal_heap_address),
+            "heap header: {freed:?}, eof {eof}"
+        );
+        assert!(
+            covers(ainfo.name_btree_address),
+            "name index: {freed:?}, eof {eof}"
+        );
         assert!(writer
             .superseded_dense
             .lock()
@@ -19259,9 +19288,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Bytes one chunk of [`btree_v2_flush_probe`]'s dataset occupies — an
-    /// f64 element, so the allocator's alignment neither pads nor merges it and
-    /// the file's growth is exactly the bytes asked for.
+    /// Bytes one chunk of [`btree_v2_flush_probe`]'s dataset occupies: one f64
+    /// element, which is also what the file grows by per chunk.
     const BT2_PROBE_CHUNK: u64 = 8;
 
     /// Write chunks of a 1x1-chunked 2-D BT2 dataset, flushing at each batch
@@ -19633,6 +19661,45 @@ mod tests {
         for (i, val) in values[64..80].iter().enumerate() {
             assert_eq!(*val, 4 * 16 + i as u16);
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Chunks whose size is no multiple of eight start where the last one
+    /// ended. Aligning each one left a fragment on the free list per frame,
+    /// which every later draw scanned, so an append cost grew with the frame
+    /// count.
+    #[test]
+    fn swmr_appends_of_odd_sized_frames_leave_the_free_list_empty() {
+        use crate::io::swmr::SwmrWriter;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_swmr_odd_frames_{}_{}.h5",
+            std::process::id(),
+            n
+        ));
+
+        let mut swmr = SwmrWriter::create(&path).unwrap();
+        let idx = swmr
+            .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[5])
+            .unwrap();
+        swmr.start_swmr().unwrap();
+        let frames = 4096u32;
+        for frame in 0..frames {
+            swmr.append_frame(idx, &[frame as u8; 5]).unwrap();
+            if frame % 512 == 511 {
+                swmr.flush().unwrap();
+            }
+        }
+        assert_eq!(swmr.writer_mut().allocator.free_blocks(), vec![]);
+        swmr.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("frames").unwrap(), vec![4096, 5]);
+        let raw = reader.read_dataset_raw("frames").unwrap();
+        assert!(raw.chunks(5).enumerate().all(|(i, f)| f == [i as u8; 5]));
 
         std::fs::remove_file(&path).ok();
     }
@@ -20689,11 +20756,8 @@ mod tests {
         assert!(info.persist);
         assert_eq!(info.threshold, 1);
         assert_eq!(info.page_size, 4096);
-        // The alignment fragments the creation left behind are the file's
-        // first free space, so the metadata manager already has an address
-        // and the raw-data one, which nothing freed into, does not.
-        assert_ne!(info.fs_addr[0], UNDEF_ADDR);
-        assert!(info.fs_addr.iter().skip(1).all(|&a| a == UNDEF_ADDR));
+        // The creation released nothing, so no manager has an address yet.
+        assert!(info.fs_addr.iter().all(|&a| a == UNDEF_ADDR));
 
         // An append supersedes the root header and the extension, and that
         // freed space is what the managers now record.

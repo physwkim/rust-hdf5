@@ -312,8 +312,8 @@ fn a_crate_created_persisting_file_is_one_libhdf5_accepts() {
     }
 
     let created = h5stat_space(py, &path);
-    // What the creation freed is the alignment fragments before each block;
-    // the managers record every one of them, so nothing in the file is
+    // Whatever the creation freed — at most the fragment before an aligned
+    // contiguous block — the managers record, so nothing in the file is
     // unaccounted for even before anything is deleted.
     assert_eq!(
         created.unaccounted, 0,
@@ -958,6 +958,15 @@ fn the_recorded_eoa_is_the_end_of_the_finished_file() {
             )
             .create(&path)
             .unwrap();
+        // Created first, so the space its deletion frees lies inside the
+        // file, where a manager has to record it rather than the end of the
+        // file taking it back.
+        file.new_dataset::<i32>()
+            .shape([64usize])
+            .create("drop")
+            .unwrap()
+            .write_raw(&(0..64i32).collect::<Vec<_>>())
+            .unwrap();
         file.new_dataset::<i32>()
             .shape([16usize])
             .create("keep")
@@ -971,6 +980,7 @@ fn the_recorded_eoa_is_the_end_of_the_finished_file() {
             .unwrap()
             .write_raw(&(0..8).map(f64::from).collect::<Vec<_>>())
             .unwrap();
+        file.delete_dataset("drop").unwrap();
         file.close().unwrap();
 
         // Once for the file this crate creates, once for the one it reopens:
@@ -982,9 +992,10 @@ fn the_recorded_eoa_is_the_end_of_the_finished_file() {
                 .superblock_extension()
                 .file_space_info
                 .expect("the created file declares its strategy");
-            assert_ne!(
-                info.fs_addr[0],
-                u64::MAX,
+            // A created file writes its object headers only at close, so
+            // `drop` frees no header: the section persisted is its data.
+            assert!(
+                info.fs_addr.iter().any(|&a| a != u64::MAX),
                 "the {round} {strategy} file persisted no manager: {info:?}"
             );
             assert_eq!(
