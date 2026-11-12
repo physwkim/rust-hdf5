@@ -1180,16 +1180,107 @@ pub struct ChunkedDatasetInfo {
     pub chunk_size_len: u8,
 }
 
-/// Where a newly-created EA data block's address must be recorded.
-enum DblkParent {
-    /// Slot `index_block.dblk_addrs[idx]`.
-    IndexBlock(usize),
-    /// Slot `super_block.dblk_addrs[local_dblk]` of the super block at `sblk_addr`.
-    SuperBlock {
-        sblk_addr: u64,
-        ndblks_in_sblk: usize,
-        local_dblk: usize,
+impl ChunkedDatasetInfo {
+    /// The index block's data-block and super-block address slots, from
+    /// whichever of the two index-block classes this array has.
+    fn iblk_addrs(&self) -> (&[u64], &[u64]) {
+        match &self.filt_iblk {
+            Some(f) => (&f.dblk_addrs, &f.sblk_addrs),
+            None => (&self.ea_iblk.dblk_addrs, &self.ea_iblk.sblk_addrs),
+        }
+    }
+
+    /// [`iblk_addrs`](Self::iblk_addrs), mutably.
+    fn iblk_addrs_mut(&mut self) -> (&mut [u64], &mut [u64]) {
+        match &mut self.filt_iblk {
+            Some(f) => (&mut f.dblk_addrs, &mut f.sblk_addrs),
+            None => (&mut self.ea_iblk.dblk_addrs, &mut self.ea_iblk.sblk_addrs),
+        }
+    }
+}
+
+/// Where an extensible-array entry lives, as
+/// [`Hdf5Writer::ea_slot`] resolves it (`H5EA__lookup_elmt`).
+#[derive(Clone, Copy)]
+enum EaSlot {
+    /// Element `elem` of the index block, which is held in memory.
+    Index(usize),
+    /// Entry `offset` of the `nelmts`-entry block at `addr`.
+    Block {
+        addr: u64,
+        block: EaEntryBlock,
+        nelmts: usize,
+        offset: usize,
     },
+    /// The super block, data block or page that would hold the entry was
+    /// never created, so no entry from here up to chunk index `end` exists.
+    Absent { end: u64 },
+}
+
+/// A block of extensible-array entries, read and rewritten whole.
+#[derive(Clone, Copy)]
+enum EaEntryBlock {
+    /// An unpaged data block, prefix and all.
+    Dblk { block_offset: u64 },
+    /// One page of a paged data block: its entries and a checksum
+    /// (`H5EA__cache_dblk_page_serialize`).
+    Page,
+}
+
+/// What reading and writing one dataset's extensible-array blocks needs.
+struct EaCodec {
+    geo: EaGeometry,
+    filtered: bool,
+    max_nelmts_bits: u8,
+    chunk_size_len: u8,
+    header_addr: u64,
+    /// An unfiltered chunk's stored size, which its entry does not record.
+    chunk_bytes: u64,
+}
+
+impl EaCodec {
+    fn new(c: &ChunkedDatasetInfo, element_size: u64) -> IoResult<Self> {
+        let p = &c.earray_params;
+        Ok(Self {
+            geo: EaGeometry::new(
+                p.idx_blk_elmts,
+                p.data_blk_min_elmts,
+                p.sup_blk_min_data_ptrs,
+                p.max_nelmts_bits,
+                p.max_dblk_page_nelmts_bits,
+            )?,
+            filtered: c.filt_iblk.is_some(),
+            max_nelmts_bits: p.max_nelmts_bits,
+            chunk_size_len: c.chunk_size_len,
+            header_addr: c.ea_header_addr,
+            chunk_bytes: c.chunk_dims.iter().product::<u64>() * element_size,
+        })
+    }
+
+    fn class_id(&self) -> u8 {
+        if self.filtered {
+            EA_CLS_FILT_CHUNK
+        } else {
+            EA_CLS_CHUNK
+        }
+    }
+
+    fn raw_elmt_size(&self, sizeof_addr: u8) -> usize {
+        if self.filtered {
+            FilteredChunkEntry::raw_size(sizeof_addr, self.chunk_size_len) as usize
+        } else {
+            sizeof_addr as usize
+        }
+    }
+
+    /// The entry an unfiltered data block or page stores as `addr` alone.
+    fn unfiltered_entry(&self, addr: u64) -> FilteredChunkEntry {
+        FilteredChunkEntry {
+            addr,
+            nbytes: self.chunk_bytes,
+            filter_mask: 0,
+        }
+    }
 }
 
 /// Which attribute list an attribute operation targets: the root group's,
@@ -7174,96 +7265,55 @@ impl Hdf5Writer {
     ///
     /// Every block's size is recovered the way its allocation computed it:
     /// re-encoding the in-memory copy (EA header and index block, FA
-    /// header and data block, BT2 header) or sizing a same-shape dummy
-    /// from the array geometry (EA data blocks, whose element counts come
-    /// from [`EaGeometry`]; BT2 nodes are all `node_size`).
+    /// header and data block, BT2 header) or from the array geometry (EA
+    /// super and data blocks, [`EaGeometry::sblk_size`] and
+    /// [`EaGeometry::dblk_size`]; BT2 nodes are all `node_size`).
     fn free_chunk_index(&self, index: usize) -> IoResult<()> {
         let ds = self.ds(index);
         let mut m = ds.lock();
         let is_filtered = m.filter_pipeline.is_some();
         if let Some(c) = m.chunked.take() {
-            let p = &c.earray_params;
-            let bits = p.max_nelmts_bits;
-            let csl = c.chunk_size_len;
-            let geo = EaGeometry::new(
-                p.idx_blk_elmts,
-                p.data_blk_min_elmts,
-                p.sup_blk_min_data_ptrs,
-                bits,
-                p.max_dblk_page_nelmts_bits,
-            )?;
-            let dblk_size = |nelmts: u64| -> u64 {
-                if is_filtered {
-                    FilteredDataBlock::new(c.ea_header_addr, 0, nelmts as usize)
-                        .encode(&self.ctx, bits, csl)
-                        .len() as u64
-                } else {
-                    ExtensibleArrayDataBlock::new(c.ea_header_addr, 0, nelmts as usize)
-                        .encoded_size(&self.ctx, bits) as u64
-                }
+            let k = EaCodec::new(&c, m.datatype.element_size() as u64)?;
+            let (sa, bits) = (self.ctx.sizeof_addr, k.max_nelmts_bits);
+            let dblk_size =
+                |u: usize| -> u64 { k.geo.dblk_size(u, sa, bits, k.raw_elmt_size(sa)) as u64 };
+            let iblk_size = match &c.filt_iblk {
+                Some(f) => f.encode(&self.ctx, k.chunk_size_len).len() as u64,
+                None => c.ea_iblk.encoded_size(&self.ctx) as u64,
             };
-            let (dblk_addrs, sblk_addrs, iblk_size) = if is_filtered {
-                let f = c.filt_iblk.as_ref().unwrap();
-                (
-                    f.dblk_addrs.clone(),
-                    f.sblk_addrs.clone(),
-                    f.encode(&self.ctx, csl).len() as u64,
-                )
-            } else {
-                (
-                    c.ea_iblk.dblk_addrs.clone(),
-                    c.ea_iblk.sblk_addrs.clone(),
-                    c.ea_iblk.encoded_size(&self.ctx) as u64,
-                )
-            };
+            let (dblk_addrs, sblk_addrs) = c.iblk_addrs();
             // Data blocks addressed from the index block belong to the
             // first `iblock_nsblks` super blocks; each of those defines the
             // element count (and so the disk size) of its data blocks.
             let mut g = 0usize;
-            'direct: for s in geo.sblk.iter().take(geo.iblock_nsblks) {
-                for _ in 0..s.ndblks {
+            'direct: for u in 0..k.geo.iblock_nsblks {
+                for _ in 0..k.geo.sblk[u].ndblks {
                     let Some(&a) = dblk_addrs.get(g) else {
                         break 'direct;
                     };
                     g += 1;
-                    if a == UNDEF_ADDR {
-                        continue;
+                    if a != UNDEF_ADDR {
+                        self.allocator
+                            .free(a, dblk_size(u), FreeSpaceClass::Metadata);
                     }
-                    if s.dblk_nelmts > geo.dblk_page_nelmts {
-                        return Err(crate::io::IoError::InvalidState(
-                            "cannot free a paged extensible-array data block, \
-                             which is not yet supported"
-                                .into(),
-                        ));
-                    }
-                    self.allocator
-                        .free(a, dblk_size(s.dblk_nelmts), FreeSpaceClass::Metadata);
                 }
             }
-            for (off, &sa) in sblk_addrs.iter().enumerate() {
-                if sa == UNDEF_ADDR {
+            // A paged data block is one allocation, its pages included.
+            for (off, &sa_addr) in sblk_addrs.iter().enumerate() {
+                if sa_addr == UNDEF_ADDR {
                     continue;
                 }
-                let s = geo.sblk[geo.iblock_nsblks + off];
-                if s.dblk_nelmts > geo.dblk_page_nelmts {
-                    return Err(crate::io::IoError::InvalidState(
-                        "cannot free a paged extensible-array data block, \
-                         which is not yet supported"
-                            .into(),
-                    ));
-                }
-                let buf = self.handle.read_at_most(sa, 65536)?;
-                let sb =
-                    ExtensibleArraySuperBlock::decode(&buf, &self.ctx, bits, s.ndblks as usize, 0)?;
+                let u = k.geo.iblock_nsblks + off;
+                let sb = self.read_ea_sblk(&k, u, sa_addr)?;
                 for &da in &sb.dblk_addrs {
                     if da != UNDEF_ADDR {
                         self.allocator
-                            .free(da, dblk_size(s.dblk_nelmts), FreeSpaceClass::Metadata);
+                            .free(da, dblk_size(u), FreeSpaceClass::Metadata);
                     }
                 }
                 self.allocator.free(
-                    sa,
-                    sb.encode(&self.ctx, bits).len() as u64,
+                    sa_addr,
+                    k.geo.sblk_size(u, sa, bits) as u64,
                     FreeSpaceClass::Metadata,
                 );
             }
@@ -11099,6 +11149,286 @@ impl Hdf5Writer {
         }
     }
 
+    /// Resolve where extensible-array entry `idx` lives, the way
+    /// `H5EA__lookup_elmt` does. With `extend` it creates the super block,
+    /// data block and page on the way that do not exist yet, each written
+    /// before the parent that points at it so a SWMR reader never follows an
+    /// address to bytes not yet there; without, it reports the first missing
+    /// one as [`EaSlot::Absent`].
+    fn ea_slot(
+        &self,
+        c: &mut ChunkedDatasetInfo,
+        k: &EaCodec,
+        idx: u64,
+        extend: bool,
+    ) -> IoResult<EaSlot> {
+        let loc = match k.geo.locate(idx)? {
+            EaLoc::Index { elem } => return Ok(EaSlot::Index(elem)),
+            EaLoc::Dblk(l) => l,
+        };
+        let u = loc.sblk_idx;
+        let s = k.geo.sblk[u];
+        let dblk_start = idx - loc.offset_in_dblk;
+        let dblk_end = dblk_start + s.dblk_nelmts;
+        let unpaged = |addr: u64| EaSlot::Block {
+            addr,
+            block: EaEntryBlock::Dblk {
+                block_offset: loc.dblk_block_offset,
+            },
+            nelmts: s.dblk_nelmts as usize,
+            offset: loc.offset_in_dblk as usize,
+        };
+        match loc.path {
+            EaDblkPath::Direct { idx: di } => {
+                // libhdf5 reads an index-block data block whole, never by
+                // page, and under the parameters it writes these blocks
+                // never reach a page; one that does is not a file it makes.
+                if loc.paged {
+                    return Err(crate::io::IoError::Unsupported(
+                        "extensible array with paged data blocks addressed from the \
+                         index block"
+                            .into(),
+                    ));
+                }
+                let mut addr = c.iblk_addrs().0[di];
+                if addr == UNDEF_ADDR {
+                    if !extend {
+                        return Ok(EaSlot::Absent { end: dblk_end });
+                    }
+                    addr = self.create_ea_dblk(c, k, u, loc.dblk_block_offset)?;
+                    c.iblk_addrs_mut().0[di] = addr;
+                }
+                Ok(unpaged(addr))
+            }
+            EaDblkPath::ViaSblk {
+                sblk_off,
+                local_dblk,
+                sblk_block_offset,
+                ..
+            } => {
+                let mut sblk_addr = c.iblk_addrs().1[sblk_off];
+                if sblk_addr == UNDEF_ADDR {
+                    if !extend {
+                        return Ok(EaSlot::Absent {
+                            end: k.geo.idx_blk_elmts + s.start_idx + s.ndblks * s.dblk_nelmts,
+                        });
+                    }
+                    let sb = ExtensibleArraySuperBlock::new(
+                        k.class_id(),
+                        k.header_addr,
+                        sblk_block_offset,
+                        s.ndblks as usize,
+                        k.geo.sblk_page_init_len(u),
+                    );
+                    let enc = sb.encode(&self.ctx, k.max_nelmts_bits);
+                    sblk_addr = self
+                        .allocator
+                        .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
+                    self.handle.write_at(sblk_addr, &enc)?;
+                    c.iblk_addrs_mut().1[sblk_off] = sblk_addr;
+                    c.ea_header.num_sblks_created += 1;
+                    c.ea_header.size_sblks_created += enc.len() as u64;
+                }
+                let mut sb = self.read_ea_sblk(k, u, sblk_addr)?;
+                let mut sb_dirty = false;
+                let mut dblk_addr = sb.dblk_addrs[local_dblk];
+                if dblk_addr == UNDEF_ADDR {
+                    if !extend {
+                        return Ok(EaSlot::Absent { end: dblk_end });
+                    }
+                    dblk_addr = self.create_ea_dblk(c, k, u, loc.dblk_block_offset)?;
+                    sb.dblk_addrs[local_dblk] = dblk_addr;
+                    sb_dirty = true;
+                }
+                let slot = if loc.paged {
+                    // The page-init bitmap is one MSB-first bit string over
+                    // the super block's pages, `local_dblk * npages + page`.
+                    let page_nelmts = k.geo.dblk_page_nelmts;
+                    let page = loc.offset_in_dblk / page_nelmts;
+                    let bit = local_dblk as u64 * k.geo.npages(u) + page;
+                    let (byte, mask) = ((bit / 8) as usize, 0x80u8 >> (bit % 8));
+                    let page_size = k.geo.dblk_page_size(k.raw_elmt_size(self.ctx.sizeof_addr));
+                    let addr = dblk_addr
+                        + k.geo
+                            .dblk_prefix_size(self.ctx.sizeof_addr, k.max_nelmts_bits)
+                            as u64
+                        + page * page_size as u64;
+                    if sb.page_init[byte] & mask == 0 {
+                        if !extend {
+                            return Ok(EaSlot::Absent {
+                                end: dblk_start + (page + 1) * page_nelmts,
+                            });
+                        }
+                        // H5EA__dblk_page_create: a page of undefined entries,
+                        // and no statistic counts it.
+                        let undef = vec![FilteredChunkEntry::undef(); page_nelmts as usize];
+                        self.write_ea_entries(k, addr, EaEntryBlock::Page, &undef)?;
+                        sb.page_init[byte] |= mask;
+                        sb_dirty = true;
+                    }
+                    EaSlot::Block {
+                        addr,
+                        block: EaEntryBlock::Page,
+                        nelmts: page_nelmts as usize,
+                        offset: (loc.offset_in_dblk % page_nelmts) as usize,
+                    }
+                } else {
+                    unpaged(dblk_addr)
+                };
+                if sb_dirty {
+                    self.handle
+                        .write_at(sblk_addr, &sb.encode(&self.ctx, k.max_nelmts_bits))?;
+                }
+                Ok(slot)
+            }
+        }
+    }
+
+    /// Allocate and write a data block of super block `u`
+    /// (`H5EA__dblock_create`) and count it in the header's statistics. The
+    /// allocation covers a paged block's pages too, but only its prefix is
+    /// written: a page is written when its first entry is.
+    fn create_ea_dblk(
+        &self,
+        c: &mut ChunkedDatasetInfo,
+        k: &EaCodec,
+        u: usize,
+        block_offset: u64,
+    ) -> IoResult<u64> {
+        let s = k.geo.sblk[u];
+        let size = k.geo.dblk_size(
+            u,
+            self.ctx.sizeof_addr,
+            k.max_nelmts_bits,
+            k.raw_elmt_size(self.ctx.sizeof_addr),
+        ) as u64;
+        let addr = self.allocator.allocate(size, FreeSpaceClass::Metadata);
+        let nelmts = if k.geo.is_sblk_paged(u) {
+            0
+        } else {
+            s.dblk_nelmts as usize
+        };
+        let undef = vec![FilteredChunkEntry::undef(); nelmts];
+        self.write_ea_entries(k, addr, EaEntryBlock::Dblk { block_offset }, &undef)?;
+        c.ea_header.num_dblks_created += 1;
+        c.ea_header.size_dblks_created += size;
+        c.ea_header.num_elmts_realized += s.dblk_nelmts;
+        Ok(addr)
+    }
+
+    /// Read super block `u` at `addr`, page-init bitmap and all.
+    fn read_ea_sblk(
+        &self,
+        k: &EaCodec,
+        u: usize,
+        addr: u64,
+    ) -> IoResult<ExtensibleArraySuperBlock> {
+        let len = k.geo.sblk_size(u, self.ctx.sizeof_addr, k.max_nelmts_bits);
+        let buf = self.handle.read_at(addr, len)?;
+        Ok(ExtensibleArraySuperBlock::decode(
+            &buf,
+            &self.ctx,
+            k.max_nelmts_bits,
+            k.geo.sblk[u].ndblks as usize,
+            k.geo.sblk_page_init_len(u),
+        )?)
+    }
+
+    /// Read the `nelmts` entries of the block at `addr`.
+    fn read_ea_entries(
+        &self,
+        k: &EaCodec,
+        addr: u64,
+        block: EaEntryBlock,
+        nelmts: usize,
+    ) -> IoResult<Vec<FilteredChunkEntry>> {
+        let sa = self.ctx.sizeof_addr;
+        let entries = nelmts * k.raw_elmt_size(sa);
+        Ok(match block {
+            EaEntryBlock::Dblk { .. } => {
+                let prefix = k.geo.dblk_prefix_size(sa, k.max_nelmts_bits);
+                let buf = self.handle.read_at(addr, prefix + entries)?;
+                if k.filtered {
+                    FilteredDataBlock::decode(
+                        &buf,
+                        &self.ctx,
+                        k.max_nelmts_bits,
+                        nelmts,
+                        k.chunk_size_len,
+                    )?
+                    .elements
+                } else {
+                    ExtensibleArrayDataBlock::decode(&buf, &self.ctx, k.max_nelmts_bits, nelmts)?
+                        .elements
+                        .into_iter()
+                        .map(|a| k.unfiltered_entry(a))
+                        .collect()
+                }
+            }
+            EaEntryBlock::Page => {
+                let buf = self.handle.read_at(addr, entries + 4)?;
+                if k.filtered {
+                    decode_filtered_page(&buf, &self.ctx, nelmts, k.chunk_size_len as usize)?
+                        .into_iter()
+                        .map(|e| FilteredChunkEntry {
+                            addr: e.address,
+                            nbytes: e.chunk_size,
+                            filter_mask: e.filter_mask,
+                        })
+                        .collect()
+                } else {
+                    decode_unfiltered_page(&buf, &self.ctx, nelmts)?
+                        .into_iter()
+                        .map(|a| k.unfiltered_entry(a))
+                        .collect()
+                }
+            }
+        })
+    }
+
+    /// Write `entries` as the block at `addr`.
+    fn write_ea_entries(
+        &self,
+        k: &EaCodec,
+        addr: u64,
+        block: EaEntryBlock,
+        entries: &[FilteredChunkEntry],
+    ) -> IoResult<()> {
+        let enc = match (block, k.filtered) {
+            (EaEntryBlock::Dblk { block_offset }, true) => FilteredDataBlock {
+                class_id: EA_CLS_FILT_CHUNK,
+                header_addr: k.header_addr,
+                block_offset,
+                elements: entries.to_vec(),
+            }
+            .encode(&self.ctx, k.max_nelmts_bits, k.chunk_size_len),
+            (EaEntryBlock::Dblk { block_offset }, false) => ExtensibleArrayDataBlock {
+                class_id: EA_CLS_CHUNK,
+                header_addr: k.header_addr,
+                block_offset,
+                elements: entries.iter().map(|e| e.addr).collect(),
+            }
+            .encode(&self.ctx, k.max_nelmts_bits),
+            (EaEntryBlock::Page, true) => {
+                let elems: Vec<FixedArrayFilteredChunkElement> = entries
+                    .iter()
+                    .map(|e| FixedArrayFilteredChunkElement {
+                        address: e.addr,
+                        chunk_size: e.nbytes,
+                        filter_mask: e.filter_mask,
+                    })
+                    .collect();
+                encode_filtered_page(&elems, &self.ctx, k.chunk_size_len as usize)
+            }
+            (EaEntryBlock::Page, false) => {
+                let addrs: Vec<u64> = entries.iter().map(|e| e.addr).collect();
+                encode_unfiltered_page(&addrs, &self.ctx)
+            }
+        };
+        self.handle.write_at(addr, &enc)?;
+        Ok(())
+    }
+
     /// Place a chunk's already-final bytes (filtered if the dataset is
     /// filtered) in the file and record them in the extensible-array index —
     /// in the index block, a data block, or a super block per the EA geometry.
@@ -11138,256 +11468,61 @@ impl Hdf5Writer {
                 )));
             }
         }
-        let idx_blk_elmts = {
-            let c = m.chunked.as_ref().unwrap();
-            c.earray_params.idx_blk_elmts as u64
-        };
-
-        if chunk_idx < idx_blk_elmts {
-            let chunked = m.chunked.as_mut().unwrap();
-            if is_filtered {
-                if let Some(ref mut fiblk) = chunked.filt_iblk {
-                    let old = fiblk.elements[chunk_idx as usize];
-                    let chunk_addr =
-                        self.place_chunk(Some((old.addr, old.nbytes)), compressed_size);
-                    self.handle.write_at(chunk_addr, final_bytes)?;
-                    fiblk.elements[chunk_idx as usize] = FilteredChunkEntry {
-                        addr: chunk_addr,
-                        nbytes: compressed_size,
-                        filter_mask,
-                    };
-                }
-            } else {
-                // An unfiltered chunk's stored size is fixed by the chunk
-                // shape, so a rewrite always fits where it already is.
-                let old = chunked.ea_iblk.elements[chunk_idx as usize];
-                let chunk_addr = self.place_chunk(Some((old, compressed_size)), compressed_size);
-                self.handle.write_at(chunk_addr, final_bytes)?;
-                chunked.ea_iblk.elements[chunk_idx as usize] = chunk_addr;
-            }
-            chunked.chunks_written += 1;
-            if chunk_idx + 1 > chunked.ea_header.max_idx_set {
-                chunked.ea_header.max_idx_set = chunk_idx + 1;
-            }
-            if chunked.ea_header.num_elmts_realized < idx_blk_elmts {
-                chunked.ea_header.num_elmts_realized = idx_blk_elmts;
-            }
-        } else {
-            // chunk_idx >= idx_blk_elmts: place the chunk through the EA
-            // data-block / super-block hierarchy (libhdf5-compatible geometry).
-            let (geo, max_nelmts_bits, chunk_size_len, ea_header_addr) = {
-                let c = m.chunked.as_ref().unwrap();
-                let p = &c.earray_params;
-                (
-                    EaGeometry::new(
-                        p.idx_blk_elmts,
-                        p.data_blk_min_elmts,
-                        p.sup_blk_min_data_ptrs,
-                        p.max_nelmts_bits,
-                        p.max_dblk_page_nelmts_bits,
-                    )?,
-                    p.max_nelmts_bits,
-                    c.chunk_size_len,
-                    c.ea_header_addr,
-                )
-            };
-            let loc = match geo.locate(chunk_idx)? {
-                EaLoc::Dblk(l) => l,
-                EaLoc::Index { .. } => unreachable!("chunk_idx >= idx_blk_elmts"),
-            };
-            if loc.paged {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "chunk index {} needs a paged extensible-array data block, \
-                     which is not yet supported",
-                    chunk_idx
-                )));
-            }
-            let class_id = if is_filtered {
-                EA_CLS_FILT_CHUNK
-            } else {
-                EA_CLS_CHUNK
-            };
-            let dblk_nelmts = loc.dblk_nelmts as usize;
-
-            // Resolve the data block's current address and its parent slot,
-            // creating the owning super block on demand.
-            let parent: DblkParent;
-            let mut dblk_addr: u64;
-            match loc.path {
-                EaDblkPath::Direct { idx: di } => {
-                    let c = m.chunked.as_ref().unwrap();
-                    dblk_addr = if is_filtered {
-                        c.filt_iblk.as_ref().unwrap().dblk_addrs[di]
-                    } else {
-                        c.ea_iblk.dblk_addrs[di]
-                    };
-                    parent = DblkParent::IndexBlock(di);
-                }
-                EaDblkPath::ViaSblk {
-                    sblk_off,
-                    local_dblk,
-                    ndblks_in_sblk,
-                    sblk_block_offset,
-                } => {
-                    let mut sblk_addr = {
-                        let c = m.chunked.as_ref().unwrap();
-                        if is_filtered {
-                            c.filt_iblk.as_ref().unwrap().sblk_addrs[sblk_off]
-                        } else {
-                            c.ea_iblk.sblk_addrs[sblk_off]
-                        }
-                    };
-                    if sblk_addr == UNDEF_ADDR {
-                        let sb = ExtensibleArraySuperBlock::new(
-                            class_id,
-                            ea_header_addr,
-                            sblk_block_offset,
-                            ndblks_in_sblk,
-                        );
-                        let enc = sb.encode(&self.ctx, max_nelmts_bits);
-                        sblk_addr = self
-                            .allocator
-                            .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
-                        self.handle.write_at(sblk_addr, &enc)?;
-                        let c = m.chunked.as_mut().unwrap();
-                        if is_filtered {
-                            c.filt_iblk.as_mut().unwrap().sblk_addrs[sblk_off] = sblk_addr;
-                        } else {
-                            c.ea_iblk.sblk_addrs[sblk_off] = sblk_addr;
-                        }
-                        c.ea_header.num_sblks_created += 1;
-                        c.ea_header.size_sblks_created += enc.len() as u64;
+        let element_size = m.datatype.element_size() as u64;
+        let c = m.chunked.as_mut().unwrap();
+        let k = EaCodec::new(c, element_size)?;
+        match self.ea_slot(c, &k, chunk_idx, true)? {
+            EaSlot::Index(elem) => {
+                let idx_blk_elmts = k.geo.idx_blk_elmts;
+                if is_filtered {
+                    if let Some(ref mut fiblk) = c.filt_iblk {
+                        let old = fiblk.elements[elem];
+                        let chunk_addr =
+                            self.place_chunk(Some((old.addr, old.nbytes)), compressed_size);
+                        self.handle.write_at(chunk_addr, final_bytes)?;
+                        fiblk.elements[elem] = FilteredChunkEntry {
+                            addr: chunk_addr,
+                            nbytes: compressed_size,
+                            filter_mask,
+                        };
                     }
-                    let sb_buf = self.handle.read_at_most(sblk_addr, 65536)?;
-                    // The writer never creates paged super blocks (it errors
-                    // before the paging threshold), so page_init_total is 0.
-                    let sb = ExtensibleArraySuperBlock::decode(
-                        &sb_buf,
-                        &self.ctx,
-                        max_nelmts_bits,
-                        ndblks_in_sblk,
-                        0,
-                    )?;
-                    dblk_addr = sb.dblk_addrs[local_dblk];
-                    parent = DblkParent::SuperBlock {
-                        sblk_addr,
-                        ndblks_in_sblk,
-                        local_dblk,
-                    };
+                } else {
+                    // An unfiltered chunk's stored size is fixed by the chunk
+                    // shape, so a rewrite always fits where it already is.
+                    let old = c.ea_iblk.elements[elem];
+                    let chunk_addr =
+                        self.place_chunk(Some((old, compressed_size)), compressed_size);
+                    self.handle.write_at(chunk_addr, final_bytes)?;
+                    c.ea_iblk.elements[elem] = chunk_addr;
+                }
+                if c.ea_header.num_elmts_realized < idx_blk_elmts {
+                    c.ea_header.num_elmts_realized = idx_blk_elmts;
                 }
             }
-
-            // Create or update the data block holding this chunk's entry.
-            let created = dblk_addr == UNDEF_ADDR;
-            if is_filtered {
-                let mut dblk = if created {
-                    FilteredDataBlock::new(ea_header_addr, loc.dblk_block_offset, dblk_nelmts)
-                } else {
-                    let buf = self.handle.read_at_most(dblk_addr, 65536)?;
-                    FilteredDataBlock::decode(
-                        &buf,
-                        &self.ctx,
-                        max_nelmts_bits,
-                        dblk_nelmts,
-                        chunk_size_len,
-                    )?
-                };
-                // A freshly created data block holds only undefined addresses,
-                // so this reads as "no previous chunk" without a special case.
-                let old = dblk.elements[loc.offset_in_dblk as usize];
+            EaSlot::Block {
+                addr,
+                block,
+                nelmts,
+                offset,
+            } => {
+                let mut entries = self.read_ea_entries(&k, addr, block, nelmts)?;
+                // A block `ea_slot` just created holds only undefined
+                // entries, which read here as "no previous chunk".
+                let old = entries[offset];
                 let chunk_addr = self.place_chunk(Some((old.addr, old.nbytes)), compressed_size);
                 self.handle.write_at(chunk_addr, final_bytes)?;
-                let entry = FilteredChunkEntry {
+                entries[offset] = FilteredChunkEntry {
                     addr: chunk_addr,
                     nbytes: compressed_size,
                     filter_mask,
                 };
-                dblk.elements[loc.offset_in_dblk as usize] = entry;
-                let enc = dblk.encode(&self.ctx, max_nelmts_bits, chunk_size_len);
-                if created {
-                    dblk_addr = self
-                        .allocator
-                        .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
-                }
-                self.handle.write_at(dblk_addr, &enc)?;
-                if created {
-                    let c = m.chunked.as_mut().unwrap();
-                    c.ea_header.num_dblks_created += 1;
-                    c.ea_header.size_dblks_created += enc.len() as u64;
-                }
-            } else {
-                let mut dblk = if created {
-                    ExtensibleArrayDataBlock::new(
-                        ea_header_addr,
-                        loc.dblk_block_offset,
-                        dblk_nelmts,
-                    )
-                } else {
-                    let buf = self.handle.read_at_most(dblk_addr, 65536)?;
-                    ExtensibleArrayDataBlock::decode(&buf, &self.ctx, max_nelmts_bits, dblk_nelmts)?
-                };
-                // Unfiltered: the stored size is fixed by the chunk shape, so
-                // a rewrite always fits its old block. A freshly created data
-                // block holds undefined addresses and falls through to a new
-                // allocation.
-                let old = dblk.elements[loc.offset_in_dblk as usize];
-                let chunk_addr = self.place_chunk(Some((old, compressed_size)), compressed_size);
-                self.handle.write_at(chunk_addr, final_bytes)?;
-                dblk.elements[loc.offset_in_dblk as usize] = chunk_addr;
-                let enc = dblk.encode(&self.ctx, max_nelmts_bits);
-                if created {
-                    dblk_addr = self
-                        .allocator
-                        .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
-                }
-                self.handle.write_at(dblk_addr, &enc)?;
-                if created {
-                    let c = m.chunked.as_mut().unwrap();
-                    c.ea_header.num_dblks_created += 1;
-                    c.ea_header.size_dblks_created += enc.len() as u64;
-                }
+                self.write_ea_entries(&k, addr, block, &entries)?;
             }
-
-            // Record a newly-created data block's address in its parent.
-            if created {
-                match parent {
-                    DblkParent::IndexBlock(di) => {
-                        let c = m.chunked.as_mut().unwrap();
-                        if is_filtered {
-                            c.filt_iblk.as_mut().unwrap().dblk_addrs[di] = dblk_addr;
-                        } else {
-                            c.ea_iblk.dblk_addrs[di] = dblk_addr;
-                        }
-                    }
-                    DblkParent::SuperBlock {
-                        sblk_addr,
-                        ndblks_in_sblk,
-                        local_dblk,
-                    } => {
-                        let buf = self.handle.read_at_most(sblk_addr, 65536)?;
-                        let mut sb = ExtensibleArraySuperBlock::decode(
-                            &buf,
-                            &self.ctx,
-                            max_nelmts_bits,
-                            ndblks_in_sblk,
-                            0,
-                        )?;
-                        sb.dblk_addrs[local_dblk] = dblk_addr;
-                        let enc = sb.encode(&self.ctx, max_nelmts_bits);
-                        self.handle.write_at(sblk_addr, &enc)?;
-                    }
-                }
-            }
-
-            // Statistics.
-            let c = m.chunked.as_mut().unwrap();
-            c.chunks_written += 1;
-            if chunk_idx + 1 > c.ea_header.max_idx_set {
-                c.ea_header.max_idx_set = chunk_idx + 1;
-            }
-            if created {
-                c.ea_header.num_elmts_realized += loc.dblk_nelmts;
-            }
+            EaSlot::Absent { .. } => unreachable!("ea_slot creates what it is asked to extend"),
+        }
+        c.chunks_written += 1;
+        if chunk_idx + 1 > c.ea_header.max_idx_set {
+            c.ea_header.max_idx_set = chunk_idx + 1;
         }
         Ok(())
     }
@@ -13826,8 +13961,8 @@ impl Hdf5Writer {
 
     /// Read an already-written chunk's *decompressed* bytes when the chunk
     /// is allocated and resolvable from the in-memory extensible-array
-    /// index. Handles index-block and data-block chunks, filtered and
-    /// unfiltered.
+    /// index. Handles chunks in the index block, data blocks and their
+    /// pages, filtered and unfiltered.
     ///
     /// Returns `Ok(None)` only when the chunk has never been written
     /// (address `UNDEF`) or the index genuinely does not reach it, which for
@@ -13837,136 +13972,40 @@ impl Hdf5Writer {
         ds_index: usize,
         chunk_idx: u64,
     ) -> IoResult<Option<Vec<u8>>> {
-        // Phase 1: resolve the chunk's location from the in-memory index.
-        // Hold the slot guard through Phase 1: `chunked` borrows it, while the
+        // Hold the slot guard throughout: `chunked` borrows it, while the
         // `self.handle`/`self.ctx` reads below touch disjoint fields.
         let ds = self.ds(ds_index);
-        let m = ds.lock();
+        let mut m = ds.lock();
         let element_size = m.datatype.element_size() as u64;
         let pipeline = m.filter_pipeline.clone();
-        let Some(chunked) = m.chunked.as_ref() else {
+        let Some(chunked) = m.chunked.as_mut() else {
             return Ok(None);
         };
-        let chunk_bytes = chunked.chunk_dims.iter().product::<u64>() * element_size;
-        let max_nelmts_bits = chunked.earray_params.max_nelmts_bits;
-        let chunk_size_len = chunked.chunk_size_len;
-        let is_filtered = chunked.filt_iblk.is_some();
-
-        // The chunk entry is either read straight from an index block, or
-        // located via a data block that must itself be read from disk.
-        enum Loc {
-            Direct(u64, u64, u32),
-            DataBlock {
-                dblk_addr: u64,
-                offset: usize,
-                nelmts: usize,
-            },
-        }
-
-        // Resolve the chunk's location with the libhdf5-compatible EA
-        // geometry (super-block-grouped data blocks), matching `record_ea_chunk`.
-        let ea_loc = {
-            let p = &chunked.earray_params;
-            EaGeometry::new(
-                p.idx_blk_elmts,
-                p.data_blk_min_elmts,
-                p.sup_blk_min_data_ptrs,
-                p.max_nelmts_bits,
-                p.max_dblk_page_nelmts_bits,
-            )?
-            .locate(chunk_idx)?
-        };
-        let loc = match ea_loc {
-            EaLoc::Index { elem } => {
-                if is_filtered {
-                    let e = &chunked.filt_iblk.as_ref().unwrap().elements[elem];
-                    Loc::Direct(e.addr, e.nbytes, e.filter_mask)
-                } else {
-                    Loc::Direct(chunked.ea_iblk.elements[elem], chunk_bytes, 0)
-                }
-            }
-            EaLoc::Dblk(l) => {
-                if l.paged {
-                    return Err(crate::io::IoError::InvalidState(format!(
-                        "chunk index {} lives in a paged extensible-array data \
-                         block, which is not yet supported for read-modify-write",
-                        chunk_idx
-                    )));
-                }
-                let dblk_addr = match l.path {
-                    EaDblkPath::Direct { idx } => {
-                        if is_filtered {
-                            chunked.filt_iblk.as_ref().unwrap().dblk_addrs[idx]
-                        } else {
-                            chunked.ea_iblk.dblk_addrs[idx]
-                        }
-                    }
-                    EaDblkPath::ViaSblk {
-                        sblk_off,
-                        local_dblk,
-                        ndblks_in_sblk,
-                        ..
-                    } => {
-                        let sblk_addr = if is_filtered {
-                            chunked.filt_iblk.as_ref().unwrap().sblk_addrs[sblk_off]
-                        } else {
-                            chunked.ea_iblk.sblk_addrs[sblk_off]
-                        };
-                        if sblk_addr == UNDEF_ADDR {
-                            return Ok(None);
-                        }
-                        let sb_buf = self.handle.read_at_most(sblk_addr, 65536)?;
-                        let sb = ExtensibleArraySuperBlock::decode(
-                            &sb_buf,
-                            &self.ctx,
-                            max_nelmts_bits,
-                            ndblks_in_sblk,
-                            0,
-                        )?;
-                        sb.dblk_addrs[local_dblk]
-                    }
-                };
-                if dblk_addr == UNDEF_ADDR {
-                    return Ok(None);
-                }
-                Loc::DataBlock {
-                    dblk_addr,
-                    offset: l.offset_in_dblk as usize,
-                    nelmts: l.dblk_nelmts as usize,
-                }
-            }
-        };
-
-        // Phase 2: resolve through the data block (if needed) and read. The
-        // mask is the chunk's filter mask (0 for unfiltered), so a chunk
+        let k = EaCodec::new(chunked, element_size)?;
+        // The mask is the chunk's filter mask (0 for unfiltered), so a chunk
         // written via a direct chunk write with a skipped filter is reversed
         // correctly during read-modify-write.
-        let (addr, nbytes, mask) = match loc {
-            Loc::Direct(a, n, m) => (a, n, m),
-            Loc::DataBlock {
-                dblk_addr,
-                offset,
-                nelmts,
-            } => {
-                let buf = self.handle.read_at_most(dblk_addr, 65536)?;
-                if is_filtered {
-                    let dblk = FilteredDataBlock::decode(
-                        &buf,
-                        &self.ctx,
-                        max_nelmts_bits,
-                        nelmts,
-                        chunk_size_len,
-                    )?;
-                    let e = &dblk.elements[offset];
+        let (addr, nbytes, mask) = match self.ea_slot(chunked, &k, chunk_idx, false)? {
+            EaSlot::Index(elem) => {
+                if k.filtered {
+                    let e = &chunked.filt_iblk.as_ref().unwrap().elements[elem];
                     (e.addr, e.nbytes, e.filter_mask)
                 } else {
-                    let dblk =
-                        ExtensibleArrayDataBlock::decode(&buf, &self.ctx, max_nelmts_bits, nelmts)?;
-                    (dblk.elements[offset], chunk_bytes, 0)
+                    (chunked.ea_iblk.elements[elem], k.chunk_bytes, 0)
                 }
             }
+            EaSlot::Block {
+                addr,
+                block,
+                nelmts,
+                offset,
+            } => {
+                let e = self.read_ea_entries(&k, addr, block, nelmts)?[offset];
+                (e.addr, e.nbytes, e.filter_mask)
+            }
+            EaSlot::Absent { .. } => return Ok(None),
         };
-        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask, chunk_bytes)
+        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask, k.chunk_bytes)
     }
 
     /// Read one stored chunk block and undo its filters.
@@ -16172,61 +16211,45 @@ impl Hdf5Writer {
         // One slot guard for the whole walk, the `record_ea_chunk` pattern:
         // `self.handle`/`self.allocator`/`self.ctx` are disjoint fields.
         let mut m = ds.lock();
-        let is_filtered = m.filter_pipeline.is_some();
         let pipeline = m.filter_pipeline.clone();
         let chunk_bytes = geo.chunk_bytes();
-        let (ea_geo, max_nelmts_bits, chunk_size_len, max_idx) = {
-            let c = m.chunked.as_ref().unwrap();
-            let p = &c.earray_params;
-            (
-                EaGeometry::new(
-                    p.idx_blk_elmts,
-                    p.data_blk_min_elmts,
-                    p.sup_blk_min_data_ptrs,
-                    p.max_nelmts_bits,
-                    p.max_dblk_page_nelmts_bits,
-                )?,
-                p.max_nelmts_bits,
-                c.chunk_size_len,
-                c.ea_header.max_idx_set,
-            )
-        };
-
+        let c = m.chunked.as_mut().unwrap();
+        let k = EaCodec::new(c, geo.element_size)?;
+        let max_idx = c.ea_header.max_idx_set;
         let mut straddlers = Vec::new();
         let mut dead_refs = Vec::new();
 
-        // The decoded data block the walk is currently inside, written back
-        // when the walk leaves it (or ends) having cleared an entry.
-        enum Dblk {
-            Unfiltered(ExtensibleArrayDataBlock),
-            Filtered(FilteredDataBlock),
-        }
-        let mut cache: Option<(u64, Dblk, bool)> = None;
-        let flush = |cache: &mut Option<(u64, Dblk, bool)>| -> IoResult<()> {
-            if let Some((addr, blk, dirty)) = cache.take() {
-                if dirty {
-                    let enc = match &blk {
-                        Dblk::Unfiltered(d) => d.encode(&self.ctx, max_nelmts_bits),
-                        Dblk::Filtered(d) => d.encode(&self.ctx, max_nelmts_bits, chunk_size_len),
-                    };
-                    self.handle.write_at(addr, &enc)?;
+        // Collect (when asked) and free the chunk a defined entry names.
+        let release = |e: FilteredChunkEntry, dead_refs: &mut Vec<u8>| -> IoResult<()> {
+            if collect_refs {
+                if let Some(bytes) = self.read_chunk_block(
+                    pipeline.as_ref(),
+                    e.addr,
+                    e.nbytes,
+                    e.filter_mask,
+                    chunk_bytes,
+                )? {
+                    dead_refs.extend_from_slice(&bytes);
                 }
+            }
+            if !self.swmr_active {
+                self.allocator
+                    .free(e.addr, e.nbytes, FreeSpaceClass::RawData);
             }
             Ok(())
         };
-        // Consecutive slots resolve through the same super block, so keep
-        // the last decode. Super blocks are only read here — clearing a
-        // data-block element never moves the block — so it never dirties.
-        let mut sblk_cache: Option<(usize, ExtensibleArraySuperBlock)> = None;
-
-        let mut slot = 0u64;
-        while slot < max_idx {
-            let coords = crate::io::chunk_grid::coords_of(
+        let coords_of = |slot: u64| {
+            crate::io::chunk_grid::coords_of(
                 &geo.dims,
                 geo.max_dims.as_deref(),
                 &geo.chunk_dims,
                 slot,
-            )?;
+            )
+        };
+
+        let mut slot = 0u64;
+        while slot < max_idx {
+            let coords = coords_of(slot)?;
             if !chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
                 if chunk_straddles_extent(&coords, &geo.chunk_dims, new_dims) {
                     straddlers.push(coords);
@@ -16234,188 +16257,61 @@ impl Hdf5Writer {
                 slot += 1;
                 continue;
             }
-            match ea_geo.locate(slot)? {
-                EaLoc::Index { elem } => {
-                    let c = m.chunked.as_mut().unwrap();
-                    if is_filtered {
+            match self.ea_slot(c, &k, slot, false)? {
+                EaSlot::Index(elem) => {
+                    if k.filtered {
                         let fiblk = c.filt_iblk.as_mut().unwrap();
                         let e = fiblk.elements[elem];
                         if e.addr != UNDEF_ADDR {
-                            if collect_refs {
-                                if let Some(bytes) = self.read_chunk_block(
-                                    pipeline.as_ref(),
-                                    e.addr,
-                                    e.nbytes,
-                                    e.filter_mask,
-                                    chunk_bytes,
-                                )? {
-                                    dead_refs.extend_from_slice(&bytes);
-                                }
-                            }
-                            if !self.swmr_active {
-                                self.allocator
-                                    .free(e.addr, e.nbytes, FreeSpaceClass::RawData);
-                            }
-                            fiblk.elements[elem] = FilteredChunkEntry {
-                                addr: UNDEF_ADDR,
-                                nbytes: 0,
-                                filter_mask: 0,
-                            };
+                            release(e, &mut dead_refs)?;
+                            fiblk.elements[elem] = FilteredChunkEntry::undef();
                         }
                     } else {
                         let a = c.ea_iblk.elements[elem];
                         if a != UNDEF_ADDR {
-                            if collect_refs {
-                                if let Some(bytes) = self.read_chunk_block(
-                                    pipeline.as_ref(),
-                                    a,
-                                    chunk_bytes,
-                                    0,
-                                    chunk_bytes,
-                                )? {
-                                    dead_refs.extend_from_slice(&bytes);
-                                }
-                            }
-                            if !self.swmr_active {
-                                self.allocator.free(a, chunk_bytes, FreeSpaceClass::RawData);
-                            }
+                            release(k.unfiltered_entry(a), &mut dead_refs)?;
                             c.ea_iblk.elements[elem] = UNDEF_ADDR;
                         }
                     }
                     slot += 1;
                 }
-                EaLoc::Dblk(l) => {
-                    if l.paged {
-                        return Err(crate::io::IoError::InvalidState(format!(
-                            "chunk index {slot} lives in a paged extensible-array \
-                             data block, which is not yet supported"
-                        )));
-                    }
-                    let dblk_start = slot - l.offset_in_dblk;
-                    let dblk_end = dblk_start + l.dblk_nelmts;
-                    // Resolve the data block's address; an undefined super or
-                    // data block means nothing in its whole element range was
-                    // ever written, so the walk skips the range.
-                    let dblk_addr = {
-                        let c = m.chunked.as_ref().unwrap();
-                        match l.path {
-                            EaDblkPath::Direct { idx } => {
-                                if is_filtered {
-                                    c.filt_iblk.as_ref().unwrap().dblk_addrs[idx]
-                                } else {
-                                    c.ea_iblk.dblk_addrs[idx]
-                                }
+                // Nothing in the range was ever written, so it holds neither
+                // a chunk to free nor a straddler to clear.
+                EaSlot::Absent { end } => slot = end,
+                // Take the rest of the block in one pass, then write it back
+                // once if an entry was cleared.
+                EaSlot::Block {
+                    addr,
+                    block,
+                    nelmts,
+                    offset,
+                } => {
+                    let first = slot - offset as u64;
+                    let end = (first + nelmts as u64).min(max_idx);
+                    let mut entries = self.read_ea_entries(&k, addr, block, nelmts)?;
+                    let mut dirty = false;
+                    for s in slot..end {
+                        let coords = coords_of(s)?;
+                        if !chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
+                            if chunk_straddles_extent(&coords, &geo.chunk_dims, new_dims) {
+                                straddlers.push(coords);
                             }
-                            EaDblkPath::ViaSblk {
-                                sblk_off,
-                                local_dblk,
-                                ndblks_in_sblk,
-                                ..
-                            } => {
-                                let sblk_addr = if is_filtered {
-                                    c.filt_iblk.as_ref().unwrap().sblk_addrs[sblk_off]
-                                } else {
-                                    c.ea_iblk.sblk_addrs[sblk_off]
-                                };
-                                if sblk_addr == UNDEF_ADDR {
-                                    UNDEF_ADDR
-                                } else {
-                                    if sblk_cache.as_ref().map(|&(o, _)| o) != Some(sblk_off) {
-                                        let buf = self.handle.read_at_most(sblk_addr, 65536)?;
-                                        let sb = ExtensibleArraySuperBlock::decode(
-                                            &buf,
-                                            &self.ctx,
-                                            max_nelmts_bits,
-                                            ndblks_in_sblk,
-                                            0,
-                                        )?;
-                                        sblk_cache = Some((sblk_off, sb));
-                                    }
-                                    sblk_cache.as_ref().unwrap().1.dblk_addrs[local_dblk]
-                                }
-                            }
+                            continue;
                         }
-                    };
-                    if dblk_addr == UNDEF_ADDR {
-                        slot = dblk_end;
-                        continue;
-                    }
-                    if cache.as_ref().map(|&(a, _, _)| a) != Some(dblk_addr) {
-                        flush(&mut cache)?;
-                        let buf = self.handle.read_at_most(dblk_addr, 65536)?;
-                        let blk = if is_filtered {
-                            Dblk::Filtered(FilteredDataBlock::decode(
-                                &buf,
-                                &self.ctx,
-                                max_nelmts_bits,
-                                l.dblk_nelmts as usize,
-                                chunk_size_len,
-                            )?)
-                        } else {
-                            Dblk::Unfiltered(ExtensibleArrayDataBlock::decode(
-                                &buf,
-                                &self.ctx,
-                                max_nelmts_bits,
-                                l.dblk_nelmts as usize,
-                            )?)
-                        };
-                        cache = Some((dblk_addr, blk, false));
-                    }
-                    let (_, blk, dirty) = cache.as_mut().unwrap();
-                    match blk {
-                        Dblk::Filtered(d) => {
-                            let e = d.elements[l.offset_in_dblk as usize];
-                            if e.addr != UNDEF_ADDR {
-                                if collect_refs {
-                                    if let Some(bytes) = self.read_chunk_block(
-                                        pipeline.as_ref(),
-                                        e.addr,
-                                        e.nbytes,
-                                        e.filter_mask,
-                                        chunk_bytes,
-                                    )? {
-                                        dead_refs.extend_from_slice(&bytes);
-                                    }
-                                }
-                                if !self.swmr_active {
-                                    self.allocator
-                                        .free(e.addr, e.nbytes, FreeSpaceClass::RawData);
-                                }
-                                d.elements[l.offset_in_dblk as usize] = FilteredChunkEntry {
-                                    addr: UNDEF_ADDR,
-                                    nbytes: 0,
-                                    filter_mask: 0,
-                                };
-                                *dirty = true;
-                            }
-                        }
-                        Dblk::Unfiltered(d) => {
-                            let a = d.elements[l.offset_in_dblk as usize];
-                            if a != UNDEF_ADDR {
-                                if collect_refs {
-                                    if let Some(bytes) = self.read_chunk_block(
-                                        pipeline.as_ref(),
-                                        a,
-                                        chunk_bytes,
-                                        0,
-                                        chunk_bytes,
-                                    )? {
-                                        dead_refs.extend_from_slice(&bytes);
-                                    }
-                                }
-                                if !self.swmr_active {
-                                    self.allocator.free(a, chunk_bytes, FreeSpaceClass::RawData);
-                                }
-                                d.elements[l.offset_in_dblk as usize] = UNDEF_ADDR;
-                                *dirty = true;
-                            }
+                        let e = &mut entries[(s - first) as usize];
+                        if e.addr != UNDEF_ADDR {
+                            release(*e, &mut dead_refs)?;
+                            *e = FilteredChunkEntry::undef();
+                            dirty = true;
                         }
                     }
-                    slot += 1;
+                    if dirty {
+                        self.write_ea_entries(&k, addr, block, &entries)?;
+                    }
+                    slot = end;
                 }
             }
         }
-        flush(&mut cache)?;
         Ok((straddlers, dead_refs))
     }
 
