@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "mmap")]
@@ -78,6 +79,10 @@ pub struct FileHandle {
     /// it, which is what `H5FD_set_base_addr` does for the C library's
     /// drivers — no caller can forget to add it.
     base: u64,
+    /// How many times [`load_metadata`](Self::load_metadata) runs a load
+    /// whose checksum fails before giving up: libhdf5's
+    /// `H5Pset_metadata_read_attempts`, 1 unless the file is read under SWMR.
+    read_attempts: NonZeroU32,
 }
 
 /// Where a [`FileHandle`]'s bytes come from — the one place that decides, so
@@ -508,6 +513,50 @@ impl Accum {
     }
 }
 
+/// The longest [`FileHandle::load_metadata`] sleeps between two attempts,
+/// about a millisecond.
+pub(crate) const MAX_RETRY_SLEEP_NS: u64 = 1 << 20;
+
+/// The error a metadata load ends in, which [`FileHandle::load_metadata`]
+/// asks whether it is the one failure it retries.
+pub(crate) trait LoadError {
+    fn is_checksum_mismatch(&self) -> bool;
+}
+
+impl LoadError for crate::format::FormatError {
+    fn is_checksum_mismatch(&self) -> bool {
+        matches!(self, Self::ChecksumMismatch { .. })
+    }
+}
+
+impl LoadError for crate::io::IoError {
+    fn is_checksum_mismatch(&self) -> bool {
+        matches!(self, Self::Format(e) if e.is_checksum_mismatch())
+    }
+}
+
+/// Whether a [`FileHandle::load_metadata`] is already running on this thread.
+struct LoadDepth;
+
+thread_local! {
+    static IN_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl LoadDepth {
+    /// `Some` for the outermost load on this thread, which owns the retry;
+    /// dropping it ends that load.
+    fn enter() -> Option<Self> {
+        // No guard is built for an inner load: its drop would end the outer.
+        IN_LOAD.with(|d| if d.replace(true) { None } else { Some(Self) })
+    }
+}
+
+impl Drop for LoadDepth {
+    fn drop(&mut self) {
+        IN_LOAD.with(|d| d.set(false));
+    }
+}
+
 impl FileHandle {
     /// Wrap an already-opened file. Every constructor goes through here, so
     /// every handle starts with an empty accumulator over its own descriptor.
@@ -521,6 +570,7 @@ impl FileHandle {
             lock_policy,
             lock_held,
             base: 0,
+            read_attempts: NonZeroU32::MIN,
         }
     }
 
@@ -625,6 +675,58 @@ impl FileHandle {
     /// (`H5FD_set_base_addr`). Every later offset is taken relative to it.
     pub fn set_base(&mut self, base: u64) {
         self.base = base;
+    }
+
+    /// How many times a metadata load whose checksum fails is attempted.
+    pub fn metadata_read_attempts(&self) -> NonZeroU32 {
+        self.read_attempts
+    }
+
+    /// Set how many times a metadata load whose checksum fails is attempted
+    /// (`H5Pset_metadata_read_attempts`).
+    pub fn set_metadata_read_attempts(&mut self, attempts: NonZeroU32) {
+        self.read_attempts = attempts;
+    }
+
+    /// Run `load` — one read and decode of checksummed metadata — again while
+    /// its checksum fails, up to [`metadata_read_attempts`] times, and return
+    /// the last failure unchanged when none passes.
+    ///
+    /// This is `H5C__load_entry`'s loop: a SWMR writer can be part way through
+    /// rewriting the bytes a reader reads, and the checksum is how the reader
+    /// tells a torn image from a corrupt one. `load` must re-read everything
+    /// its decode depends on, since a stale parent image places the child's
+    /// checksum wrongly however often the child itself is re-read.
+    ///
+    /// libhdf5 sleeps 1 ns after the first failure and doubles the sleep after
+    /// each; the doubling stops at [`MAX_RETRY_SLEEP_NS`] so that the SWMR
+    /// default of 100 attempts ends in well under a second on an image that
+    /// is corrupt rather than torn.
+    ///
+    /// Only the outermost load on a thread retries: a load that runs inside
+    /// another returns its failure at once and the outer one re-runs both, so
+    /// attempts do not multiply through nesting.
+    ///
+    /// [`metadata_read_attempts`]: Self::metadata_read_attempts
+    pub(crate) fn load_metadata<T, E: LoadError>(
+        &self,
+        mut load: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let Some(_outermost) = LoadDepth::enter() else {
+            return load();
+        };
+        let mut sleep_ns = 1u64;
+        let mut attempt = 1;
+        loop {
+            match load() {
+                Err(e) if e.is_checksum_mismatch() && attempt < self.read_attempts.get() => {
+                    std::thread::sleep(std::time::Duration::from_nanos(sleep_ns));
+                    sleep_ns = (sleep_ns * 2).min(MAX_RETRY_SLEEP_NS);
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Absolute file offset of the HDF5 superblock signature, or `None` when
@@ -1549,5 +1651,129 @@ mod read_source_tests {
             assert_eq!(out, want, "read_exact_at_into");
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod load_metadata_tests {
+    use super::*;
+    use crate::format::FormatError;
+    use crate::io::IoError;
+    use std::cell::Cell;
+
+    fn handle(attempts: u32) -> FileHandle {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_load_metadata_{}_{n}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [0u8; 8]).unwrap();
+        let mut h = FileHandle::open_read_with_locking(&path, FileLocking::Disabled).unwrap();
+        let _ = std::fs::remove_file(&path);
+        h.set_metadata_read_attempts(NonZeroU32::new(attempts).unwrap());
+        h
+    }
+
+    fn mismatch() -> IoError {
+        IoError::Format(FormatError::ChecksumMismatch {
+            expected: 1,
+            computed: 2,
+        })
+    }
+
+    #[test]
+    fn a_checksum_failure_is_loaded_again_until_the_attempts_run_out() {
+        let h = handle(5);
+        let calls = Cell::new(0);
+        let r: Result<(), _> = h.load_metadata(|| {
+            calls.set(calls.get() + 1);
+            Err(mismatch())
+        });
+        assert!(r.unwrap_err().is_checksum_mismatch());
+        assert_eq!(calls.get(), 5);
+
+        let calls = Cell::new(0);
+        let r = h.load_metadata(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(mismatch())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn one_attempt_unless_set() {
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_load_metadata_default_{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [0u8; 8]).unwrap();
+        let h = FileHandle::open_read_with_locking(&path, FileLocking::Disabled).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(h.metadata_read_attempts().get(), 1);
+        let calls = Cell::new(0);
+        let _: Result<(), _> = h.load_metadata(|| {
+            calls.set(calls.get() + 1);
+            Err(mismatch())
+        });
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn only_a_checksum_failure_is_loaded_again() {
+        let h = handle(5);
+        for err in [
+            || IoError::Format(FormatError::InvalidSignature),
+            || IoError::InvalidState("short".into()),
+            || IoError::Io(std::io::ErrorKind::UnexpectedEof.into()),
+        ] {
+            let calls = Cell::new(0);
+            let r: Result<(), _> = h.load_metadata(|| {
+                calls.set(calls.get() + 1);
+                Err(err())
+            });
+            assert!(!r.unwrap_err().is_checksum_mismatch());
+            assert_eq!(calls.get(), 1);
+        }
+        // A bare `FormatError` load is gated the same way.
+        let calls = Cell::new(0);
+        let r: Result<(), FormatError> = h.load_metadata(|| {
+            calls.set(calls.get() + 1);
+            Err(FormatError::ChecksumMismatch {
+                expected: 1,
+                computed: 2,
+            })
+        });
+        assert!(r.is_err());
+        assert_eq!(calls.get(), 5);
+    }
+
+    #[test]
+    fn a_nested_load_fails_through_to_the_outer_one() {
+        let h = handle(3);
+        let (outer, inner) = (Cell::new(0), Cell::new(0));
+        let r: Result<(), _> = h.load_metadata(|| {
+            outer.set(outer.get() + 1);
+            h.load_metadata(|| {
+                inner.set(inner.get() + 1);
+                Err(mismatch())
+            })
+        });
+        assert!(r.unwrap_err().is_checksum_mismatch());
+        assert_eq!((outer.get(), inner.get()), (3, 3));
+
+        // The outer load has ended, so the next one owns the retry again.
+        let calls = Cell::new(0);
+        let _: Result<(), _> = h.load_metadata(|| {
+            calls.set(calls.get() + 1);
+            Err(mismatch())
+        });
+        assert_eq!(calls.get(), 3);
     }
 }

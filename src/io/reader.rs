@@ -6,6 +6,7 @@
 //! Supports both legacy (v0/v1 superblock, v1 object headers, symbol tables)
 //! and modern (v2/v3 superblock, v2 object headers, link messages) formats.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use crate::dataset::{DatasetAccess, VirtualView};
@@ -438,6 +439,17 @@ struct Origin {
 /// link to each other form a cycle whose every hop opens a fresh target, so it
 /// is this count, not target identity, that terminates the walk.
 const MAX_EXTERNAL_HOPS: usize = 16;
+
+/// The metadata read attempts a SWMR reader starts with: libhdf5's
+/// `H5F_SWMR_METADATA_READ_ATTEMPTS`, used when `H5Pset_metadata_read_attempts`
+/// was not called.
+pub(crate) const SWMR_METADATA_READ_ATTEMPTS: NonZeroU32 = NonZeroU32::new(100).unwrap();
+
+/// The v2/v3 superblock at the start of the address space, read and decoded
+/// as one load so a torn read is retried whole.
+fn load_superblock_v2v3(handle: &FileHandle) -> IoResult<SuperblockV2V3> {
+    handle.load_metadata(|| Ok(SuperblockV2V3::decode(&handle.read_at_most(0, 256)?)?))
+}
 
 /// What path traversal produced.
 enum Traversal {
@@ -1936,7 +1948,7 @@ fn copy_matched_selections(
 /// and the static dataset-open path (which only has a `&mut FileHandle`, not
 /// a full `&mut Hdf5Reader`) share the one implementation.
 fn read_heap_collection_from(
-    handle: &mut FileHandle,
+    handle: &FileHandle,
     ctx: &FormatContext,
     addr: u64,
 ) -> IoResult<GlobalHeapCollection> {
@@ -2753,10 +2765,14 @@ impl Hdf5Reader {
     /// Open an existing HDF5 file in SWMR read mode using the env-var-derived
     /// locking policy.
     ///
-    /// Currently identical to `open()`, but indicates intent to use
-    /// `refresh()` for re-reading metadata written by a concurrent SWMR writer.
+    /// Unlike `open()`, a metadata load whose checksum fails is attempted
+    /// [`SWMR_METADATA_READ_ATTEMPTS`] times before the open or a later
+    /// `refresh()` fails, since a concurrent SWMR writer may be rewriting it.
     pub fn open_swmr(path: &Path) -> IoResult<Self> {
-        Self::open(path)
+        Self::open_swmr_with_locking(
+            path,
+            crate::io::locking::FileLocking::from_env_or(Default::default()),
+        )
     }
 
     /// Open an existing HDF5 file in SWMR read mode with an explicit locking
@@ -2765,7 +2781,7 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        Self::open_with_locking(path, locking)
+        Self::open_with_attempts(path, locking, SWMR_METADATA_READ_ATTEMPTS)
     }
 
     /// Open an existing HDF5 file for reading using the env-var-derived
@@ -2786,7 +2802,18 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
+        Self::open_with_attempts(path, locking, NonZeroU32::MIN)
+    }
+
+    /// Open with `attempts` as the metadata read attempts, in force before
+    /// the superblock is read.
+    fn open_with_attempts(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+        attempts: NonZeroU32,
+    ) -> IoResult<Self> {
         let mut handle = FileHandle::open_read_with_locking(path, locking)?;
+        handle.set_metadata_read_attempts(attempts);
 
         // The superblock is not necessarily at the start of the file: a
         // userblock precedes it, and `H5FD_locate_signature` finds it by
@@ -2809,7 +2836,7 @@ impl Hdf5Reader {
         };
         let mut reader = match version {
             0 | 1 => Self::open_v0v1(handle, &sb_buf, origin)?,
-            2 | 3 => Self::open_v2v3(handle, &sb_buf, origin)?,
+            2 | 3 => Self::open_v2v3(handle, origin)?,
             v => {
                 return Err(crate::io::IoError::Format(
                     crate::format::FormatError::InvalidVersion(v),
@@ -2830,8 +2857,8 @@ impl Hdf5Reader {
     }
 
     /// Open a file with v2/v3 superblock (existing code path).
-    fn open_v2v3(mut handle: FileHandle, sb_buf: &[u8], origin: Origin) -> IoResult<Self> {
-        let sb = SuperblockV2V3::decode(sb_buf)?;
+    fn open_v2v3(mut handle: FileHandle, origin: Origin) -> IoResult<Self> {
+        let sb = load_superblock_v2v3(&handle)?;
 
         let ctx = FormatContext {
             sizeof_addr: sb.sizeof_offsets,
@@ -3095,7 +3122,7 @@ impl Hdf5Reader {
     /// the message, exactly as `H5SM__cache_table_get_final_load_size` takes it
     /// from `H5F_SOHM_NINDEXES`.
     fn read_sohm_table(
-        handle: &mut FileHandle,
+        handle: &FileHandle,
         ctx: &FormatContext,
         smt: &SharedMessageTableMessage,
     ) -> IoResult<SohmMasterTable> {
@@ -3103,8 +3130,10 @@ impl Hdf5Reader {
             return Ok(SohmMasterTable::default());
         }
         let size = SohmMasterTable::encoded_size(ctx, smt.nindexes);
-        let buf = handle.read_at(smt.table_address, size)?;
-        Ok(SohmMasterTable::decode(&buf, ctx, smt.nindexes)?)
+        handle.load_metadata(|| {
+            let buf = handle.read_at(smt.table_address, size)?;
+            Ok(SohmMasterTable::decode(&buf, ctx, smt.nindexes)?)
+        })
     }
 
     /// Extract the symbol-table message (btree_addr, heap_addr) from an
@@ -3144,56 +3173,58 @@ impl Hdf5Reader {
     /// object in the heap is an encoded `Link` message. Returns the decoded
     /// links (hard and soft).
     pub(crate) fn read_dense_links(
-        handle: &mut FileHandle,
+        handle: &FileHandle,
         ctx: &FormatContext,
         fractal_heap_addr: u64,
     ) -> IoResult<Vec<LinkMessage>> {
-        // Read the fractal heap header. Its on-disk size depends only on the
-        // address/length widths, so a generous prefix read covers it.
-        let hdr_buf = handle.read_at_most(fractal_heap_addr, 512)?;
-        let fh_header = FractalHeapHeader::decode(&hdr_buf, ctx)?;
+        handle.load_metadata(|| {
+            // Read the fractal heap header. Its on-disk size depends only on the
+            // address/length widths, so a generous prefix read covers it.
+            let hdr_buf = handle.read_at_most(fractal_heap_addr, 512)?;
+            let fh_header = FractalHeapHeader::decode(&hdr_buf, ctx)?;
 
-        // Walk the heap's managed blocks; each block hands back a payload
-        // region holding one or more packed encoded `Link` messages.
-        let mut br = HandleBlockReader { handle };
-        let payloads = fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br)?;
+            // Walk the heap's managed blocks; each block hands back a payload
+            // region holding one or more packed encoded `Link` messages.
+            let mut br = HandleBlockReader { handle };
+            let payloads = fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br)?;
 
-        let mut links = Vec::new();
-        for payload in payloads {
-            // Decode packed `Link` messages sequentially. Each decode reports
-            // its consumed length; stop at the first byte that is not a valid
-            // link (trailing free space or an unrelated managed object).
-            let mut pos = 0;
-            while pos < payload.len() {
-                // A v1 link message starts with version byte 1.
-                if payload[pos] != 1 {
-                    break;
-                }
-                match LinkMessage::decode(&payload[pos..], ctx) {
-                    Ok((link, consumed)) if consumed > 0 => {
-                        links.push(link);
-                        pos += consumed;
+            let mut links = Vec::new();
+            for payload in payloads {
+                // Decode packed `Link` messages sequentially. Each decode reports
+                // its consumed length; stop at the first byte that is not a valid
+                // link (trailing free space or an unrelated managed object).
+                let mut pos = 0;
+                while pos < payload.len() {
+                    // A v1 link message starts with version byte 1.
+                    if payload[pos] != 1 {
+                        break;
                     }
-                    _ => break,
+                    match LinkMessage::decode(&payload[pos..], ctx) {
+                        Ok((link, consumed)) if consumed > 0 => {
+                            links.push(link);
+                            pos += consumed;
+                        }
+                        _ => break,
+                    }
                 }
             }
-        }
 
-        // That scan stops at the first byte that does not begin a link, which
-        // is how trailing free space in a direct block ends it — and would
-        // equally swallow a link the scan could not read. The heap header
-        // counts its managed objects, so a short scan is detectable, and a
-        // group listing that is short is the loss this guards against.
-        if links.len() < fh_header.man_nobjs as usize {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "dense link storage at address {fractal_heap_addr:#x} holds {} managed \
-                 objects but only {} decoded as links",
-                fh_header.man_nobjs,
-                links.len()
-            )));
-        }
+            // That scan stops at the first byte that does not begin a link, which
+            // is how trailing free space in a direct block ends it — and would
+            // equally swallow a link the scan could not read. The heap header
+            // counts its managed objects, so a short scan is detectable, and a
+            // group listing that is short is the loss this guards against.
+            if links.len() < fh_header.man_nobjs as usize {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dense link storage at address {fractal_heap_addr:#x} holds {} managed \
+                     objects but only {} decoded as links",
+                    fh_header.man_nobjs,
+                    links.len()
+                )));
+            }
 
-        Ok(links)
+            Ok(links)
+        })
     }
 
     /// Recursively walk a B-tree v1 to collect leaf-level SNOD addresses.
@@ -3526,30 +3557,45 @@ impl Hdf5Reader {
     /// no data: a `Virtual` layout carries no data address of its own, so a
     /// dropped mapping list would read back as all-fill with no error.
     fn resolve_virtual_mappings(
-        handle: &mut FileHandle,
+        handle: &FileHandle,
         ctx: &FormatContext,
         heap_address: u64,
         heap_index: u32,
         name: &str,
     ) -> IoResult<VirtualMappingList> {
-        let coll = read_heap_collection_from(handle, ctx, heap_address)?;
+        let malformed = |e: crate::format::FormatError| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} has a malformed virtual dataset mapping list: {e}"
+            ))
+        };
         let idx = u16::try_from(heap_index).map_err(|_| {
             crate::io::IoError::InvalidState(format!(
                 "dataset {name:?} virtual mapping heap index {heap_index} does not fit \
                  the 16-bit on-disk field"
             ))
         })?;
-        let obj = coll.get_object(idx).ok_or_else(|| {
-            crate::io::IoError::InvalidState(format!(
-                "dataset {name:?} virtual mapping list object {idx} not found in the \
-                 global heap collection at address {heap_address:#x}"
-            ))
-        })?;
-        VirtualMappingList::decode(obj, ctx).map_err(|e| {
-            crate::io::IoError::InvalidState(format!(
-                "dataset {name:?} has a malformed virtual dataset mapping list: {e}"
-            ))
-        })
+        // A checksum failure leaves the gate as `Format` so it can be
+        // retried, and takes the dataset's context only once it is final.
+        handle
+            .load_metadata(|| {
+                let coll = read_heap_collection_from(handle, ctx, heap_address)?;
+                let obj = coll.get_object(idx).ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?} virtual mapping list object {idx} not found in the \
+                         global heap collection at address {heap_address:#x}"
+                    ))
+                })?;
+                VirtualMappingList::decode(obj, ctx).map_err(|e| match e {
+                    e @ crate::format::FormatError::ChecksumMismatch { .. } => e.into(),
+                    e => malformed(e),
+                })
+            })
+            .map_err(|e| match e {
+                crate::io::IoError::Format(
+                    e @ crate::format::FormatError::ChecksumMismatch { .. },
+                ) => malformed(e),
+                e => e,
+            })
     }
 
     /// Resolve every external-file slot's name through the local heap the
@@ -3985,6 +4031,7 @@ impl Hdf5Reader {
         owner: CrossFileOwner,
     ) -> IoResult<&mut Hdf5Reader> {
         let locking = self.locking;
+        let attempts = self.handle.metadata_read_attempts();
         let elink_prefix = self.elink_prefix.clone();
         match self.external.entry(resolved) {
             std::collections::btree_map::Entry::Occupied(e) => {
@@ -3993,7 +4040,9 @@ impl Hdf5Reader {
                 Ok(&mut *e.reader)
             }
             std::collections::btree_map::Entry::Vacant(e) => {
-                let mut reader = Hdf5Reader::open_with_locking(e.key(), locking)?;
+                // Opened under the opener's access properties, as libhdf5
+                // opens a link target with the parent file's fapl.
+                let mut reader = Hdf5Reader::open_with_attempts(e.key(), locking, attempts)?;
                 reader.elink_prefix.clone_from(&elink_prefix);
                 Ok(&mut *e
                     .insert(CrossFileEntry {
@@ -4481,7 +4530,7 @@ impl Hdf5Reader {
     /// has none, and this crate's writers put a whole write call's strings
     /// into one collection, which a cap would turn into silent data loss.
     fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
-        read_heap_collection_from(&mut self.handle, &self.meta.ctx, addr)
+        read_heap_collection_from(&self.handle, &self.meta.ctx, addr)
     }
 
     /// Decode an attribute's value as a string, resolving a variable-length
@@ -5522,6 +5571,27 @@ impl Hdf5Reader {
         Ok(())
     }
 
+    /// How many times a metadata load whose checksum fails is attempted
+    /// before the read fails: 1, or [`SWMR_METADATA_READ_ATTEMPTS`] for a
+    /// reader opened with `open_swmr`.
+    pub fn metadata_read_attempts(&self) -> NonZeroU32 {
+        self.handle.metadata_read_attempts()
+    }
+
+    /// Set how many times a metadata load whose checksum fails is attempted
+    /// (`H5Pset_metadata_read_attempts`), here and in every file this reader
+    /// has opened or will open through an external link or virtual source.
+    ///
+    /// A SWMR writer rewrites metadata in place, so a reader can read an
+    /// image the writer is part way through; reading it again is what tells
+    /// a torn image from a corrupt one.
+    pub fn set_metadata_read_attempts(&mut self, attempts: NonZeroU32) {
+        self.handle.set_metadata_read_attempts(attempts);
+        for entry in self.external.values_mut() {
+            entry.reader.set_metadata_read_attempts(attempts);
+        }
+    }
+
     /// Re-read the superblock and dataset metadata for SWMR.
     ///
     /// Call this periodically to pick up new data written by a concurrent
@@ -5536,10 +5606,8 @@ impl Hdf5Reader {
         self.handle.refresh_read_source();
 
         // Re-read superblock to get latest EOF and root group address.
-        let sb_buf = self.handle.read_at_most(0, 256)?;
-
-        // Only v2/v3 superblocks support SWMR refresh
-        let sb = SuperblockV2V3::decode(&sb_buf)?;
+        // Only v2/v3 superblocks support SWMR refresh.
+        let sb = load_superblock_v2v3(&self.handle)?;
 
         let ctx = FormatContext {
             sizeof_addr: sb.sizeof_offsets,
@@ -6517,8 +6585,11 @@ pub(crate) fn collect_object_attributes(
                     } else {
                         AttributeStorage::Compact
                     };
-                    let mut br = HandleBlockReader { handle };
-                    match crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br) {
+                    let dense = handle.load_metadata(|| {
+                        let mut br = HandleBlockReader { handle };
+                        crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br)
+                    });
+                    match dense {
                         Ok(dense) => attrs.entries.extend(dense),
                         Err(e) => attrs
                             .mark_incomplete(format!("dense attribute storage is unreadable: {e}")),

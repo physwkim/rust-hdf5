@@ -259,69 +259,73 @@ fn read_object_header_at(
 /// every block that list was read out of — chunk 0 first, then the
 /// continuations in the order they were followed.
 fn read_header_chain(
-    handle: &mut FileHandle,
+    handle: &FileHandle,
     meta: &FileMeta,
     addr: u64,
 ) -> IoResult<(ObjectHeader, HeaderBlocks)> {
-    let ctx = &meta.ctx;
-    let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
-    if let Err(FormatError::BufferTooShort { needed, .. }) = ObjectHeader::decode_any(&buf) {
-        if needed > buf.len() {
-            buf = handle.read_at_most(addr, needed)?;
-        }
-    }
-    let (mut header, chunk0_len) = ObjectHeader::decode_any(&buf)?;
-    let mut blocks = vec![(addr, chunk0_len as u64)];
-
-    // A v1 header has no "OHDR" signature; detect by it.
-    let is_v2 = buf.len() >= 4 && buf[0..4] == crate::format::object_header::OHDR_SIGNATURE;
-    // v2 creation-order tracking is recorded in object-header flag bit 2.
-    let track_creation_order = is_v2 && (header.flags & 0x04) != 0;
-
-    let sa = ctx.sizeof_addr as usize;
-    let ss = ctx.sizeof_size as usize;
-
-    // Collect continuation references from a slice of messages.
-    let collect = |msgs: &[ObjectHeaderMessage], out: &mut HeaderBlocks| {
-        for msg in msgs {
-            if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
-                let cont_addr = read_uint(&msg.data, sa);
-                let cont_len = read_uint(&msg.data[sa..], ss);
-                out.push((cont_addr, cont_len));
+    // One load: a torn continuation is re-read along with chunk 0, which
+    // states its length.
+    handle.load_metadata(|| {
+        let ctx = &meta.ctx;
+        let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
+        if let Err(FormatError::BufferTooShort { needed, .. }) = ObjectHeader::decode_any(&buf) {
+            if needed > buf.len() {
+                buf = handle.read_at_most(addr, needed)?;
             }
         }
-    };
+        let (mut header, chunk0_len) = ObjectHeader::decode_any(&buf)?;
+        let mut blocks = vec![(addr, chunk0_len as u64)];
 
-    let mut pending: HeaderBlocks = Vec::new();
-    collect(&header.messages, &mut pending);
+        // A v1 header has no "OHDR" signature; detect by it.
+        let is_v2 = buf.len() >= 4 && buf[0..4] == crate::format::object_header::OHDR_SIGNATURE;
+        // v2 creation-order tracking is recorded in object-header flag bit 2.
+        let track_creation_order = is_v2 && (header.flags & 0x04) != 0;
 
-    let mut visited = std::collections::HashSet::new();
-    let mut blocks_read = 0usize;
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
 
-    while let Some((cont_addr, cont_len)) = pending.pop() {
-        if cont_addr == UNDEF_ADDR || cont_addr == 0 || cont_len == 0 {
-            continue;
+        // Collect continuation references from a slice of messages.
+        let collect = |msgs: &[ObjectHeaderMessage], out: &mut HeaderBlocks| {
+            for msg in msgs {
+                if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
+                    let cont_addr = read_uint(&msg.data, sa);
+                    let cont_len = read_uint(&msg.data[sa..], ss);
+                    out.push((cont_addr, cont_len));
+                }
+            }
+        };
+
+        let mut pending: HeaderBlocks = Vec::new();
+        collect(&header.messages, &mut pending);
+
+        let mut visited = std::collections::HashSet::new();
+        let mut blocks_read = 0usize;
+
+        while let Some((cont_addr, cont_len)) = pending.pop() {
+            if cont_addr == UNDEF_ADDR || cont_addr == 0 || cont_len == 0 {
+                continue;
+            }
+            if !visited.insert(cont_addr) {
+                continue; // already followed — guard against cycles
+            }
+            blocks_read += 1;
+            if blocks_read > MAX_CONT_BLOCKS {
+                break;
+            }
+
+            // The continuation message states the chunk's exact length, and a v2
+            // chunk's checksum covers exactly that image: a short read would check
+            // a different buffer than the writer hashed.
+            let cont_buf = handle.read_at(cont_addr, cont_len as usize)?;
+            blocks.push((cont_addr, cont_len));
+            let mut new_msgs = Vec::new();
+            parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs)?;
+            collect(&new_msgs, &mut pending);
+            header.messages.extend(new_msgs);
         }
-        if !visited.insert(cont_addr) {
-            continue; // already followed — guard against cycles
-        }
-        blocks_read += 1;
-        if blocks_read > MAX_CONT_BLOCKS {
-            break;
-        }
 
-        // The continuation message states the chunk's exact length, and a v2
-        // chunk's checksum covers exactly that image: a short read would check
-        // a different buffer than the writer hashed.
-        let cont_buf = handle.read_at(cont_addr, cont_len as usize)?;
-        blocks.push((cont_addr, cont_len));
-        let mut new_msgs = Vec::new();
-        parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs)?;
-        collect(&new_msgs, &mut pending);
-        header.messages.extend(new_msgs);
-    }
-
-    Ok((header, blocks))
+        Ok((header, blocks))
+    })
 }
 
 /// Why the object at `addr` cannot keep its bytes across a rewrite of the
@@ -537,20 +541,23 @@ fn resolve_shared_body(
                     "no shared-message index covers message type {msg_type:#04x}"
                 ))
             })?;
-            // The heap header's length depends only on the address/length
-            // widths and the filter pipeline it may carry; a bounded prefix
-            // covers it, as it does for dense link storage.
-            let hdr_buf = handle.read_at_most(heap_addr, 512)?;
-            let fh_header = FractalHeapHeader::decode(&hdr_buf, &meta.ctx)?;
-            let mut br = HandleBlockReader { handle };
-            // The same heap-ID reader dense links and dense attributes use: a
-            // shared message can be managed, tiny or huge exactly as any other
-            // heap object can, and the ID says which.
-            let id = HeapId::parse(&ptr.heap_id, &fh_header, &meta.ctx)?;
-            let blocks = collect_managed_blocks(&fh_header, &meta.ctx, &mut br)?;
-            Ok(read_heap_object(
-                &id, &fh_header, &meta.ctx, &blocks, &mut br,
-            )?)
+            let handle: &FileHandle = handle;
+            handle.load_metadata(|| {
+                // The heap header's length depends only on the address/length
+                // widths and the filter pipeline it may carry; a bounded prefix
+                // covers it, as it does for dense link storage.
+                let hdr_buf = handle.read_at_most(heap_addr, 512)?;
+                let fh_header = FractalHeapHeader::decode(&hdr_buf, &meta.ctx)?;
+                let mut br = HandleBlockReader { handle };
+                // The same heap-ID reader dense links and dense attributes use: a
+                // shared message can be managed, tiny or huge exactly as any other
+                // heap object can, and the ID says which.
+                let id = HeapId::parse(&ptr.heap_id, &fh_header, &meta.ctx)?;
+                let blocks = collect_managed_blocks(&fh_header, &meta.ctx, &mut br)?;
+                Ok(read_heap_object(
+                    &id, &fh_header, &meta.ctx, &blocks, &mut br,
+                )?)
+            })
         }
         SharedLocation::Committed => {
             let pick = |msgs: &[ObjectHeaderMessage]| {
@@ -785,7 +792,7 @@ pub(crate) fn read_datatype_message(
 /// A [`BlockReader`] over the file handle, for the fractal heaps a shared
 /// message index keeps its bodies in.
 struct HandleBlockReader<'a> {
-    handle: &'a mut FileHandle,
+    handle: &'a FileHandle,
 }
 
 impl BlockReader for HandleBlockReader<'_> {

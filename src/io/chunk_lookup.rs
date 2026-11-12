@@ -212,31 +212,40 @@ pub(crate) fn find(
     if view.addr == UNDEF_ADDR || !view.within_extent(coords) {
         return Ok(None);
     }
-    let record = match &view.kind {
-        IndexKind::SingleChunk(filter) => Some(ChunkRecord {
-            addr: view.addr,
-            nbytes: filter.map_or(view.whole_bytes, |f| f.nbytes),
-            mask: filter.map_or(0, |f| f.filter_mask),
-        }),
-        IndexKind::Implicit => {
-            // `H5D__none_idx_create` allocates every slot of the maximum grid
-            // in one block, so the address is arithmetic.
-            let linear = view.linear(coords)?;
-            Some(ChunkRecord {
-                addr: view
-                    .addr
-                    .saturating_add(linear.saturating_mul(view.chunk_bytes)),
-                nbytes: view.chunk_bytes,
-                mask: 0,
-            })
+    let record = handle.load_metadata(|| {
+        let found = match &view.kind {
+            IndexKind::SingleChunk(filter) => Ok(Some(ChunkRecord {
+                addr: view.addr,
+                nbytes: filter.map_or(view.whole_bytes, |f| f.nbytes),
+                mask: filter.map_or(0, |f| f.filter_mask),
+            })),
+            IndexKind::Implicit => {
+                // `H5D__none_idx_create` allocates every slot of the maximum
+                // grid in one block, so the address is arithmetic.
+                let linear = view.linear(coords)?;
+                Ok(Some(ChunkRecord {
+                    addr: view
+                        .addr
+                        .saturating_add(linear.saturating_mul(view.chunk_bytes)),
+                    nbytes: view.chunk_bytes,
+                    mask: 0,
+                }))
+            }
+            IndexKind::FixedArray => find_fixed_array(handle, view, blocks, view.linear(coords)?),
+            IndexKind::ExtensibleArray(params) => {
+                find_extensible_array(handle, view, params, blocks, view.linear(coords)?)
+            }
+            IndexKind::BTreeV2 => find_btree_v2(handle, view, blocks, coords),
+            IndexKind::BTreeV1 => find_btree_v1(handle, view, blocks, coords),
+        };
+        // A failed walk leaves nothing memoized: a block's checksum is placed
+        // by its parent's image (a B-tree v2 child's record count), so a
+        // retry that kept the parent would check the same wrong range again.
+        if found.is_err() {
+            *blocks = BlockCache::default();
         }
-        IndexKind::FixedArray => find_fixed_array(handle, view, blocks, view.linear(coords)?)?,
-        IndexKind::ExtensibleArray(params) => {
-            find_extensible_array(handle, view, params, blocks, view.linear(coords)?)?
-        }
-        IndexKind::BTreeV2 => find_btree_v2(handle, view, blocks, coords)?,
-        IndexKind::BTreeV1 => find_btree_v1(handle, view, blocks, coords)?,
-    };
+        found
+    })?;
     Ok(record.filter(|r| r.addr != UNDEF_ADDR))
 }
 

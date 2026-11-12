@@ -3,6 +3,7 @@
 //! Provides a high-level wrapper around the SWMR protocol for streaming
 //! frame-based data (e.g., area detector images).
 
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use crate::format::messages::attribute::AttributeMessage;
@@ -949,6 +950,25 @@ impl SwmrFileReader {
     pub fn refresh(&mut self) -> Result<()> {
         self.reader.refresh()?;
         Ok(())
+    }
+
+    /// How many times a metadata read whose checksum fails is attempted
+    /// before [`refresh`](Self::refresh) or a read fails. 100 unless set, the
+    /// default libhdf5 gives a SWMR reader.
+    pub fn metadata_read_attempts(&self) -> NonZeroU32 {
+        self.reader.metadata_read_attempts()
+    }
+
+    /// Set how many times a metadata read whose checksum fails is attempted
+    /// (`H5Pset_metadata_read_attempts`).
+    ///
+    /// The writer rewrites metadata in place, so a read can catch an image it
+    /// is part way through; the checksum fails, and reading again after a
+    /// short sleep gets the finished image. Each sleep doubles from 1 ns up
+    /// to about 1 ms. A checksum that still fails on the last attempt is
+    /// returned as the error.
+    pub fn set_metadata_read_attempts(&mut self, attempts: NonZeroU32) {
+        self.reader.set_metadata_read_attempts(attempts);
     }
 
     /// Return the names of all datasets.
