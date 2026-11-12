@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.12
+
+### Fixed
+
+- A dataset whose chunks an extensible array indexes takes chunks past
+  index 131,059, where 0.7.11 refused the chunk: the writer adds super
+  blocks and paged data blocks as libhdf5's `H5EA` does, so a SWMR stream
+  is no longer capped at 131,060 frames. h5py reads the newest chunk of a
+  263,232-chunk stream live and the whole dataset after close, and the
+  array's super-block, data-block and element counts match libhdf5's.
+
+### Changed
+
+- Chunks and metadata blocks start where the file ends, unaligned, as
+  libhdf5 places them by default; only contiguous dataset storage still
+  starts on an eight-byte boundary, for mapped views. Aligning every
+  allocation left a free-list fragment per chunk whose size was not a
+  multiple of eight, and every later allocation scanned the list: a SWMR
+  append of a 4-byte frame took 230 µs by frame 300,000. It now holds at
+  16–23 µs from frame 32,768 on, where the index block each append
+  rewrites reaches its 1024-entry page.
+
 ## 0.7.11
 
 ### Added
