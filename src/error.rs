@@ -8,6 +8,9 @@ pub enum Hdf5Error {
     /// A low-level format encoding/decoding error.
     Format(crate::format::FormatError),
     /// An I/O-layer error from hdf5-io.
+    ///
+    /// No longer produced: every I/O-layer error now arrives as the variant
+    /// of the same name. Kept for 0.7.x compatibility; removed in 0.8.
     IoLayer(crate::io::IoError),
     /// A requested object (dataset, group, attribute) was not found.
     ///
