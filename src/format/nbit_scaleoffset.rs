@@ -655,19 +655,25 @@ pub(crate) fn nbit_decoded_len(cd_values: &[u32]) -> Option<usize> {
 /// the header must be present and the count must match (#6497), and the
 /// walkers above refuse a tree that outruns the list or the buffer.
 pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResult<Vec<u8>> {
-    if cd_values.len() < NBIT_HEADER_NPARMS {
-        return Err(FormatError::InvalidData("nbit: cd_values too short".into()));
-    }
-    if cd_values[0] as usize != cd_values.len() {
+    let too_short = || FormatError::InvalidData("nbit: cd_values too short".into());
+    let &[count, need_not_compress, ..] = cd_values else {
+        return Err(too_short());
+    };
+    if count as usize != cd_values.len() {
         return Err(FormatError::InvalidData(format!(
-            "nbit: cd_values[0] names {} parameters but {} are stored",
-            cd_values[0],
+            "nbit: cd_values[0] names {count} parameters but {} are stored",
             cd_values.len()
         )));
     }
-    // cd_values[1] != 0 -> data is full-precision, filter is a pass-through.
-    if cd_values[1] != 0 {
+    // A pass-through is decided before the datatype is read: for a class it
+    // does not pack (an enum, a bit field, a string) `H5Z__set_local_nbit`
+    // stores no datatype parameters at all, only the count, this flag and
+    // the element count.
+    if need_not_compress != 0 {
         return Ok(data.to_vec());
+    }
+    if cd_values.len() < NBIT_HEADER_NPARMS {
+        return Err(too_short());
     }
 
     let d_nelmts = cd_values[2] as usize;
@@ -1753,6 +1759,19 @@ mod tests {
             Ok(out) => panic!("accepted {cd:?}: {} bytes out", out.len()),
             Err(e) => e.to_string(),
         }
+    }
+
+    /// `H5Z__set_local_nbit`'s list for a top-level enum, bit field or other
+    /// class it does not pack: count, pass-through flag, element count.
+    #[test]
+    fn a_pass_through_list_without_a_datatype_is_the_data() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        for compress in [false, true] {
+            assert_eq!(apply_nbit(&data, &[3, 1, 4], compress).unwrap(), data);
+        }
+        assert_eq!(nbit_decoded_len(&[3, 1, 4]), None);
+        let err = refusal(&data, &[1], false);
+        assert!(err.contains("cd_values too short"), "{err}");
     }
 
     #[test]
