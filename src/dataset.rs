@@ -4881,8 +4881,8 @@ pub(crate) mod numeric {
     ///
     /// The shape is that of an element after the post-filter conversion
     /// ([`apply_datatype_conversion`]), which leaves every integer — a
-    /// fixed-point integer or a bit field, whatever its precision and bit
-    /// offset — as the full-width value of its stored size. Accepts such
+    /// fixed-point integer, a bit field or an enum over either, whatever its
+    /// precision and bit offset — as the full-width value of its stored size. Accepts such
     /// integers of 1/2/4/8 bytes and IEEE binary32/binary64 floats;
     /// everything else is a `TypeMismatch` naming what was found.
     ///

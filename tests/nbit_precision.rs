@@ -5,6 +5,9 @@
 //! for an unsigned type or bit field, sign-extended from the precision for a
 //! signed one.
 //!
+//! An enum over such a type reads as its base does: libhdf5 converts an
+//! enum to a number through its base (`H5T__conv_enum_numeric`).
+//!
 //! The fixture is libhdf5 output (`tests/fixtures/gen_nbit_precision.py`):
 //! datasets of shape (3, 4, 5) and root attributes of shape (5,), whose
 //! values are the generator's formula of the row-major element index,
@@ -15,7 +18,7 @@ use std::path::PathBuf;
 
 use rust_hdf5::swmr::SwmrFileReader;
 use rust_hdf5::types::H5Type;
-use rust_hdf5::H5File;
+use rust_hdf5::{DatatypeMessage, H5File};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nbit_precision.h5")
@@ -163,4 +166,42 @@ fn reduced_precision_attributes() {
     assert_eq!(signed.unwrap(), [-2048, -1048, -48, 952, 1952]);
     let bits = file.attr("b12_o4").unwrap().read_numeric_as::<u16>();
     assert_eq!(bits.unwrap(), [7, 1007, 2007, 3007, 4007]);
+}
+
+/// Element `i` of an enum dataset is member `i % members.len()`.
+fn check_enum<T>(name: &str, members: &[i64])
+where
+    T: H5Type + Copy + Default + PartialEq + Debug + Into<i64> + TryFrom<i64>,
+    <T as TryFrom<i64>>::Error: Debug,
+{
+    let ds = H5File::open(fixture()).unwrap().dataset(name).unwrap();
+    assert!(
+        matches!(ds.datatype().unwrap(), DatatypeMessage::Enum { .. }),
+        "{name} is an enum"
+    );
+    check::<T>(name, &values(|i| members[(i as usize) % members.len()]));
+}
+
+#[test]
+fn signed_enum_offset_3_nbit_filter() {
+    check_enum::<i16>("e_s12_o3_nbit", &[-2048, -1000, -1, 0, 1, 7, 1500, 2047]);
+}
+
+#[test]
+fn unsigned_big_endian_enum_offset_4_contiguous() {
+    check_enum::<u16>("e_u12_o4_be_contig", &[0, 1, 9, 300, 2048, 4000, 4095]);
+}
+
+#[test]
+fn reduced_precision_enum_attribute() {
+    let file = H5File::open(fixture()).unwrap();
+    let attr = file.attr("e_s12_o3").unwrap();
+    assert!(matches!(
+        attr.datatype().unwrap(),
+        DatatypeMessage::Enum { .. }
+    ));
+    assert_eq!(
+        attr.read_numeric_as::<i64>().unwrap(),
+        [-2048, -1000, -1, 0, 2047]
+    );
 }

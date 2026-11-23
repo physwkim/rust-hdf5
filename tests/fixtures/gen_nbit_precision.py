@@ -12,6 +12,12 @@ Each value is the `values(i)` given in `DATASETS` (or `ATTRIBUTES`, shape
 converts it into the reduced type on write, and the script checks that
 libhdf5 reads it back unchanged.
 
+`ENUMS` are enums over such a reduced type (and `ENUM_ATTRIBUTES` likewise,
+shape (5,)): element `i` is member `i % len(members)`, whose value libhdf5
+stores in the reduced base's bits. The script checks that libhdf5 reads each
+back both as the enum and as the base's native integer type
+(`H5T__conv_enum_numeric`), the read the Rust tests compare against.
+
 Regenerate with (h5py over libhdf5):
     cd tests/fixtures && python3 gen_nbit_precision.py
 """
@@ -66,6 +72,21 @@ ATTRIBUTES = {
     "b12_o4": (h5py.h5t.STD_B16LE, 12, 4, lambda i: i * 1000 + 7, h5py.h5t.NATIVE_B16),
 }
 
+# name -> (base type, precision, offset, layout, member values)
+ENUMS = {
+    "e_s12_o3_nbit": (
+        h5py.h5t.STD_I16LE, 12, 3, "nbit", (-2048, -1000, -1, 0, 1, 7, 1500, 2047),
+    ),
+    "e_u12_o4_be_contig": (
+        h5py.h5t.STD_U16BE, 12, 4, "contig", (0, 1, 9, 300, 2048, 4000, 4095),
+    ),
+}
+
+# name -> (base type, precision, offset, member values)
+ENUM_ATTRIBUTES = {
+    "e_s12_o3": (h5py.h5t.STD_I16LE, 12, 3, (-2048, -1000, -1, 0, 2047)),
+}
+
 
 def reduced(base, precision, offset):
     tid = base.copy()
@@ -79,9 +100,31 @@ def dtype_of(base):
     return np.dtype(f"{'i' if signed else 'u'}{base.get_size()}")
 
 
+def enum_of(base, members):
+    tid = h5py.h5t.enum_create(base)
+    for k, v in enumerate(members):
+        tid.enum_insert(f"m{k}".encode(), v)
+    return tid
+
+
 def create(h5, name, base, precision, offset, layout, values, mtype):
     tid = reduced(base, precision, offset)
     data = np.array([values(i) for i in range(N)], dtype=dtype_of(base)).reshape(SHAPE)
+    write(h5, name, tid, layout, data, mtype)
+
+
+def create_enum(h5, name, base, precision, offset, layout, members):
+    tid = enum_of(reduced(base, precision, offset), members)
+    native = dtype_of(base)
+    mtype = enum_of(h5py.h5t.py_create(native), members)
+    data = np.array([members[i % len(members)] for i in range(N)], dtype=native).reshape(SHAPE)
+    dsid = write(h5, name, tid, layout, data, mtype)
+    back = np.empty_like(data)
+    dsid.read(h5py.h5s.ALL, h5py.h5s.ALL, back, mtype=h5py.h5t.py_create(native))
+    assert (back == data).all(), name
+
+
+def write(h5, name, tid, layout, data, mtype):
     dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
     if layout == "contig":
         space = h5py.h5s.create_simple(SHAPE)
@@ -98,6 +141,7 @@ def create(h5, name, base, precision, offset, layout, values, mtype):
     assert (back == data).all(), name
     if layout == "nbit":
         assert dsid.get_create_plist().get_filter(0)[0] == h5py.h5z.FILTER_NBIT, name
+    return dsid
 
 
 def create_attr(h5, name, base, precision, offset, values, mtype):
@@ -110,12 +154,27 @@ def create_attr(h5, name, base, precision, offset, values, mtype):
     assert (back == data).all(), name
 
 
+def create_enum_attr(h5, name, base, precision, offset, members):
+    tid = enum_of(reduced(base, precision, offset), members)
+    native = dtype_of(base)
+    data = np.array(members, dtype=native)
+    aid = h5py.h5a.create(h5.id, name.encode(), tid, h5py.h5s.create_simple((len(members),)))
+    aid.write(data, mtype=enum_of(h5py.h5t.py_create(native), members))
+    back = np.empty_like(data)
+    aid.read(back, mtype=h5py.h5t.py_create(native))
+    assert (back == data).all(), name
+
+
 def main():
     with h5py.File("nbit_precision.h5", "w", libver="latest") as h5:
         for name, spec in DATASETS.items():
             create(h5, name, *spec)
         for name, spec in ATTRIBUTES.items():
             create_attr(h5, name, *spec)
+        for name, spec in ENUMS.items():
+            create_enum(h5, name, *spec)
+        for name, spec in ENUM_ATTRIBUTES.items():
+            create_enum_attr(h5, name, *spec)
     print("generated nbit_precision.h5")
 
 

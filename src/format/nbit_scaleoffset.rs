@@ -1482,7 +1482,8 @@ fn is_standard_ieee_float(dt: &DatatypeMessage) -> bool {
 /// the `precision` significant bits at `offset` down to bit 0, then filling
 /// the bits above them — with the sign bit for a signed integer
 /// (`H5T__conv_i_i`), with zeros for an unsigned one or a bit field, which
-/// has no sign (`H5T__conv_b_b`).
+/// has no sign (`H5T__conv_b_b`). An enum's values are its base's, which is
+/// how libhdf5 converts one to a number (`H5T__conv_enum_numeric`).
 #[derive(Clone, Copy)]
 pub(crate) struct IntLayout {
     pub size: usize,
@@ -1493,10 +1494,11 @@ pub(crate) struct IntLayout {
 }
 
 impl IntLayout {
-    /// `dt`'s layout, or `None` when `dt` is not a fixed-point integer or a
-    /// bit field.
+    /// `dt`'s layout, or `None` when `dt` is not a fixed-point integer, a
+    /// bit field or an enum over one.
     pub(crate) fn of(dt: &DatatypeMessage) -> Option<Self> {
         let (size, byte_order, signed, offset, precision) = match *dt {
+            DatatypeMessage::Enum { ref base, .. } => return Self::of(base),
             DatatypeMessage::FixedPoint {
                 size,
                 byte_order,
