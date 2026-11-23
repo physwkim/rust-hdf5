@@ -39,6 +39,7 @@ use crate::format::messages::virtual_mapping::{
     parse_source_name, VirtualMapping, VirtualMappingList,
 };
 use crate::format::messages::*;
+use crate::format::nbit_scaleoffset::Conversion;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
     decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
@@ -5410,8 +5411,11 @@ impl Hdf5Reader {
     }
 
     /// Fill `out` (shaped like the virtual dataset's own extent) by
-    /// stitching each mapping's source bytes in order (`H5D__virtual_read`,
-    /// H5Dvirtual.c). `out` must already be pre-filled with the tiled fill
+    /// stitching each mapping's source elements in order (`H5D__virtual_read`,
+    /// H5Dvirtual.c), each in the stored image of the virtual dataset's
+    /// datatype ([`read_source_box_into`](Self::read_source_box_into)), the
+    /// image every other layout's read leaves before the wrappers convert
+    /// it once. `out` must already be pre-filled with the tiled fill
     /// value — every element no mapping covers is left exactly as the
     /// caller filled it. Mappings apply in list order, so a later mapping's
     /// bytes win over an earlier one's on overlap, exactly like the C
@@ -5446,7 +5450,8 @@ impl Hdf5Reader {
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
+        let datatype = info.datatype.clone();
+        let element_size = datatype.element_size() as u64;
         let Some(mappings) = info.virtual_mappings.clone() else {
             // No mapping list written yet: every element is unmapped, and
             // `out` is already the fill value the caller pre-filled it with.
@@ -5482,12 +5487,13 @@ impl Hdf5Reader {
                 // so this open holds nothing past the mapping — dropping the
                 // token is what that close does.
                 self.apply_dataset_access(source_name, &access)?;
-                let Some(src_dims) = self
+                let Some((src_dims, src_type)) = self
                     .dataset_info(source_name)
-                    .map(|i| i.dataspace.dims.clone())
+                    .map(|i| (i.dataspace.dims.clone(), i.datatype.clone()))
                 else {
                     continue;
                 };
+                let cast = Conversion::between(&src_type, &datatype)?;
                 let source_sel = mapping.source_selection.resolve(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
@@ -5495,18 +5501,9 @@ impl Hdf5Reader {
                     ))
                 })?;
                 copy_matched_selections(
-                    |s, c, buf| {
-                        // `buf` is `copy_matched_selections`' fresh per-box
-                        // buffer, never the virtual dataset's own `out`.
-                        self.read_slice_into_unconverted(
-                            source_name,
-                            s,
-                            c,
-                            buf,
-                            depth + 1,
-                            ReadDst::Fresh,
-                        )
-                    },
+                    // `buf` is `copy_matched_selections`' fresh per-box
+                    // buffer, never the virtual dataset's own `out`.
+                    |s, c, buf| self.read_source_box_into(source_name, s, c, cast, buf, depth + 1),
                     &source_sel,
                     &virtual_sel,
                     element_size,
@@ -5518,12 +5515,13 @@ impl Hdf5Reader {
                     continue;
                 };
                 src_reader.apply_dataset_access(source_name, &access)?;
-                let Some(src_dims) = src_reader
+                let Some((src_dims, src_type)) = src_reader
                     .dataset_info(source_name)
-                    .map(|i| i.dataspace.dims.clone())
+                    .map(|i| (i.dataspace.dims.clone(), i.datatype.clone()))
                 else {
                     continue;
                 };
+                let cast = Conversion::between(&src_type, &datatype)?;
                 let source_sel = mapping.source_selection.resolve(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
@@ -5531,16 +5529,9 @@ impl Hdf5Reader {
                     ))
                 })?;
                 copy_matched_selections(
+                    // As above: `buf` is a fresh per-box buffer.
                     |s, c, buf| {
-                        // As above: `buf` is a fresh per-box buffer.
-                        src_reader.read_slice_into_unconverted(
-                            source_name,
-                            s,
-                            c,
-                            buf,
-                            depth + 1,
-                            ReadDst::Fresh,
-                        )
+                        src_reader.read_source_box_into(source_name, s, c, cast, buf, depth + 1)
                     },
                     &source_sel,
                     &virtual_sel,
@@ -5550,6 +5541,36 @@ impl Hdf5Reader {
             }
         }
         Ok(())
+    }
+
+    /// Fill `out` with the box `starts`/`counts` of the virtual source
+    /// `name`, as the stored image of the virtual dataset's datatype: the
+    /// source's own stored image, converted by `cast` when the source's
+    /// datatype is another (`H5D__virtual_read_one` reads every source
+    /// through `H5T_convert`).
+    fn read_source_box_into(
+        &mut self,
+        name: &str,
+        starts: &[u64],
+        counts: &[u64],
+        cast: Option<Conversion>,
+        out: &mut [u8],
+        depth: usize,
+    ) -> IoResult<()> {
+        let Some(cast) = cast else {
+            return self.read_slice_into_unconverted(
+                name,
+                starts,
+                counts,
+                out,
+                depth,
+                ReadDst::Fresh,
+            );
+        };
+        let (_, stored_len) = self.slice_size_and_datatype(name, starts, counts)?;
+        let mut stored = alloc_tiled_fill(stored_len as usize, None)?;
+        self.read_slice_into_unconverted(name, starts, counts, &mut stored, depth, ReadDst::Fresh)?;
+        Ok(cast.apply(&stored, out)?)
     }
 
     /// Apply the post-filter datatype conversion (libhdf5's `H5T_convert`

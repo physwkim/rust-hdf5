@@ -8,6 +8,9 @@ pub enum Hdf5Error {
     /// A low-level format encoding/decoding error.
     Format(crate::format::FormatError),
     /// An I/O-layer error from hdf5-io.
+    ///
+    /// No longer produced: every I/O-layer error now arrives as the variant
+    /// of the same name. Kept for 0.7.x compatibility; removed in 0.8.
     IoLayer(crate::io::IoError),
     /// A requested object (dataset, group, attribute) was not found.
     ///
@@ -62,18 +65,20 @@ impl From<crate::format::selection::HyperslabError> for Hdf5Error {
 
 impl From<crate::io::IoError> for Hdf5Error {
     fn from(e: crate::io::IoError) -> Self {
-        // Every outcome that names *why* a lookup failed carries through as
-        // itself so a caller can match on it; everything else keeps its
-        // existing shape. `NotFound` is among them: a `?` on an I/O-layer
-        // lookup must not turn a plain absence into an opaque `IoLayer`,
-        // which is what forced callers to re-map it by hand.
+        // Every I/O-layer outcome carries through as its public twin, so a
+        // caller can match on why a call failed — a torn SWMR read is
+        // `Format(ChecksumMismatch)` — without the crate-private `IoError`.
+        // No catch-all: a new `IoError` variant must name its public form
+        // here rather than fall into an opaque `IoLayer`.
+        use crate::io::IoError;
         match e {
-            crate::io::IoError::NotFound(s) => Self::NotFound(s),
-            crate::io::IoError::Unsupported(s) => Self::Unsupported(s),
-            crate::io::IoError::DanglingLink { link, target } => {
-                Self::DanglingLink { link, target }
-            }
-            crate::io::IoError::ExternalFileNotFound {
+            IoError::Io(e) => Self::Io(e),
+            IoError::Format(e) => Self::Format(e),
+            IoError::NotFound(s) => Self::NotFound(s),
+            IoError::InvalidState(s) => Self::InvalidState(s),
+            IoError::Unsupported(s) => Self::Unsupported(s),
+            IoError::DanglingLink { link, target } => Self::DanglingLink { link, target },
+            IoError::ExternalFileNotFound {
                 link,
                 file,
                 searched,
@@ -82,7 +87,6 @@ impl From<crate::io::IoError> for Hdf5Error {
                 file,
                 searched,
             },
-            other => Self::IoLayer(other),
         }
     }
 }
@@ -146,6 +150,36 @@ mod tests {
     fn display_type_mismatch() {
         let err = Hdf5Error::TypeMismatch("expected f64, got u8".into());
         assert!(format!("{}", err).contains("expected f64, got u8"));
+    }
+
+    /// The I/O-layer outcomes that used to fall into `IoLayer` reach the
+    /// caller as the public variant of the same name.
+    #[test]
+    fn io_layer_errors_carry_through_as_their_public_variant() {
+        use crate::format::FormatError;
+        use crate::io::IoError;
+
+        let mismatch = IoError::Format(FormatError::ChecksumMismatch {
+            expected: 1,
+            computed: 2,
+        });
+        assert!(matches!(
+            Hdf5Error::from(mismatch),
+            Hdf5Error::Format(FormatError::ChecksumMismatch {
+                expected: 1,
+                computed: 2
+            })
+        ));
+        let eof = IoError::Io(std::io::ErrorKind::UnexpectedEof.into());
+        assert!(matches!(
+            Hdf5Error::from(eof),
+            Hdf5Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        let state = IoError::InvalidState("short buffer".into());
+        assert!(matches!(
+            Hdf5Error::from(state),
+            Hdf5Error::InvalidState(s) if s == "short buffer"
+        ));
     }
 
     #[test]

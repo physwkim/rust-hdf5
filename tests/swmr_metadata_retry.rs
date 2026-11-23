@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use rust_hdf5::format::FormatError;
 use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
-use rust_hdf5::FileLocking;
+use rust_hdf5::{FileLocking, Hdf5Error};
 
 fn tmp(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -189,6 +190,34 @@ fn a_torn_chunk_index_block_is_read_again_until_it_checks() {
     assert_eq!(
         r.read_chunk_raw("frames", &[2, 0]).unwrap(),
         Some((vec![2u8; 4], 0))
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A torn image that outlasts the attempts is `Format(ChecksumMismatch)`
+/// through the public reads, so a caller can tell it from other failures
+/// without the crate-private I/O-layer error or its text.
+#[test]
+fn a_torn_image_is_a_checksum_mismatch_through_the_public_reads() {
+    let path = tmp("variant");
+    stream(&path);
+    let mut r = SwmrFileReader::open_with_locking(&path, FileLocking::Disabled).unwrap();
+    r.set_metadata_read_attempts(attempts(2));
+    let bytes = std::fs::read(&path).unwrap();
+    let eaib = bytes.windows(4).position(|w| w == b"EAIB").unwrap() as u64;
+    flip(&path, eaib + 14);
+    let err = r.read_slice::<u8>("frames", &[0, 0], &[1, 4]).unwrap_err();
+    assert!(
+        matches!(err, Hdf5Error::Format(FormatError::ChecksumMismatch { .. })),
+        "{err:?}"
+    );
+    flip(&path, eaib + 14);
+
+    flip(&path, superblock_checksum_at(&path));
+    let err = r.refresh().unwrap_err();
+    assert!(
+        matches!(err, Hdf5Error::Format(FormatError::ChecksumMismatch { .. })),
+        "{err:?}"
     );
     let _ = std::fs::remove_file(&path);
 }

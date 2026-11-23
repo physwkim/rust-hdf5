@@ -655,19 +655,25 @@ pub(crate) fn nbit_decoded_len(cd_values: &[u32]) -> Option<usize> {
 /// the header must be present and the count must match (#6497), and the
 /// walkers above refuse a tree that outruns the list or the buffer.
 pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResult<Vec<u8>> {
-    if cd_values.len() < NBIT_HEADER_NPARMS {
-        return Err(FormatError::InvalidData("nbit: cd_values too short".into()));
-    }
-    if cd_values[0] as usize != cd_values.len() {
+    let too_short = || FormatError::InvalidData("nbit: cd_values too short".into());
+    let &[count, need_not_compress, ..] = cd_values else {
+        return Err(too_short());
+    };
+    if count as usize != cd_values.len() {
         return Err(FormatError::InvalidData(format!(
-            "nbit: cd_values[0] names {} parameters but {} are stored",
-            cd_values[0],
+            "nbit: cd_values[0] names {count} parameters but {} are stored",
             cd_values.len()
         )));
     }
-    // cd_values[1] != 0 -> data is full-precision, filter is a pass-through.
-    if cd_values[1] != 0 {
+    // A pass-through is decided before the datatype is read: for a class it
+    // does not pack (an enum, a bit field, a string) `H5Z__set_local_nbit`
+    // stores no datatype parameters at all, only the count, this flag and
+    // the element count.
+    if need_not_compress != 0 {
         return Ok(data.to_vec());
+    }
+    if cd_values.len() < NBIT_HEADER_NPARMS {
+        return Err(too_short());
     }
 
     let d_nelmts = cd_values[2] as usize;
@@ -1459,10 +1465,10 @@ fn postdecompress_float<T: SoFloat, const N: usize>(
 }
 
 // ===========================================================================
-//  Post-filter datatype conversion (H5T_convert equivalent)
+//  Datatype conversion (H5T_convert equivalent)
 // ===========================================================================
 
-use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+use crate::format::messages::datatype::{ByteOrder, DatatypeMessage, IeeeFormat};
 
 /// True if `dt` is a floating-point type whose bit layout is an IEEE 754
 /// interchange format — the only float layouts that can be reinterpreted in
@@ -1471,143 +1477,393 @@ fn is_standard_ieee_float(dt: &DatatypeMessage) -> bool {
     dt.ieee_format().is_some()
 }
 
-/// True if the filter-pipeline / on-disk output for `dt` needs a post-filter
-/// datatype conversion before the element values are usable.
-///
-/// For a `FixedPoint` datatype the filter pipeline output (or contiguous
-/// on-disk bytes) carries the significant value in `bit_precision` bits
-/// starting at `bit_offset`, with the rest zero-filled and the sign bit NOT
-/// extended. libhdf5 fixes this up with a datatype conversion
-/// (`H5T_convert`) after the filter pipeline; this returns true for any
-/// such non-trivial layout.
-///
-/// It also returns true for a non-standard `FloatingPoint` layout, so the
-/// caller routes it through [`apply_datatype_conversion`], which then
-/// returns a clear error rather than silently yielding wrong data.
-pub fn datatype_needs_bit_conversion(dt: &DatatypeMessage) -> bool {
-    match dt {
-        DatatypeMessage::FixedPoint {
+/// The bit layout of an integer-valued atomic datatype: a fixed-point
+/// integer or a bit field. libhdf5 converts both to a native type by moving
+/// the `precision` significant bits at `offset` down to bit 0, then filling
+/// the bits above them — with the sign bit for a signed integer
+/// (`H5T__conv_i_i`), with zeros for an unsigned one or a bit field, which
+/// has no sign (`H5T__conv_b_b`). An enum's values are its base's, which is
+/// how libhdf5 converts one to a number (`H5T__conv_enum_numeric`).
+#[derive(Clone, Copy)]
+pub(crate) struct IntLayout {
+    pub size: usize,
+    pub byte_order: ByteOrder,
+    pub signed: bool,
+    pub offset: usize,
+    pub precision: usize,
+}
+
+impl IntLayout {
+    /// `dt`'s layout, or `None` when `dt` is not a fixed-point integer, a
+    /// bit field or an enum over one.
+    pub(crate) fn of(dt: &DatatypeMessage) -> Option<Self> {
+        let (size, byte_order, signed, offset, precision) = match *dt {
+            DatatypeMessage::Enum { ref base, .. } => return Self::of(base),
+            DatatypeMessage::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                bit_offset,
+                bit_precision,
+            } => (size, byte_order, signed, bit_offset, bit_precision),
+            DatatypeMessage::BitField {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+            } => (size, byte_order, false, bit_offset, bit_precision),
+            _ => return None,
+        };
+        Some(Self {
+            size: size as usize,
+            byte_order,
+            signed,
+            offset: usize::from(offset),
+            precision: usize::from(precision),
+        })
+    }
+
+    /// The significant bits fill the element, so it is already its value.
+    fn is_whole(self) -> bool {
+        self.offset == 0 && self.precision == self.size * 8
+    }
+
+    fn whole(self) -> Self {
+        Self {
+            offset: 0,
+            precision: self.size * 8,
+            ..self
+        }
+    }
+
+    /// This layout, if [`decode`](Self::decode) and
+    /// [`encode`](Self::encode) can address it.
+    fn checked(self) -> FormatResult<Self> {
+        let Self {
             size,
-            bit_offset,
-            bit_precision,
+            offset,
+            precision,
             ..
-        } => *bit_offset != 0 || (*bit_precision as u32) < *size * 8,
-        DatatypeMessage::FloatingPoint { .. } => !is_standard_ieee_float(dt),
-        _ => false,
+        } = self;
+        if size == 0 || size > 8 {
+            return Err(FormatError::InvalidData(format!(
+                "datatype conversion: unsupported integer size {size}"
+            )));
+        }
+        if precision == 0 || offset + precision > size * 8 {
+            return Err(FormatError::InvalidData(format!(
+                "datatype conversion: invalid bit layout (offset {offset}, \
+                 precision {precision}, size {size})"
+            )));
+        }
+        Ok(self)
+    }
+
+    fn mask(self) -> u64 {
+        u64::MAX >> (64 - self.precision)
+    }
+
+    /// The least and greatest value the significant bits hold.
+    fn bounds(self) -> (i128, i128) {
+        let p = self.precision as u32;
+        if self.signed {
+            (-(1i128 << (p - 1)), (1i128 << (p - 1)) - 1)
+        } else {
+            (0, (1i128 << p) - 1)
+        }
+    }
+
+    /// The value of the element `e`: its significant bits, sign-extended
+    /// from the precision when signed.
+    fn decode(self, e: &[u8]) -> i128 {
+        let load = |raw: u64, &b: &u8| (raw << 8) | u64::from(b);
+        let raw = match self.byte_order {
+            ByteOrder::LittleEndian => e.iter().rev().fold(0, load),
+            ByteOrder::BigEndian => e.iter().fold(0, load),
+        };
+        let bits = (raw >> self.offset) & self.mask();
+        let p = self.precision as u32;
+        if self.signed && bits >> (p - 1) == 1 {
+            i128::from(bits) - (1i128 << p)
+        } else {
+            i128::from(bits)
+        }
+    }
+
+    /// Store the low `precision` bits of `v` as the significant bits of the
+    /// element `e`, the bits outside them zero.
+    fn store(self, v: i128, e: &mut [u8]) {
+        let bits = ((v as u64) & self.mask()) << self.offset;
+        let le = bits.to_le_bytes();
+        e.copy_from_slice(&le[..self.size]);
+        if self.byte_order == ByteOrder::BigEndian {
+            e.reverse();
+        }
     }
 }
 
-/// Apply the post-filter datatype conversion in place to a fully-decoded
-/// output buffer.
-///
-/// This mirrors libhdf5's `H5T_convert` step that runs AFTER the filter
-/// pipeline. For a `FixedPoint` datatype with `bit_offset != 0` or
-/// `bit_precision < size*8`, each `size`-byte element is rewritten so the
-/// significant value occupies the whole element with bit offset 0:
-///
-///   1. interpret the element as an unsigned integer (respecting byte order),
-///   2. shift right by `bit_offset`,
-///   3. mask to `bit_precision` low bits,
-///   4. sign-extend from bit `bit_precision-1` if the type is signed,
-///   5. write the result back in the same byte order.
-///
-/// It is a strict no-op for ordinary full-width datatypes (and for any
-/// non-`FixedPoint` class).
-///
-/// For `FloatingPoint` types with a non-standard bit layout that cannot be
-/// faithfully reinterpreted, an error is returned rather than wrong data.
-pub fn apply_datatype_conversion(buffer: &mut [u8], dt: &DatatypeMessage) -> FormatResult<()> {
-    match dt {
-        DatatypeMessage::FixedPoint {
-            size,
+/// How a numeric datatype lays out an element's value.
+#[derive(Clone, Copy)]
+enum Element {
+    /// A fixed-point integer, or an enum over one.
+    Int(IntLayout),
+    /// A bit field.
+    Bits(IntLayout),
+    /// IEEE binary32 (`binary64: false`) or binary64.
+    Float {
+        binary64: bool,
+        byte_order: ByteOrder,
+    },
+}
+
+/// An element's value between its decode and its encode: an integer of up to
+/// 64 bits, or a float, held without loss either way.
+#[derive(Clone, Copy)]
+enum Value {
+    Int(i128),
+    Float(f64),
+}
+
+impl Element {
+    /// `dt`'s layout, or `None` when `dt` is not numeric.
+    fn of(dt: &DatatypeMessage) -> FormatResult<Option<Self>> {
+        if let Some(layout) = IntLayout::of(dt) {
+            let layout = layout.checked()?;
+            return Ok(Some(match dt {
+                DatatypeMessage::BitField { .. } => Self::Bits(layout),
+                _ => Self::Int(layout),
+            }));
+        }
+        let DatatypeMessage::FloatingPoint { byte_order, .. } = *dt else {
+            return Ok(None);
+        };
+        let binary64 = match dt.ieee_format() {
+            Some(IeeeFormat::Binary32) => false,
+            Some(IeeeFormat::Binary64) => true,
+            Some(IeeeFormat::Binary16) => {
+                return Err(FormatError::UnsupportedFeature(format!(
+                    "datatype conversion: converting binary16 datatype '{dt}' to \
+                     another datatype"
+                )));
+            }
+            None => return Err(non_ieee_float()),
+        };
+        Ok(Some(Self::Float {
+            binary64,
             byte_order,
-            signed,
-            bit_offset,
-            bit_precision,
-        } => {
-            let size = *size as usize;
-            let precision = *bit_precision as usize;
-            let offset = *bit_offset as usize;
+        }))
+    }
 
-            // Full-width plain integer: nothing to do.
-            if offset == 0 && precision == size * 8 {
-                return Ok(());
-            }
-            if size == 0 || size > 8 {
-                return Err(FormatError::InvalidData(format!(
-                    "datatype conversion: unsupported FixedPoint size {size}"
-                )));
-            }
-            if precision == 0 || offset + precision > size * 8 {
-                return Err(FormatError::InvalidData(format!(
-                    "datatype conversion: invalid bit layout (offset {offset}, \
-                     precision {precision}, size {size})"
-                )));
-            }
-            if !buffer.len().is_multiple_of(size) {
-                return Err(FormatError::InvalidData(format!(
-                    "datatype conversion: buffer length {} not a multiple of \
-                     element size {size}",
-                    buffer.len()
-                )));
-            }
-
-            let big_endian = matches!(byte_order, ByteOrder::BigEndian);
-            let precision_mask: u64 = if precision == 64 {
-                u64::MAX
-            } else {
-                (1u64 << precision) - 1
-            };
-            let sign_bit: u64 = 1u64 << (precision - 1);
-
-            for elem in buffer.chunks_exact_mut(size) {
-                // Load element as a u64 in native value space.
-                let mut raw: u64 = 0;
-                if big_endian {
-                    for &b in elem.iter() {
-                        raw = (raw << 8) | b as u64;
-                    }
-                } else {
-                    for (i, &b) in elem.iter().enumerate() {
-                        raw |= (b as u64) << (8 * i);
-                    }
-                }
-
-                // Extract the significant bits.
-                let mut value = (raw >> offset) & precision_mask;
-
-                // Sign-extend from bit `precision-1` when signed.
-                if *signed && (value & sign_bit) != 0 {
-                    value |= !precision_mask;
-                }
-
-                // Store back in the same byte order, full element width.
-                if big_endian {
-                    for i in 0..size {
-                        elem[size - 1 - i] = (value >> (8 * i)) as u8;
-                    }
-                } else {
-                    for (i, b) in elem.iter_mut().enumerate() {
-                        *b = (value >> (8 * i)) as u8;
-                    }
-                }
-            }
-            Ok(())
+    /// This element with its value filling it: what the post-filter
+    /// conversion leaves.
+    fn whole(self) -> Self {
+        match self {
+            Self::Int(layout) => Self::Int(layout.whole()),
+            Self::Bits(layout) => Self::Bits(layout.whole()),
+            float => float,
         }
-        DatatypeMessage::FloatingPoint { .. } => {
-            // Standard IEEE-754 layouts need no conversion. Anything else
-            // cannot be faithfully reinterpreted here.
-            if is_standard_ieee_float(dt) {
-                Ok(())
-            } else {
-                Err(FormatError::InvalidData(
-                    "datatype conversion: non-standard floating-point bit \
-                     layout cannot be converted"
-                        .into(),
+    }
+
+    fn size(self) -> usize {
+        match self {
+            Self::Int(layout) | Self::Bits(layout) => layout.size,
+            Self::Float { binary64, .. } => 4 << usize::from(binary64),
+        }
+    }
+
+    fn decode(self, e: &[u8]) -> Value {
+        match self {
+            Self::Int(layout) | Self::Bits(layout) => Value::Int(layout.decode(e)),
+            Self::Float {
+                binary64,
+                byte_order,
+            } => {
+                let mut le = [0u8; 8];
+                le[..e.len()].copy_from_slice(e);
+                if byte_order == ByteOrder::BigEndian {
+                    le[..e.len()].reverse();
+                }
+                Value::Float(if binary64 {
+                    f64::from_le_bytes(le)
+                } else {
+                    f64::from(f32::from_le_bytes([le[0], le[1], le[2], le[3]]))
+                })
+            }
+        }
+    }
+
+    /// Store `v` in the element `e`. An integer out of range clamps to it
+    /// (`H5T__conv_i_i`); a float becomes an integer truncated toward zero,
+    /// clamped, NaN as 0 (`H5T__conv_f_i`); a bit field keeps the low bits
+    /// it has room for (`H5T__conv_b_b`); an integer or a binary64 becomes a
+    /// binary32 rounded once, to nearest even.
+    fn encode(self, v: Value, e: &mut [u8]) {
+        let int = match v {
+            Value::Int(i) => i,
+            Value::Float(f) => f as i128,
+        };
+        match self {
+            Self::Int(layout) => {
+                let (lo, hi) = layout.bounds();
+                layout.store(int.clamp(lo, hi), e);
+            }
+            Self::Bits(layout) => layout.store(int, e),
+            Self::Float {
+                binary64,
+                byte_order,
+            } => {
+                let le = if binary64 {
+                    match v {
+                        Value::Int(i) => i as f64,
+                        Value::Float(f) => f,
+                    }
+                    .to_le_bytes()
+                } else {
+                    let f = match v {
+                        Value::Int(i) => i as f32,
+                        Value::Float(f) => f as f32,
+                    };
+                    let mut le = [0u8; 8];
+                    le[..4].copy_from_slice(&f.to_le_bytes());
+                    le
+                };
+                e.copy_from_slice(&le[..e.len()]);
+                if byte_order == ByteOrder::BigEndian {
+                    e.reverse();
+                }
+            }
+        }
+    }
+}
+
+fn non_ieee_float() -> FormatError {
+    FormatError::InvalidData(
+        "datatype conversion: non-standard floating-point bit layout cannot be converted".into(),
+    )
+}
+
+/// libhdf5's `H5T_convert` of numeric elements from one datatype's stored
+/// image to another's, one element at a time through its value.
+///
+/// It runs at two points. A read turns the stored image of a dataset's
+/// datatype into the values of it ([`unpack`](Self::unpack), the
+/// post-filter conversion), and a virtual dataset turns each source's
+/// stored image into one of its own datatype ([`between`](Self::between))
+/// before the read unpacks it.
+#[derive(Clone, Copy)]
+pub(crate) struct Conversion {
+    from: Element,
+    to: Element,
+}
+
+impl Conversion {
+    /// From the stored image of `dt` to its values, or `None` when the
+    /// stored image already is the values: an integer's significant bits
+    /// move to bit 0 and fill the element ([`IntLayout`]). A float other
+    /// than an IEEE 754 interchange format cannot be converted.
+    pub(crate) fn unpack(dt: &DatatypeMessage) -> FormatResult<Option<Self>> {
+        match dt {
+            DatatypeMessage::FloatingPoint { .. } if !is_standard_ieee_float(dt) => {
+                Err(non_ieee_float())
+            }
+            _ if IntLayout::of(dt).is_some_and(|layout| !layout.is_whole()) => Ok(Element::of(dt)?
+                .map(|from| Self {
+                    from,
+                    to: from.whole(),
+                })),
+            _ => Ok(None),
+        }
+    }
+
+    /// From the stored image of `from` to that of `to`, or `None` when the
+    /// two are the same datatype. Only the class pairs libhdf5 registers a
+    /// conversion for (H5T.c:1137-1150) convert: an integer, an enum or a
+    /// float to an integer or a float, a bit field to a bit field. An enum
+    /// converts to another enum by member name (`H5T__conv_enum`), which is
+    /// not implemented, and binary16 has no encoder here.
+    pub(crate) fn between(
+        from: &DatatypeMessage,
+        to: &DatatypeMessage,
+    ) -> FormatResult<Option<Self>> {
+        use DatatypeMessage::{BitField, Enum, FixedPoint, FloatingPoint};
+        if from == to {
+            return Ok(None);
+        }
+        let paired = matches!(
+            (from, to),
+            (
+                FixedPoint { .. } | Enum { .. } | FloatingPoint { .. },
+                FixedPoint { .. } | FloatingPoint { .. }
+            ) | (BitField { .. }, BitField { .. })
+        );
+        let element = |dt: &DatatypeMessage| {
+            Element::of(dt)?.filter(|_| paired).ok_or_else(|| {
+                FormatError::UnsupportedFeature(format!(
+                    "datatype conversion: no conversion from '{from}' to '{to}'"
                 ))
-            }
+            })
+        };
+        Ok(Some(Self {
+            from: element(from)?,
+            to: element(to)?,
+        }))
+    }
+
+    /// Convert the elements of `src` into `dst`, which holds as many.
+    pub(crate) fn apply(self, src: &[u8], dst: &mut [u8]) -> FormatResult<()> {
+        let (n, m) = (self.from.size(), self.to.size());
+        if !src.len().is_multiple_of(n) || dst.len() != src.len() / n * m {
+            return Err(FormatError::InvalidData(format!(
+                "datatype conversion: {} bytes of {n}-byte elements do not fill {} bytes \
+                 of {m}-byte ones",
+                src.len(),
+                dst.len()
+            )));
         }
-        _ => Ok(()),
+        for (s, d) in src.chunks_exact(n).zip(dst.chunks_exact_mut(m)) {
+            self.to.encode(self.from.decode(s), d);
+        }
+        Ok(())
+    }
+
+    /// [`apply`](Self::apply) with `buffer` as both, for a conversion
+    /// between elements of one size.
+    fn apply_in_place(self, buffer: &mut [u8]) -> FormatResult<()> {
+        let n = self.from.size();
+        if self.to.size() != n || !buffer.len().is_multiple_of(n) {
+            return Err(FormatError::InvalidData(format!(
+                "datatype conversion: buffer length {} not a multiple of \
+                 element size {n}",
+                buffer.len()
+            )));
+        }
+        for e in buffer.chunks_exact_mut(n) {
+            self.to.encode(self.from.decode(e), e);
+        }
+        Ok(())
+    }
+}
+
+/// True if the filter-pipeline / on-disk output for `dt` needs a post-filter
+/// datatype conversion before the element values are usable: an integer
+/// whose significant bits do not fill its element, or a float that is not
+/// an IEEE 754 interchange format, for which [`apply_datatype_conversion`]
+/// then returns a clear error rather than silently yielding wrong data.
+pub fn datatype_needs_bit_conversion(dt: &DatatypeMessage) -> bool {
+    !matches!(Conversion::unpack(dt), Ok(None))
+}
+
+/// Apply the post-filter datatype conversion in place to a fully-decoded
+/// output buffer: libhdf5's `H5T_convert` step that runs after the filter
+/// pipeline. Each integer element whose significant bits do not fill it is
+/// rewritten, in its own byte order, as their value (shifted down by the bit
+/// offset, masked to the precision, sign-extended when signed). It is a
+/// strict no-op for full-width integers, IEEE floats and any other class; a
+/// float with any other bit layout is an error rather than wrong data.
+pub fn apply_datatype_conversion(buffer: &mut [u8], dt: &DatatypeMessage) -> FormatResult<()> {
+    match Conversion::unpack(dt)? {
+        Some(conversion) => conversion.apply_in_place(buffer),
+        None => Ok(()),
     }
 }
 
@@ -1705,6 +1961,19 @@ mod tests {
             Ok(out) => panic!("accepted {cd:?}: {} bytes out", out.len()),
             Err(e) => e.to_string(),
         }
+    }
+
+    /// `H5Z__set_local_nbit`'s list for a top-level enum, bit field or other
+    /// class it does not pack: count, pass-through flag, element count.
+    #[test]
+    fn a_pass_through_list_without_a_datatype_is_the_data() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        for compress in [false, true] {
+            assert_eq!(apply_nbit(&data, &[3, 1, 4], compress).unwrap(), data);
+        }
+        assert_eq!(nbit_decoded_len(&[3, 1, 4]), None);
+        let err = refusal(&data, &[1], false);
+        assert!(err.contains("cd_values too short"), "{err}");
     }
 
     #[test]
@@ -1895,6 +2164,31 @@ mod tests {
         }
     }
 
+    fn bits(size: u32, offset: u16, precision: u16) -> DatatypeMessage {
+        DatatypeMessage::BitField {
+            size,
+            byte_order: ByteOrder::LittleEndian,
+            bit_offset: offset,
+            bit_precision: precision,
+        }
+    }
+
+    #[test]
+    fn conversion_noop_for_whole_bit_field() {
+        assert!(!datatype_needs_bit_conversion(&bits(2, 0, 16)));
+    }
+
+    #[test]
+    fn conversion_bit_field_shifts_and_zero_extends() {
+        // A bit field has no sign: its top significant bit set still fills
+        // the bits above with zeros, as `H5T__conv_b_b` does.
+        let dt = bits(2, 4, 12);
+        assert!(datatype_needs_bit_conversion(&dt));
+        let mut buf = (0xFFF0u16).to_le_bytes().to_vec();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x0FFF);
+    }
+
     #[test]
     fn conversion_rejects_non_standard_float() {
         // A float with a non-IEEE bit layout must error, not corrupt data.
@@ -1930,5 +2224,173 @@ mod tests {
         let dt = fixed(4, false, 3, 16);
         let mut buf = vec![0u8; 5]; // not a multiple of 4
         assert!(apply_datatype_conversion(&mut buf, &dt).is_err());
+    }
+
+    fn big_endian(mut dt: DatatypeMessage) -> DatatypeMessage {
+        if let DatatypeMessage::FixedPoint { byte_order, .. }
+        | DatatypeMessage::FloatingPoint { byte_order, .. } = &mut dt
+        {
+            *byte_order = ByteOrder::BigEndian;
+        }
+        dt
+    }
+
+    /// `src`, elements of `from`, converted into elements of `to`.
+    fn between(from: &DatatypeMessage, to: &DatatypeMessage, src: &[u8]) -> Vec<u8> {
+        let conversion = Conversion::between(from, to).unwrap().unwrap();
+        let n = src.len() / from.element_size() as usize;
+        let mut dst = vec![0xA5; n * to.element_size() as usize];
+        conversion.apply(src, &mut dst).unwrap();
+        dst
+    }
+
+    /// The stored image of `values`, each element written by `bytes`.
+    fn elements<const N: usize, T>(values: &[T], bytes: impl Fn(&T) -> [u8; N]) -> Vec<u8> {
+        values.iter().flat_map(bytes).collect()
+    }
+
+    // Expected values below are libhdf5's `H5Tconvert` of the same input.
+
+    #[test]
+    fn between_clamps_an_integer_into_a_narrower_one() {
+        let src = elements(&[-40000i32, -5, 40000], |v| v.to_le_bytes());
+        let dst = between(
+            &DatatypeMessage::i32_type(),
+            &DatatypeMessage::i16_type(),
+            &src,
+        );
+        assert_eq!(dst, elements(&[-32768i16, -5, 32767], |v| v.to_le_bytes()));
+        let src = elements(&[300u16, 65535, 5], |v| v.to_le_bytes());
+        let dst = between(&DatatypeMessage::u16_type(), &fixed(1, true, 0, 8), &src);
+        assert_eq!(dst, [127, 127, 5]);
+    }
+
+    #[test]
+    fn between_repacks_reduced_precision_across_byte_order_and_sign() {
+        // Signed 11 bits at offset 5, big-endian: -1 and 1023.
+        let from = big_endian(fixed(2, true, 5, 11));
+        let src = [0xFF, 0xE0, 0x7F, 0xE0];
+        // Unsigned 12 bits at offset 4: -1 clamps to 0.
+        let dst = between(&from, &fixed(2, false, 4, 12), &src);
+        assert_eq!(dst, [0x00, 0x00, 0xF0, 0x3F]);
+    }
+
+    #[test]
+    fn between_keeps_the_low_bits_of_a_bit_field() {
+        let src = elements(&[0x1234u16, 0x12], |v| v.to_le_bytes());
+        assert_eq!(between(&bits(2, 0, 16), &bits(1, 0, 8), &src), [0x34, 0x12]);
+        assert_eq!(
+            between(&bits(1, 0, 8), &bits(2, 4, 12), &[0xAB]),
+            [0xB0, 0x0A]
+        );
+    }
+
+    #[test]
+    fn between_converts_an_enum_through_its_base() {
+        let base = big_endian(fixed(2, true, 3, 12));
+        // -2048 and 2047 in 12 bits at offset 3.
+        let members = [("lo", [0x40, 0x00]), ("hi", [0x3F, 0xF8])]
+            .map(
+                |(name, value)| crate::format::messages::datatype::EnumMember {
+                    name: name.into(),
+                    value: value.to_vec(),
+                },
+            )
+            .to_vec();
+        let e = DatatypeMessage::enumeration(base, members);
+        let src = [0x40, 0x00, 0x3F, 0xF8];
+        let dst = between(&e, &DatatypeMessage::i16_type(), &src);
+        assert_eq!(dst, elements(&[-2048i16, 2047], |v| v.to_le_bytes()));
+        let dst = between(&e, &DatatypeMessage::f64_type(), &src);
+        assert_eq!(dst, elements(&[-2048f64, 2047.0], |v| v.to_le_bytes()));
+    }
+
+    #[test]
+    fn between_rounds_into_binary32_once() {
+        // 3.4028235e38 rounds to f32::MAX, past it to +inf.
+        let src = elements(&[3.4028235e38f64, 1e39, 0.1], |v| v.to_be_bytes());
+        let dst = between(
+            &big_endian(DatatypeMessage::f64_type()),
+            &DatatypeMessage::f32_type(),
+            &src,
+        );
+        assert_eq!(
+            dst,
+            elements(&[f32::MAX, f32::INFINITY, 0.1], |v| v.to_le_bytes())
+        );
+        let src = elements(&[16_777_217i32, 16_777_219], |v| v.to_le_bytes());
+        let dst = between(
+            &DatatypeMessage::i32_type(),
+            &DatatypeMessage::f32_type(),
+            &src,
+        );
+        assert_eq!(
+            dst,
+            elements(&[16_777_216f32, 16_777_220.0], |v| v.to_le_bytes())
+        );
+        // Not via binary64, which would round to 2^60 + 2^36, a tie, then to 2^60.
+        let src = ((1i64 << 60) + (1 << 36) + 1).to_le_bytes();
+        let dst = between(
+            &DatatypeMessage::i64_type(),
+            &DatatypeMessage::f32_type(),
+            &src,
+        );
+        assert_eq!(dst, (((1i64 << 60) + (1 << 37)) as f32).to_le_bytes());
+    }
+
+    #[test]
+    fn between_truncates_a_float_into_an_integer() {
+        let src = elements(
+            &[f64::NAN, -2.7, 2.7, 1e10, -1e10, f64::INFINITY, -0.0],
+            |v| v.to_le_bytes(),
+        );
+        let dst = between(
+            &DatatypeMessage::f64_type(),
+            &DatatypeMessage::i16_type(),
+            &src,
+        );
+        assert_eq!(
+            dst,
+            elements(&[0i16, -2, 2, 32767, -32768, 32767, 0], |v| v.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn between_the_same_datatype_is_no_conversion() {
+        for dt in [
+            DatatypeMessage::f16_type(),
+            fixed(2, true, 3, 12),
+            DatatypeMessage::fixed_string(4),
+        ] {
+            assert!(Conversion::between(&dt, &dt).unwrap().is_none(), "{dt}");
+        }
+    }
+
+    #[test]
+    fn between_refuses_a_pair_libhdf5_has_no_conversion_for() {
+        let member = |value: u8| crate::format::messages::datatype::EnumMember {
+            name: "m".into(),
+            value: vec![value],
+        };
+        let e0 = DatatypeMessage::enumeration(DatatypeMessage::u8_type(), vec![member(0)]);
+        let e1 = DatatypeMessage::enumeration(DatatypeMessage::u8_type(), vec![member(1)]);
+        let i16 = DatatypeMessage::i16_type();
+        for (from, to) in [
+            (&i16, &bits(2, 0, 16)),
+            (&bits(2, 0, 16), &i16),
+            (&e0, &e1),
+            (&DatatypeMessage::u8_type(), &e0),
+            (&DatatypeMessage::f16_type(), &DatatypeMessage::f32_type()),
+            (&DatatypeMessage::f32_type(), &DatatypeMessage::f16_type()),
+            (&DatatypeMessage::fixed_string(2), &i16),
+        ] {
+            assert!(
+                matches!(
+                    Conversion::between(from, to),
+                    Err(FormatError::UnsupportedFeature(_))
+                ),
+                "{from} -> {to}"
+            );
+        }
     }
 }

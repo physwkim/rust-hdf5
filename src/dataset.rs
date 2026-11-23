@@ -4824,6 +4824,7 @@ pub(crate) mod numeric {
 
     use crate::error::{Hdf5Error, Result};
     use crate::format::messages::datatype::{ByteOrder, DatatypeMessage, IeeeFormat};
+    use crate::format::nbit_scaleoffset::IntLayout;
 
     /// The on-disk element shape `classify` accepted.
     #[derive(Clone, Copy)]
@@ -4878,57 +4879,34 @@ pub(crate) mod numeric {
 
     /// Map a datatype message to a supported numeric source shape.
     ///
-    /// Accepts standard-width integers (1/2/4/8 bytes, full precision, zero
-    /// bit offset) and IEEE binary32/binary64 floats; everything else is a
-    /// `TypeMismatch` naming what was found.
+    /// The shape is that of an element after the post-filter conversion
+    /// ([`apply_datatype_conversion`]), which leaves every integer — a
+    /// fixed-point integer, a bit field or an enum over either, whatever its
+    /// precision and bit offset — as the full-width value of its stored size. Accepts such
+    /// integers of 1/2/4/8 bytes and IEEE binary32/binary64 floats;
+    /// everything else is a `TypeMismatch` naming what was found.
+    ///
+    /// [`apply_datatype_conversion`]: crate::format::nbit_scaleoffset::apply_datatype_conversion
     pub fn classify(dt: &DatatypeMessage) -> Result<SourceKind> {
-        match *dt {
-            DatatypeMessage::FixedPoint {
+        if let Some(IntLayout {
+            size,
+            byte_order,
+            signed,
+            ..
+        }) = IntLayout::of(dt)
+        {
+            if !matches!(size, 1 | 2 | 4 | 8) {
+                return Err(Hdf5Error::TypeMismatch(format!(
+                    "integer datatype '{dt}' of {size} bytes is not a standard width",
+                )));
+            }
+            return Ok(SourceKind::Int {
                 size,
-                byte_order,
                 signed,
-                bit_offset,
-                bit_precision,
-            } => {
-                if !matches!(size, 1 | 2 | 4 | 8)
-                    || bit_offset != 0
-                    || u32::from(bit_precision) != size * 8
-                {
-                    return Err(Hdf5Error::TypeMismatch(format!(
-                        "fixed-point datatype (size {size}, bit offset {bit_offset}, \
-                         precision {bit_precision}) is not a standard-width integer",
-                    )));
-                }
-                Ok(SourceKind::Int {
-                    size: size as usize,
-                    signed,
-                    byte_order,
-                })
-            }
-            DatatypeMessage::BitField {
-                size,
                 byte_order,
-                bit_offset,
-                bit_precision,
-            } => {
-                // A bit field has no signed form; a full-width one is the
-                // unsigned integer of the stored width. A narrower one would
-                // need a shift-and-mask conversion this path does not model.
-                if !matches!(size, 1 | 2 | 4 | 8)
-                    || bit_offset != 0
-                    || u32::from(bit_precision) != size * 8
-                {
-                    return Err(Hdf5Error::TypeMismatch(format!(
-                        "bit-field datatype (size {size}, bit offset {bit_offset}, \
-                         precision {bit_precision}) is not a whole-width bit field",
-                    )));
-                }
-                Ok(SourceKind::Int {
-                    size: size as usize,
-                    signed: false,
-                    byte_order,
-                })
-            }
+            });
+        }
+        match *dt {
             DatatypeMessage::FloatingPoint {
                 size,
                 byte_order,
