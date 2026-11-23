@@ -7432,8 +7432,8 @@ impl Hdf5Writer {
             // first `iblock_nsblks` super blocks; each of those defines the
             // element count (and so the disk size) of its data blocks.
             let mut g = 0usize;
-            'direct: for u in 0..k.geo.iblock_nsblks {
-                for _ in 0..k.geo.sblk[u].ndblks {
+            'direct: for (u, sblk) in k.geo.sblk.iter().enumerate().take(k.geo.iblock_nsblks) {
+                for _ in 0..sblk.ndblks {
                     let Some(&a) = dblk_addrs.get(g) else {
                         break 'direct;
                     };
