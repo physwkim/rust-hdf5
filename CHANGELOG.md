@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.7.14
+
+### Fixed
+
+- Integers stored with fewer significant bits than their width, or at a
+  bit offset, read as their values: a dataset written with
+  `H5Tset_precision` (NDFileHDF5's N-bit compression) used to be refused
+  as `TypeMismatch`. Unsigned values and bit fields are masked, signed
+  values sign-extended from their precision, on every dataset read,
+  `SwmrFileReader::read_slice` and `H5Attribute::read_numeric_as`. An enum
+  over such an integer reads through its base, as `H5T__conv_enum_numeric`
+  does.
+- A virtual dataset converts each source from the source's own datatype,
+  where it used to copy the stored bytes as if they were the virtual
+  dataset's: a source of another precision, offset, byte order or size
+  read back wrong, or panicked when the element sizes differed.
+- An N-bit chunk of a class the filter passes through (an enum, a bit
+  field, a string) is no longer refused as too short; `H5Z__set_local_nbit`
+  stores only three parameters for it.
+
+### Changed
+
+- Every I/O-layer error reaches the caller as its public variant, so a
+  checksum mismatch on a torn SWMR read is
+  `Hdf5Error::Format(FormatError::ChecksumMismatch { .. })` instead of an
+  opaque `IoLayer`. `IoLayer` is no longer produced and goes in 0.8.
+- A fixed-point datatype whose offset plus precision exceeds its width,
+  or whose precision is zero, is refused as `FormatError::InvalidData`;
+  it used to pass through.
+
 ## 0.7.13
 
 ### Fixed
