@@ -335,7 +335,11 @@ impl H5Attribute {
             .as_ref()
             .ok_or_else(|| Hdf5Error::InvalidState("attribute has no read data".into()))?;
         let kind = crate::dataset::numeric::classify(&attr.datatype)?;
-        crate::dataset::numeric::convert(kind, &attr.data)
+        // `attr.data` is the stored image, which a dataset read gets from
+        // the reader already unpacked; `classify` describes the unpacked one.
+        let mut image = attr.data.clone();
+        crate::format::nbit_scaleoffset::apply_datatype_conversion(&mut image, &attr.datatype)?;
+        crate::dataset::numeric::convert(kind, &image)
     }
 
     /// Read the attribute value as a string.

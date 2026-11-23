@@ -1471,29 +1471,73 @@ fn is_standard_ieee_float(dt: &DatatypeMessage) -> bool {
     dt.ieee_format().is_some()
 }
 
+/// The bit layout of an integer-valued atomic datatype: a fixed-point
+/// integer or a bit field. libhdf5 converts both to a native type by moving
+/// the `precision` significant bits at `offset` down to bit 0, then filling
+/// the bits above them — with the sign bit for a signed integer
+/// (`H5T__conv_i_i`), with zeros for an unsigned one or a bit field, which
+/// has no sign (`H5T__conv_b_b`).
+#[derive(Clone, Copy)]
+pub(crate) struct IntLayout {
+    pub size: usize,
+    pub byte_order: ByteOrder,
+    pub signed: bool,
+    pub offset: usize,
+    pub precision: usize,
+}
+
+impl IntLayout {
+    /// `dt`'s layout, or `None` when `dt` is not a fixed-point integer or a
+    /// bit field.
+    pub(crate) fn of(dt: &DatatypeMessage) -> Option<Self> {
+        let (size, byte_order, signed, offset, precision) = match *dt {
+            DatatypeMessage::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                bit_offset,
+                bit_precision,
+            } => (size, byte_order, signed, bit_offset, bit_precision),
+            DatatypeMessage::BitField {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+            } => (size, byte_order, false, bit_offset, bit_precision),
+            _ => return None,
+        };
+        Some(Self {
+            size: size as usize,
+            byte_order,
+            signed,
+            offset: usize::from(offset),
+            precision: usize::from(precision),
+        })
+    }
+
+    /// The significant bits fill the element, so it is already its value.
+    fn is_whole(self) -> bool {
+        self.offset == 0 && self.precision == self.size * 8
+    }
+}
+
 /// True if the filter-pipeline / on-disk output for `dt` needs a post-filter
 /// datatype conversion before the element values are usable.
 ///
-/// For a `FixedPoint` datatype the filter pipeline output (or contiguous
-/// on-disk bytes) carries the significant value in `bit_precision` bits
-/// starting at `bit_offset`, with the rest zero-filled and the sign bit NOT
-/// extended. libhdf5 fixes this up with a datatype conversion
-/// (`H5T_convert`) after the filter pipeline; this returns true for any
-/// such non-trivial layout.
+/// For a fixed-point integer or a bit field the filter pipeline output (or
+/// contiguous on-disk bytes) carries the significant value in
+/// `bit_precision` bits starting at `bit_offset`, with the rest zero-filled
+/// and the sign bit NOT extended. libhdf5 fixes this up with a datatype
+/// conversion (`H5T_convert`) after the filter pipeline; this returns true
+/// for any such non-trivial layout.
 ///
 /// It also returns true for a non-standard `FloatingPoint` layout, so the
 /// caller routes it through [`apply_datatype_conversion`], which then
 /// returns a clear error rather than silently yielding wrong data.
 pub fn datatype_needs_bit_conversion(dt: &DatatypeMessage) -> bool {
-    match dt {
-        DatatypeMessage::FixedPoint {
-            size,
-            bit_offset,
-            bit_precision,
-            ..
-        } => *bit_offset != 0 || (*bit_precision as u32) < *size * 8,
-        DatatypeMessage::FloatingPoint { .. } => !is_standard_ieee_float(dt),
-        _ => false,
+    match IntLayout::of(dt) {
+        Some(layout) => !layout.is_whole(),
+        None => matches!(dt, DatatypeMessage::FloatingPoint { .. }) && !is_standard_ieee_float(dt),
     }
 }
 
@@ -1501,99 +1545,27 @@ pub fn datatype_needs_bit_conversion(dt: &DatatypeMessage) -> bool {
 /// output buffer.
 ///
 /// This mirrors libhdf5's `H5T_convert` step that runs AFTER the filter
-/// pipeline. For a `FixedPoint` datatype with `bit_offset != 0` or
-/// `bit_precision < size*8`, each `size`-byte element is rewritten so the
+/// pipeline. For a fixed-point integer or a bit field with `bit_offset != 0`
+/// or `bit_precision < size*8`, each `size`-byte element is rewritten so the
 /// significant value occupies the whole element with bit offset 0:
 ///
 ///   1. interpret the element as an unsigned integer (respecting byte order),
 ///   2. shift right by `bit_offset`,
 ///   3. mask to `bit_precision` low bits,
-///   4. sign-extend from bit `bit_precision-1` if the type is signed,
+///   4. sign-extend from bit `bit_precision-1` if the type is a signed
+///      integer,
 ///   5. write the result back in the same byte order.
 ///
 /// It is a strict no-op for ordinary full-width datatypes (and for any
-/// non-`FixedPoint` class).
+/// other class).
 ///
 /// For `FloatingPoint` types with a non-standard bit layout that cannot be
 /// faithfully reinterpreted, an error is returned rather than wrong data.
 pub fn apply_datatype_conversion(buffer: &mut [u8], dt: &DatatypeMessage) -> FormatResult<()> {
+    if let Some(layout) = IntLayout::of(dt) {
+        return unpack_significant_bits(buffer, layout);
+    }
     match dt {
-        DatatypeMessage::FixedPoint {
-            size,
-            byte_order,
-            signed,
-            bit_offset,
-            bit_precision,
-        } => {
-            let size = *size as usize;
-            let precision = *bit_precision as usize;
-            let offset = *bit_offset as usize;
-
-            // Full-width plain integer: nothing to do.
-            if offset == 0 && precision == size * 8 {
-                return Ok(());
-            }
-            if size == 0 || size > 8 {
-                return Err(FormatError::InvalidData(format!(
-                    "datatype conversion: unsupported FixedPoint size {size}"
-                )));
-            }
-            if precision == 0 || offset + precision > size * 8 {
-                return Err(FormatError::InvalidData(format!(
-                    "datatype conversion: invalid bit layout (offset {offset}, \
-                     precision {precision}, size {size})"
-                )));
-            }
-            if !buffer.len().is_multiple_of(size) {
-                return Err(FormatError::InvalidData(format!(
-                    "datatype conversion: buffer length {} not a multiple of \
-                     element size {size}",
-                    buffer.len()
-                )));
-            }
-
-            let big_endian = matches!(byte_order, ByteOrder::BigEndian);
-            let precision_mask: u64 = if precision == 64 {
-                u64::MAX
-            } else {
-                (1u64 << precision) - 1
-            };
-            let sign_bit: u64 = 1u64 << (precision - 1);
-
-            for elem in buffer.chunks_exact_mut(size) {
-                // Load element as a u64 in native value space.
-                let mut raw: u64 = 0;
-                if big_endian {
-                    for &b in elem.iter() {
-                        raw = (raw << 8) | b as u64;
-                    }
-                } else {
-                    for (i, &b) in elem.iter().enumerate() {
-                        raw |= (b as u64) << (8 * i);
-                    }
-                }
-
-                // Extract the significant bits.
-                let mut value = (raw >> offset) & precision_mask;
-
-                // Sign-extend from bit `precision-1` when signed.
-                if *signed && (value & sign_bit) != 0 {
-                    value |= !precision_mask;
-                }
-
-                // Store back in the same byte order, full element width.
-                if big_endian {
-                    for i in 0..size {
-                        elem[size - 1 - i] = (value >> (8 * i)) as u8;
-                    }
-                } else {
-                    for (i, b) in elem.iter_mut().enumerate() {
-                        *b = (value >> (8 * i)) as u8;
-                    }
-                }
-            }
-            Ok(())
-        }
         DatatypeMessage::FloatingPoint { .. } => {
             // Standard IEEE-754 layouts need no conversion. Anything else
             // cannot be faithfully reinterpreted here.
@@ -1609,6 +1581,82 @@ pub fn apply_datatype_conversion(buffer: &mut [u8], dt: &DatatypeMessage) -> For
         }
         _ => Ok(()),
     }
+}
+
+/// Steps 1-5 of [`apply_datatype_conversion`] for an integer layout.
+fn unpack_significant_bits(buffer: &mut [u8], layout: IntLayout) -> FormatResult<()> {
+    let IntLayout {
+        size,
+        byte_order,
+        signed,
+        offset,
+        precision,
+    } = layout;
+
+    // Full-width plain integer: nothing to do.
+    if layout.is_whole() {
+        return Ok(());
+    }
+    if size == 0 || size > 8 {
+        return Err(FormatError::InvalidData(format!(
+            "datatype conversion: unsupported integer size {size}"
+        )));
+    }
+    if precision == 0 || offset + precision > size * 8 {
+        return Err(FormatError::InvalidData(format!(
+            "datatype conversion: invalid bit layout (offset {offset}, \
+             precision {precision}, size {size})"
+        )));
+    }
+    if !buffer.len().is_multiple_of(size) {
+        return Err(FormatError::InvalidData(format!(
+            "datatype conversion: buffer length {} not a multiple of \
+             element size {size}",
+            buffer.len()
+        )));
+    }
+
+    let big_endian = matches!(byte_order, ByteOrder::BigEndian);
+    let precision_mask: u64 = if precision == 64 {
+        u64::MAX
+    } else {
+        (1u64 << precision) - 1
+    };
+    let sign_bit: u64 = 1u64 << (precision - 1);
+
+    for elem in buffer.chunks_exact_mut(size) {
+        // Load element as a u64 in native value space.
+        let mut raw: u64 = 0;
+        if big_endian {
+            for &b in elem.iter() {
+                raw = (raw << 8) | b as u64;
+            }
+        } else {
+            for (i, &b) in elem.iter().enumerate() {
+                raw |= (b as u64) << (8 * i);
+            }
+        }
+
+        // Extract the significant bits.
+        let mut value = (raw >> offset) & precision_mask;
+
+        // Sign-extend from bit `precision-1` when signed.
+        if signed && (value & sign_bit) != 0 {
+            value |= !precision_mask;
+        }
+
+        // Store back in the same byte order, full element width.
+        if big_endian {
+            for i in 0..size {
+                elem[size - 1 - i] = (value >> (8 * i)) as u8;
+            }
+        } else {
+            for (i, b) in elem.iter_mut().enumerate() {
+                *b = (value >> (8 * i)) as u8;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -1893,6 +1941,31 @@ mod tests {
             let e = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
             assert_eq!(e, *v);
         }
+    }
+
+    fn bits(size: u32, offset: u16, precision: u16) -> DatatypeMessage {
+        DatatypeMessage::BitField {
+            size,
+            byte_order: ByteOrder::LittleEndian,
+            bit_offset: offset,
+            bit_precision: precision,
+        }
+    }
+
+    #[test]
+    fn conversion_noop_for_whole_bit_field() {
+        assert!(!datatype_needs_bit_conversion(&bits(2, 0, 16)));
+    }
+
+    #[test]
+    fn conversion_bit_field_shifts_and_zero_extends() {
+        // A bit field has no sign: its top significant bit set still fills
+        // the bits above with zeros, as `H5T__conv_b_b` does.
+        let dt = bits(2, 4, 12);
+        assert!(datatype_needs_bit_conversion(&dt));
+        let mut buf = (0xFFF0u16).to_le_bytes().to_vec();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x0FFF);
     }
 
     #[test]
