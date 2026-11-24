@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.15
+
+### Performance
+
+- A numeric read of data stored as the requested type — `read_numeric_as`,
+  `read_numeric_slice_as` or `H5Attribute::read_numeric_as` of a
+  little-endian `u16` as `u16` — lands in the vector it returns, as
+  `read_raw` does, instead of passing through a byte buffer converted
+  element by element: a contiguous 310 MiB `u16` image stack reads in
+  0.17–0.27 s, the time `read_raw` takes, where it took 1.4 s.
+
 ## 0.7.14
 
 ### Fixed
