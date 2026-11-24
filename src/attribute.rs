@@ -337,9 +337,13 @@ impl H5Attribute {
         let kind = crate::dataset::numeric::classify(&attr.datatype)?;
         // `attr.data` is the stored image, which a dataset read gets from
         // the reader already unpacked; `classify` describes the unpacked one.
-        let mut image = attr.data.clone();
-        crate::format::nbit_scaleoffset::apply_datatype_conversion(&mut image, &attr.datatype)?;
-        crate::dataset::numeric::convert(kind, &image)
+        crate::dataset::numeric::read(kind, attr.data.len(), |image| {
+            image.copy_from_slice(&attr.data);
+            Ok(crate::format::nbit_scaleoffset::apply_datatype_conversion(
+                image,
+                &attr.datatype,
+            )?)
+        })
     }
 
     /// Read the attribute value as a string.

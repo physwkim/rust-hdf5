@@ -1561,6 +1561,26 @@ where
     F: FnOnce(&mut [u8]) -> Result<(), E>,
     E: From<crate::io::IoError>,
 {
+    // Safety: every byte pattern is a valid `T`, the same property of
+    // `H5Type` implementors that a typed read reinterpreting the stored
+    // image already rests on.
+    unsafe { read_image_into_new_unchecked(count, define) }
+}
+
+/// [`read_image_into_new`] for a `T` that is not an `H5Type`.
+///
+/// # Safety
+///
+/// Every pattern of `size_of::<T>()` bytes must be a value of `T`.
+pub(crate) unsafe fn read_image_into_new_unchecked<T, E, F>(
+    count: usize,
+    define: F,
+) -> Result<Vec<T>, E>
+where
+    T: Copy,
+    F: FnOnce(&mut [u8]) -> Result<(), E>,
+    E: From<crate::io::IoError>,
+{
     let too_big = || {
         E::from(crate::io::IoError::InvalidState(format!(
             "cannot allocate {count} elements of {} bytes for a dataset buffer \
@@ -1580,9 +1600,8 @@ where
     // permits). The slice is the only live reference to that memory while
     // `define` runs. `define` writes every byte before returning `Ok` — its
     // documented contract — so the elements are initialized by the time
-    // `set_len` claims them, and every byte pattern is a valid `T`, the same
-    // property of `H5Type` implementors that a typed read reinterpreting the
-    // stored image already rests on. A `define` that fails returns before
+    // `set_len` claims them, and every byte pattern is a valid `T`, as the
+    // caller guarantees. A `define` that fails returns before
     // `set_len`, so the vector drops empty and nothing reads the bytes it
     // left undefined.
     let image = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
