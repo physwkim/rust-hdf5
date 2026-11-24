@@ -4620,22 +4620,18 @@ impl H5Dataset {
     pub fn read_numeric_as<T: ReadNumeric>(&self) -> Result<Vec<T>> {
         match &self.info {
             DatasetInfo::Reader { name, .. } => {
-                let (kind, raw) = {
-                    let mut inner = borrow_inner_mut(&self.file_inner);
-                    match &mut *inner {
-                        H5FileInner::Reader(reader) => {
-                            let info = reader
-                                .dataset_info(name)
-                                .ok_or_else(|| Hdf5Error::NotFound(name.clone()))?;
-                            let kind = numeric::classify(&info.datatype)?;
-                            (kind, reader.read_dataset_raw(name)?)
-                        }
-                        _ => {
-                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
-                        }
-                    }
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                let H5FileInner::Reader(reader) = &mut *inner else {
+                    return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
                 };
-                numeric::convert(kind, &raw)
+                let info = reader
+                    .dataset_info(name)
+                    .ok_or_else(|| Hdf5Error::NotFound(name.clone()))?;
+                let kind = numeric::classify(&info.datatype)?;
+                let bytes = reader.dataset_raw_size(name)? as usize;
+                numeric::read(kind, bytes, |image| {
+                    Ok(reader.read_dataset_raw_into_dst(name, image, ReadDst::Fresh)?)
+                })
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read from a dataset in write mode".into(),
@@ -4655,25 +4651,36 @@ impl H5Dataset {
         counts: &[usize],
     ) -> Result<Vec<T>> {
         match &self.info {
-            DatasetInfo::Reader { name, .. } => {
+            DatasetInfo::Reader { name, shape, .. } => {
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
-                let (kind, raw) = {
-                    let mut inner = borrow_inner_mut(&self.file_inner);
-                    match &mut *inner {
-                        H5FileInner::Reader(reader) => {
-                            let info = reader
-                                .dataset_info(name)
-                                .ok_or_else(|| Hdf5Error::NotFound(name.clone()))?;
-                            let kind = numeric::classify(&info.datatype)?;
-                            (kind, reader.read_slice(name, &starts_u64, &counts_u64)?)
-                        }
-                        _ => {
-                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
-                        }
-                    }
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                let H5FileInner::Reader(reader) = &mut *inner else {
+                    return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
                 };
-                numeric::convert(kind, &raw)
+                let info = reader
+                    .dataset_info(name)
+                    .ok_or_else(|| Hdf5Error::NotFound(name.clone()))?;
+                let kind = numeric::classify(&info.datatype)?;
+                // bounds before sizing, as in `read_slice`
+                let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+                check_hyperslab(&dims, &starts_u64, &counts_u64)?;
+                let bytes = element_count(&counts_u64)?
+                    .checked_mul(kind.element_size())
+                    .ok_or_else(|| {
+                        Hdf5Error::InvalidState(format!(
+                            "selection {counts_u64:?} has more bytes than usize"
+                        ))
+                    })?;
+                numeric::read(kind, bytes, |image| {
+                    Ok(reader.read_slice_into_dst(
+                        name,
+                        &starts_u64,
+                        &counts_u64,
+                        image,
+                        ReadDst::Fresh,
+                    )?)
+                })
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read_slice from a dataset in write mode".into(),
@@ -4825,9 +4832,10 @@ pub(crate) mod numeric {
     use crate::error::{Hdf5Error, Result};
     use crate::format::messages::datatype::{ByteOrder, DatatypeMessage, IeeeFormat};
     use crate::format::nbit_scaleoffset::IntLayout;
+    use crate::io::reader::{read_image_into_new, read_image_into_new_unchecked};
 
     /// The on-disk element shape `classify` accepted.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     pub enum SourceKind {
         Int {
             size: usize,
@@ -4840,7 +4848,7 @@ pub(crate) mod numeric {
     }
 
     impl SourceKind {
-        fn element_size(self) -> usize {
+        pub fn element_size(self) -> usize {
             match self {
                 SourceKind::Int { size, .. } => size,
                 SourceKind::F16(_) => 2,
@@ -4936,14 +4944,7 @@ pub(crate) mod numeric {
     /// one is found. An empty input converts to an empty vector whatever
     /// the classes.
     pub fn convert<T: Sealed>(kind: SourceKind, raw: &[u8]) -> Result<Vec<T>> {
-        let size = kind.element_size();
-        if !raw.len().is_multiple_of(size) {
-            return Err(Hdf5Error::TypeMismatch(format!(
-                "raw data size {} is not a multiple of element size {size}",
-                raw.len(),
-            )));
-        }
-        let mut out = vec![T::default(); raw.len() / size];
+        let mut out = vec![T::default(); elements(kind, raw.len())?];
         match kind {
             SourceKind::Int {
                 size,
@@ -5043,10 +5044,41 @@ pub(crate) mod numeric {
         }
     }
 
+    /// Read a `kind` image of `bytes` bytes through `define`, which must
+    /// define every byte of the buffer it is handed, as `T`. A source stored
+    /// as `T` itself is read straight into the result, unconverted.
+    pub fn read<T, F>(kind: SourceKind, bytes: usize, define: F) -> Result<Vec<T>>
+    where
+        T: Sealed,
+        F: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        let count = elements(kind, bytes)?;
+        if T::NATIVE == Some(kind) {
+            // Safety: `NATIVE` names a source only for the primitive integers
+            // and floats, every bit pattern of which is a value.
+            return unsafe { read_image_into_new_unchecked(count, define) };
+        }
+        convert(kind, &read_image_into_new::<u8, _, _>(bytes, define)?)
+    }
+
+    fn elements(kind: SourceKind, bytes: usize) -> Result<usize> {
+        let size = kind.element_size();
+        if !bytes.is_multiple_of(size) {
+            return Err(Hdf5Error::TypeMismatch(format!(
+                "raw data size {bytes} is not a multiple of element size {size}",
+            )));
+        }
+        Ok(bytes / size)
+    }
+
     /// The sealed half of `ReadNumeric`: how one source element becomes a
     /// `Self`, or a `TypeMismatch` explaining why it cannot. `index` is the
     /// element's position, for the message.
     pub trait Sealed: Copy + Default {
+        /// The source whose elements are this type's own host bytes (the
+        /// crate builds for little-endian hosts only), if any; `read` fills
+        /// the result with such a source's bytes as they are.
+        const NATIVE: Option<SourceKind>;
         fn from_i64(v: i64, index: usize) -> Result<Self>;
         fn from_u64(v: u64, index: usize) -> Result<Self>;
         fn from_f32(v: f32) -> Result<Self>;
@@ -5056,6 +5088,11 @@ pub(crate) mod numeric {
     macro_rules! int_targets {
         ($($t:ty),* $(,)?) => {$(
             impl Sealed for $t {
+                const NATIVE: Option<SourceKind> = Some(SourceKind::Int {
+                    size: size_of::<$t>(),
+                    signed: <$t>::MIN != 0,
+                    byte_order: ByteOrder::LittleEndian,
+                });
                 fn from_i64(v: i64, index: usize) -> Result<Self> {
                     <$t>::try_from(v).map_err(|_| int_overflow::<$t>(v, index))
                 }
@@ -5076,6 +5113,8 @@ pub(crate) mod numeric {
     // Not in the macro: `i128::try_from` and `u128::try_from(u64)` are
     // infallible, which trips clippy::unnecessary_fallible_conversions.
     impl Sealed for i128 {
+        // `classify` admits no 16-byte integer
+        const NATIVE: Option<SourceKind> = None;
         fn from_i64(v: i64, _index: usize) -> Result<Self> {
             Ok(Self::from(v))
         }
@@ -5091,6 +5130,8 @@ pub(crate) mod numeric {
     }
 
     impl Sealed for u128 {
+        // `classify` admits no 16-byte integer
+        const NATIVE: Option<SourceKind> = None;
         fn from_i64(v: i64, index: usize) -> Result<Self> {
             Self::try_from(v).map_err(|_| int_overflow::<u128>(v, index))
         }
@@ -5120,6 +5161,7 @@ pub(crate) mod numeric {
     }
 
     impl Sealed for f32 {
+        const NATIVE: Option<SourceKind> = Some(SourceKind::F32(ByteOrder::LittleEndian));
         fn from_i64(_: i64, _index: usize) -> Result<Self> {
             Err(int_as_f32())
         }
@@ -5145,6 +5187,7 @@ pub(crate) mod numeric {
     }
 
     impl Sealed for f64 {
+        const NATIVE: Option<SourceKind> = Some(SourceKind::F64(ByteOrder::LittleEndian));
         fn from_i64(_: i64, _index: usize) -> Result<Self> {
             Err(int_as_f64())
         }
@@ -9486,6 +9529,78 @@ mod tests {
         let raw = (-2.25f64).to_be_bytes();
         let kind = numeric::classify(&dt).unwrap();
         assert_eq!(numeric::convert::<f64>(kind, &raw).unwrap(), vec![-2.25]);
+    }
+
+    /// Boundary: a source stored as the target type reads bit for bit,
+    /// unconverted; one differing from it in signedness, byte order or width
+    /// still converts per element.
+    #[test]
+    fn numeric_native_source_reads_unconverted() {
+        use super::numeric;
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+
+        fn read<T: numeric::Sealed>(
+            kind: numeric::SourceKind,
+            raw: &[u8],
+        ) -> crate::error::Result<Vec<T>> {
+            numeric::read(kind, raw.len(), |image| {
+                image.copy_from_slice(raw);
+                Ok(())
+            })
+        }
+
+        let int = |size: u32, signed, byte_order| {
+            let dt = DatatypeMessage::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                bit_offset: 0,
+                bit_precision: 8 * size as u16,
+            };
+            numeric::classify(&dt).unwrap()
+        };
+        let le = ByteOrder::LittleEndian;
+        let bytes = |v: &[u16]| v.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+
+        let u16s = [0, 1, 0x8000, u16::MAX];
+        let raw = bytes(&u16s);
+        assert_eq!(read::<u16>(int(2, false, le), &raw).unwrap(), u16s);
+        let raw: Vec<u8> = [i64::MIN, -1, i64::MAX]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            read::<i64>(int(8, true, le), &raw).unwrap(),
+            [i64::MIN, -1, i64::MAX]
+        );
+        let raw = [0x80u8, 0x7f];
+        assert_eq!(read::<i8>(int(1, true, le), &raw).unwrap(), [-128, 127]);
+
+        assert!(read::<u16>(int(2, false, le), &[1, 2, 3]).is_err());
+
+        // a signalling NaN's payload and -0.0 survive
+        let f32s = [f32::from_bits(0x7fa0_0001), -0.0, f32::INFINITY, 1.5];
+        let raw: Vec<u8> = f32s.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let kind = numeric::classify(&DatatypeMessage::f32_type()).unwrap();
+        let got = read::<f32>(kind, &raw).unwrap();
+        assert!(got.iter().map(|v| v.to_bits()).eq(f32s.map(f32::to_bits)));
+        let raw = (-2.25f64).to_le_bytes();
+        let kind = numeric::classify(&DatatypeMessage::f64_type()).unwrap();
+        assert_eq!(read::<f64>(kind, &raw).unwrap(), [-2.25]);
+
+        // signedness: unsigned 0xffff is no i16, signed -1 no u16
+        let raw = bytes(&[u16::MAX]);
+        assert!(read::<i16>(int(2, false, le), &raw).is_err());
+        assert!(read::<u16>(int(2, true, le), &raw).is_err());
+        // byte order: big-endian 0x0102 reads as 0x0102
+        let raw = 0x0102u16.to_be_bytes();
+        assert_eq!(
+            read::<u16>(int(2, false, ByteOrder::BigEndian), &raw).unwrap(),
+            [0x0102]
+        );
+        // width: u16 widens to u32
+        let raw = bytes(&[1, u16::MAX]);
+        assert_eq!(read::<u32>(int(2, false, le), &raw).unwrap(), [1, 65535]);
     }
 
     /// `H5Attribute::read_numeric` validates the stored datatype before
