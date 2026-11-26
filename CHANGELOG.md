@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.16
+
+### Added
+
+- `H5File::write_vlen_strings_nd` and `H5Group::write_vlen_strings_nd`
+  write a variable-length UTF-8 string dataset of any shape; an empty
+  shape is a scalar holding one string. The scalar h5py makes for
+  `g['title'] = 'T'`, the NeXus NXdata title, can now be written, and
+  h5py reads it back with the shape, dtype, charset and padding of the
+  one silx `save_NXdata` writes. A string count that does not fill the
+  shape is refused before anything is written.
+
 ## 0.7.15
 
 ### Performance
