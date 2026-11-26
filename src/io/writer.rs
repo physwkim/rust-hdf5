@@ -13072,18 +13072,27 @@ impl Hdf5Writer {
     /// Stores strings in the global heap. The dataset raw data consists of
     /// vlen references (collection_addr + object_index pairs).
     ///
-    /// `charset` is the datatype's declared character set (0 = ASCII,
-    /// 1 = UTF-8); the strings are checked against it before anything is
-    /// written, so the type never misdescribes the bytes under it.
+    /// `dims` is the dataspace, row-major over `strings`: empty for a scalar
+    /// holding one string. `charset` is the datatype's declared character
+    /// set (0 = ASCII, 1 = UTF-8). Both are checked before anything is
+    /// written, so the dataspace and the type never misdescribe the data.
     pub fn create_vlen_string_dataset(
         &self,
         name: &str,
         strings: &[&str],
+        dims: &[u64],
         charset: u8,
     ) -> IoResult<usize> {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
+        let n: u64 = dims.iter().product();
+        if n != strings.len() as u64 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset '{name}' shape {dims:?} needs {n} strings, got {}",
+                strings.len()
+            )));
+        }
         ensure_vlen_charset(charset, strings)?;
 
         let create = self.begin_create(name)?;
@@ -13118,8 +13127,7 @@ impl Hdf5Writer {
             padding: 0,
             charset,
         };
-        let dataspace =
-            crate::format::messages::dataspace::DataspaceMessage::simple(&[num_strings]);
+        let dataspace = crate::format::messages::dataspace::DataspaceMessage::simple(dims);
 
         let idx = self.push_dataset(
             &create,
@@ -18491,7 +18499,7 @@ mod tests {
         let attempts: [(&str, IoResult<usize>); 4] = [
             (
                 "vlen_string",
-                writer.create_vlen_string_dataset("d", &["x"], 1),
+                writer.create_vlen_string_dataset("d", &["x"], &[1], 1),
             ),
             ("vlen_bytes", writer.create_vlen_bytes_dataset("d", &[b"x"])),
             (
@@ -18589,7 +18597,7 @@ mod tests {
                 (
                     "vlen_string",
                     writer
-                        .create_vlen_string_dataset(taken, &["x"], 1)
+                        .create_vlen_string_dataset(taken, &["x"], &[1], 1)
                         .map(|_| ()),
                 ),
                 (
@@ -18807,7 +18815,7 @@ mod tests {
 
         let writer = Hdf5Writer::create(&path).unwrap();
         writer
-            .create_vlen_string_dataset("notes", &["initial"], 1)
+            .create_vlen_string_dataset("notes", &["initial"], &[1], 1)
             .unwrap();
         writer.close().unwrap();
 

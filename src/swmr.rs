@@ -639,10 +639,12 @@ impl SwmrFileWriter {
     /// [`write_string_dataset_ascii`](Self::write_string_dataset_ascii)
     /// declares ASCII instead.
     pub fn write_string_dataset(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
-        let idx = self
-            .inner
-            .writer_mut()
-            .create_vlen_string_dataset(name, strings, 1)?;
+        let idx = self.inner.writer_mut().create_vlen_string_dataset(
+            name,
+            strings,
+            &[strings.len() as u64],
+            1,
+        )?;
         Ok(idx)
     }
 
@@ -650,10 +652,12 @@ impl SwmrFileWriter {
     /// datatype, the one h5py's `string_dtype("ascii")` produces. A string
     /// that is not 7-bit is rejected rather than mislabelled.
     pub fn write_string_dataset_ascii(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
-        let idx = self
-            .inner
-            .writer_mut()
-            .create_vlen_string_dataset(name, strings, 0)?;
+        let idx = self.inner.writer_mut().create_vlen_string_dataset(
+            name,
+            strings,
+            &[strings.len() as u64],
+            0,
+        )?;
         Ok(idx)
     }
 
