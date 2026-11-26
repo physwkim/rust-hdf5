@@ -184,6 +184,35 @@ fn f1_vlen_dataset_with_attrs_readable_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// F1b: `write_vlen_strings_nd` with an empty shape writes the scalar string
+/// dataset h5py makes for `g['title'] = 'T'` (NeXus `NXdata/title`), and a 2-D
+/// shape reads back as a 2-D array.
+#[test]
+fn f1b_vlen_string_scalar_and_2d_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("f1b_vlen_nd");
+    {
+        let file = H5File::create(&path).unwrap();
+        let grp = file.create_group("entry").unwrap();
+        grp.write_vlen_strings_nd("title", &["T"], &[]).unwrap();
+        grp.write_vlen_strings_nd("grid", &["a", "b", "c", "d", "e", "f"], &[2, 3])
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "t = f['entry/title']\n\
+         assert t.shape == (), t.shape\n\
+         assert h5py.check_string_dtype(t.dtype).length is None, t.dtype\n\
+         assert t.asstr()[()] == 'T', t[()]\n\
+         g = f['entry/grid']\n\
+         assert g.shape == (2, 3), g.shape\n\
+         assert g.asstr()[...].tolist() == [['a', 'b', 'c'], ['d', 'e', 'f']], g[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// F2: a runtime `CompoundType` of arbitrary size, written via the
 /// `datatype()` override + `write_raw_bytes`, is read by h5py as a structured
 /// array with the right field names and dtypes.

@@ -837,7 +837,22 @@ impl H5File {
     ///
     /// [`write_vlen_strings_ascii`]: Self::write_vlen_strings_ascii
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
-        self.write_vlen_strings_charset(name, strings, 1)
+        self.write_vlen_strings_charset(name, strings, &[strings.len()], 1)
+    }
+
+    /// Create a variable-length UTF-8 string dataset of any shape.
+    ///
+    /// `strings` is the row-major data and its length must equal the product
+    /// of `shape`; an empty `shape` is a scalar holding exactly one string,
+    /// the dataset h5py makes for `f['title'] = 'T'`.
+    /// [`write_vlen_strings`](Self::write_vlen_strings) is the 1-D form.
+    pub fn write_vlen_strings_nd(
+        &self,
+        name: &str,
+        strings: &[&str],
+        shape: &[usize],
+    ) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, shape, 1)
     }
 
     /// Create a variable-length **ASCII** string dataset and write data.
@@ -852,21 +867,23 @@ impl H5File {
     /// [`DatatypeMessage::vlen_string_ascii`]: crate::DatatypeMessage::vlen_string_ascii
     /// [`DatatypeMessage::vlen_string_utf8`]: crate::DatatypeMessage::vlen_string_utf8
     pub fn write_vlen_strings_ascii(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
-        self.write_vlen_strings_charset(name, strings, 0)
+        self.write_vlen_strings_charset(name, strings, &[strings.len()], 0)
     }
 
-    /// The single owner of one-call vlen-string dataset creation: the two
-    /// public entry points differ only in the character set they declare.
+    /// The single owner of one-call vlen-string dataset creation: the public
+    /// entry points differ only in the shape and character set they declare.
     fn write_vlen_strings_charset(
         &self,
         name: &str,
         strings: &[&str],
+        shape: &[usize],
         charset: u8,
     ) -> Result<H5Dataset> {
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset(name, strings, charset)?;
+                let idx = writer.create_vlen_string_dataset(name, strings, &dims, charset)?;
                 let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
@@ -2698,6 +2715,52 @@ mod integration_tests {
             let strings = ds.read_vlen_strings().unwrap();
             assert_eq!(strings, vec!["alice", "bob", "charlie"]);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `write_vlen_strings_nd` gives the dataset the shape it is asked for: an
+    /// empty shape is a scalar holding one string (h5py's `g['title'] = 'T'`),
+    /// and a count that does not fill the shape is refused before anything is
+    /// written.
+    #[test]
+    fn vlen_strings_nd_writes_scalar_and_multidimensional_shapes() {
+        let path = temp_path("vlen_nd");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings_nd("title", &["T"], &[]).unwrap();
+            let g = file.create_group("entry").unwrap();
+            g.write_vlen_strings_nd("grid", &["a", "b", "c", "d", "e", "f"], &[2, 3])
+                .unwrap();
+            g.write_vlen_strings_nd("title", &["inner"], &[]).unwrap();
+            let err = file
+                .write_vlen_strings_nd("short", &["a", "b"], &[3])
+                .err()
+                .expect("two strings were accepted for a shape of three")
+                .to_string();
+            assert!(err.contains("[3]") && err.contains("got 2"), "got: {err}");
+            let err = g
+                .write_vlen_strings_nd("empty_scalar", &[], &[])
+                .err()
+                .expect("a scalar was accepted with no string")
+                .to_string();
+            assert!(err.contains("got 0"), "got: {err}");
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let title = file.dataset("title").unwrap();
+        assert_eq!(title.shape(), Vec::<usize>::new());
+        assert_eq!(title.read_vlen_strings().unwrap(), vec!["T"]);
+        let grid = file.dataset("entry/grid").unwrap();
+        assert_eq!(grid.shape(), vec![2, 3]);
+        assert_eq!(
+            grid.read_vlen_strings().unwrap(),
+            vec!["a", "b", "c", "d", "e", "f"]
+        );
+        let inner = file.dataset("entry/title").unwrap();
+        assert_eq!(inner.shape(), Vec::<usize>::new());
+        assert_eq!(inner.read_vlen_strings().unwrap(), vec!["inner"]);
+        assert!(file.dataset("short").is_err());
+        assert!(file.dataset("entry/empty_scalar").is_err());
         std::fs::remove_file(&path).ok();
     }
 

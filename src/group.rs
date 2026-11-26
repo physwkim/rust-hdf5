@@ -331,7 +331,21 @@ impl H5Group {
     /// [`write_vlen_strings_ascii`](Self::write_vlen_strings_ascii) is the
     /// ASCII-declaring twin, as on [`H5File`](crate::H5File).
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
-        self.write_vlen_strings_charset(name, strings, 1)
+        self.write_vlen_strings_charset(name, strings, &[strings.len()], 1)
+    }
+
+    /// Create a variable-length UTF-8 string dataset of any shape within this
+    /// group: the group-level twin of
+    /// [`H5File::write_vlen_strings_nd`](crate::H5File::write_vlen_strings_nd).
+    /// An empty `shape` is a scalar holding exactly one string, the dataset
+    /// h5py makes for `g['title'] = 'T'`.
+    pub fn write_vlen_strings_nd(
+        &self,
+        name: &str,
+        strings: &[&str],
+        shape: &[usize],
+    ) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, shape, 1)
     }
 
     /// Create a variable-length **ASCII** string dataset within this group.
@@ -341,17 +355,20 @@ impl H5Group {
     /// with the same rejection of a string the ASCII declaration would
     /// misdescribe.
     pub fn write_vlen_strings_ascii(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
-        self.write_vlen_strings_charset(name, strings, 0)
+        self.write_vlen_strings_charset(name, strings, &[strings.len()], 0)
     }
 
-    /// The single owner of group-level vlen-string dataset creation: the two
-    /// public entry points differ only in the character set they declare.
+    /// The single owner of group-level vlen-string dataset creation: the
+    /// public entry points differ only in the shape and character set they
+    /// declare.
     fn write_vlen_strings_charset(
         &self,
         name: &str,
         strings: &[&str],
+        shape: &[usize],
         charset: u8,
     ) -> Result<H5Dataset> {
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -362,7 +379,7 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset(&full_name, strings, charset)?;
+                let idx = writer.create_vlen_string_dataset(&full_name, strings, &dims, charset)?;
                 let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
